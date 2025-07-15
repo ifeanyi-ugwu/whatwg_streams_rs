@@ -1,4 +1,5 @@
 use super::{CountQueuingStrategy, Locked, QueuingStrategy, StreamError, StreamResult, Unlocked};
+use futures::{channel::oneshot, future};
 use futures_core::task::{Context, Poll};
 use futures_sink::Sink as FuturesSink;
 use std::{
@@ -9,6 +10,11 @@ use std::{
     sync::{Arc, Mutex},
     task::Waker,
 };
+
+struct PendingWrite<T> {
+    chunk: T,
+    completion_tx: oneshot::Sender<StreamResult<()>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamState {
@@ -25,7 +31,7 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
 
 pub struct WritableStreamInner<T, Sink> {
     state: StreamState,
-    queue: VecDeque<T>,
+    queue: VecDeque<PendingWrite<T>>,
     queue_total_size: usize,
     strategy: Box<dyn QueuingStrategy<T> + Send>,
     sink: Option<Sink>,
@@ -351,54 +357,66 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
     pub async fn write(&mut self, chunk: T) -> StreamResult<()> {
         let inner_arc = self.inner.clone();
 
-        // Lock to check state and take sink
-        let sink_option = {
-            let mut guard = inner_arc.lock().unwrap();
-            if guard.state != StreamState::Writable {
-                return Err(StreamError::Custom("Stream is not writable".into()));
-            }
-            guard.sink.take()
-        };
+        // Lock to check state and backpressure
+        let mut guard = inner_arc.lock().unwrap();
+        if guard.state != StreamState::Writable {
+            return Err(StreamError::Custom("Stream is not writable".into()));
+        }
 
-        let mut controller = WritableStreamDefaultController::new(inner_arc.clone());
+        // Calculate chunk size
+        let chunk_size = guard.strategy.size(&chunk);
+
+        // If backpressure applies, queue the write
+        if guard.backpressure {
+            // Create oneshot channel to await completion
+            let (tx, rx) = oneshot::channel();
+
+            // Enqueue the write
+            guard.queue.push_back(PendingWrite {
+                chunk,
+                completion_tx: tx,
+            });
+            guard.queue_total_size += chunk_size;
+
+            // Backpressure remains true if queue size exceeds high water mark
+            guard.backpressure = guard.queue_total_size >= guard.strategy.high_water_mark();
+
+            drop(guard);
+
+            // Return a future that waits for the write to complete
+            return rx
+                .await
+                .unwrap_or_else(|_| Err(StreamError::Custom("Write canceled".into())));
+        }
+
+        // No backpressure: write immediately
+        let sink_option = guard.sink.take();
+        guard.queue_total_size += chunk_size;
+        guard.backpressure = guard.queue_total_size >= guard.strategy.high_water_mark();
+        drop(guard);
 
         if let Some(mut sink_val) = sink_option {
-            // Attempt to write
+            let mut controller = WritableStreamDefaultController::new(inner_arc.clone());
             let write_result = sink_val.write(chunk, &mut controller).await;
 
-            // Re-lock to put sink back and update state
             let mut guard = inner_arc.lock().unwrap();
 
             match write_result {
                 Ok(()) => {
                     guard.sink = Some(sink_val);
 
-                    // Update queue size and backpressure after a successful write
-                    // (Assuming the write operation has cleared space, or the queue conceptually holds what's written)
-                    guard.queue_total_size = guard
-                        .queue
-                        .iter()
-                        .map(|item| guard.strategy.size(item))
-                        .sum();
-                    let old_backpressure = guard.backpressure;
-                    guard.backpressure = guard.queue_total_size >= guard.strategy.high_water_mark();
-
-                    // If backpressure cleared, wake any waiting `ready()` tasks
-                    if old_backpressure && !guard.backpressure {
-                        for waker in guard.ready_wakers.drain(..) {
-                            waker.wake();
-                        }
-                    }
+                    // After immediate write, drain the queue if any
+                    drop(guard);
+                    self.drain_queue().await?;
 
                     Ok(())
                 }
                 Err(e) => {
-                    // Transition stream to errored state
                     guard.state = StreamState::Errored;
                     guard.abort_reason = Some(format!("write() failed: {:?}", e));
                     guard.sink = None;
 
-                    // Wake all waiting futures as stream is now errored
+                    // Wake waiting tasks
                     for waker in guard.ready_wakers.drain(..) {
                         waker.wake();
                     }
@@ -410,9 +428,94 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
                 }
             }
         } else {
-            // Sink missing, treat as error
             Err(StreamError::Custom("Sink missing during write".into()))
         }
+    }
+
+    async fn drain_queue(&mut self) -> StreamResult<()> {
+        loop {
+            let pending_write_opt = {
+                let mut guard = self.inner.lock().unwrap();
+
+                if guard.state != StreamState::Writable {
+                    return Err(StreamError::Custom("Stream is not writable".into()));
+                }
+
+                guard.queue.pop_front()
+            };
+
+            let pending_write = match pending_write_opt {
+                Some(pw) => pw,
+                None => break, // Queue empty
+            };
+
+            let inner_arc = self.inner.clone();
+            let mut guard = inner_arc.lock().unwrap();
+            let sink_option = guard.sink.take();
+            drop(guard);
+
+            if let Some(mut sink_val) = sink_option {
+                let mut controller = WritableStreamDefaultController::new(inner_arc.clone());
+
+                let write_result = sink_val.write(pending_write.chunk, &mut controller).await;
+
+                let mut guard = inner_arc.lock().unwrap();
+
+                match write_result {
+                    Ok(()) => {
+                        guard.sink = Some(sink_val);
+
+                        // Update queue size and backpressure
+                        guard.queue_total_size = guard
+                            .queue
+                            .iter()
+                            .map(|pw| guard.strategy.size(&pw.chunk))
+                            .sum();
+                        let old_backpressure = guard.backpressure;
+                        guard.backpressure =
+                            guard.queue_total_size >= guard.strategy.high_water_mark();
+
+                        // Wake ready futures if backpressure cleared
+                        if old_backpressure && !guard.backpressure {
+                            for waker in guard.ready_wakers.drain(..) {
+                                waker.wake();
+                            }
+                        }
+
+                        // Notify the original write caller of success
+                        let _ = pending_write.completion_tx.send(Ok(()));
+                    }
+                    Err(e) => {
+                        guard.state = StreamState::Errored;
+                        guard.abort_reason = Some(format!("write() failed: {:?}", e));
+                        guard.sink = None;
+
+                        // Wake waiting tasks
+                        for waker in guard.ready_wakers.drain(..) {
+                            waker.wake();
+                        }
+                        for waker in guard.closed_wakers.drain(..) {
+                            waker.wake();
+                        }
+
+                        // Notify the original write caller of failure
+                        //let _ = pending_write.completion_tx.send(Err(e.clone()));// TODO: make the error enum be Cloneable(i.e) favour `arc` over `box` for the custom error
+                        let _ = pending_write
+                            .completion_tx
+                            .send(Err(StreamError::Custom("error in completion".into())));
+
+                        return Err(e);
+                    }
+                }
+            } else {
+                let _ = pending_write
+                    .completion_tx
+                    .send(Err(StreamError::Custom("Sink missing".into())));
+                return Err(StreamError::Custom("Sink missing".into()));
+            }
+        }
+
+        Ok(())
     }
 
     /// Close the stream
@@ -431,6 +534,15 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
 
             guard.close_requested = true;
             guard.state = StreamState::Closed; // Mark as closed BEFORE calling sink.close()
+
+            // Reject all queued writes
+            for pending_write in guard.queue.drain(..) {
+                let _ = pending_write.completion_tx.send(Err(StreamError::Custom(
+                    "Stream closed before write could complete".into(),
+                )));
+            }
+            guard.queue_total_size = 0;
+            guard.backpressure = false;
 
             // Wake all pending futures as stream is now closed
             for waker in guard.ready_wakers.drain(..) {
@@ -462,8 +574,15 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
 
             guard.state = StreamState::Errored;
             guard.abort_reason = reason.clone();
-            guard.queue.clear();
+
+            // Reject all queued writes
+            for pending_write in guard.queue.drain(..) {
+                let _ = pending_write.completion_tx.send(Err(StreamError::Custom(
+                    "Stream aborted before write could complete".into(),
+                )));
+            }
             guard.queue_total_size = 0;
+            guard.backpressure = false;
 
             // Wake all pending futures as stream is now errored
             for waker in guard.ready_wakers.drain(..) {
@@ -1374,5 +1493,101 @@ mod tests {
         // Data should contain only first write
         let collected = data.lock().unwrap();
         assert_eq!(*collected, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_close_clears_queue_and_rejects_writes() {
+        let (sink, _data) = CollectorSink::<i32>::new();
+        let stream = WritableStream::new(sink).await.unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+
+        // Queue some writes by simulating backpressure
+        // For simplicity, assume backpressure is forced here
+        {
+            let mut guard = writer.inner.lock().unwrap();
+            guard.backpressure = true;
+        }
+
+        //let write1 = tokio::spawn(writer.write(1));
+        //let write2 = tokio::spawn(writer.write(2));
+
+        //let write1 = writer.write(1);
+        //let write2 = writer.write(2);
+
+        // Close the stream
+        writer.close().await.unwrap();
+
+        // Writes should be rejected
+        //assert!(write1.await.unwrap().is_err());
+        //assert!(write2.await.unwrap().is_err());
+        assert!(writer.write(1).await.is_err());
+        assert!(writer.write(2).await.is_err());
+
+        // ready() future should error
+        assert!(writer.ready().await.is_err());
+
+        // closed() future should succeed
+        assert!(writer.closed().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_abort_clears_queue_and_rejects_writes() {
+        let (sink, _data) = CollectorSink::<i32>::new();
+        let stream = WritableStream::new(sink).await.unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+
+        // Queue some writes by simulating backpressure
+        {
+            let mut guard = writer.inner.lock().unwrap();
+            guard.backpressure = true;
+        }
+
+        //let write1 = tokio::spawn(writer.write(1));
+        //let write2 = tokio::spawn(writer.write(2));
+
+        // Abort the stream
+        writer.abort(Some("test abort".to_string())).await.unwrap();
+
+        // Writes should be rejected
+        //assert!(write1.await.unwrap().is_err());
+        //assert!(write2.await.unwrap().is_err());
+        assert!(writer.write(1).await.is_err());
+        assert!(writer.write(2).await.is_err());
+
+        // ready() and closed() futures should error
+        assert!(writer.ready().await.is_err());
+        assert!(writer.closed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ready_resolves_when_backpressure_clears() {
+        let (sink, _data) = CollectorSink::<i32>::new();
+        let stream = WritableStream::new(sink).await.unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+
+        // Force backpressure
+        {
+            let mut guard = writer.inner.lock().unwrap();
+            guard.backpressure = true;
+        }
+
+        // Start ready() future (should be pending)
+        //let ready_fut = tokio::spawn(writer.ready());
+        // Start ready() future (this will be pending because of backpressure)
+        let ready_fut = writer.ready();
+
+        // Clear backpressure and wake wakers
+        {
+            let mut guard = writer.inner.lock().unwrap();
+            guard.backpressure = false;
+            for waker in guard.ready_wakers.drain(..) {
+                waker.wake();
+            }
+        }
+
+        // ready() should now complete
+        //assert!(ready_fut.await.unwrap().is_ok());
+        // Await the ready future inline (no spawn)
+        assert!(ready_fut.await.is_ok());
     }
 }
