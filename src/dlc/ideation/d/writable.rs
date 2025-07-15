@@ -1248,10 +1248,13 @@ mod tests {
     async fn test_ready_state() {
         let (sink, _data) = CollectorSink::<i32>::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
 
         // Stream should be ready initially
         writer.ready().await.unwrap();
+
+        // Close the stream
+        writer.close().await.unwrap();
 
         // Should be able to check closed state
         let result = writer.closed().await;
