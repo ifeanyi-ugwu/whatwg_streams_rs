@@ -270,10 +270,16 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
 /// Simplified WritableSink trait that's easier to work with
 pub trait WritableSink<T: Send + 'static>: Sized {
     /// Start the sink
+    /*fn start(
+        &mut self,
+        controller: &mut WritableStreamDefaultController<T, Self>,
+    ) -> impl std::future::Future<Output = StreamResult<()>> + Send;*/
     fn start(
         &mut self,
         controller: &mut WritableStreamDefaultController<T, Self>,
-    ) -> impl std::future::Future<Output = StreamResult<()>> + Send;
+    ) -> impl Future<Output = StreamResult<()>> + Send {
+        future::ready(Ok(())) // default no-op
+    }
 
     /// Write a chunk to the sink
     fn write(
@@ -283,13 +289,21 @@ pub trait WritableSink<T: Send + 'static>: Sized {
     ) -> impl std::future::Future<Output = StreamResult<()>> + Send;
 
     /// Close the sink
-    fn close(self) -> impl std::future::Future<Output = StreamResult<()>> + Send;
+    /*fn close(self) -> impl std::future::Future<Output = StreamResult<()>> + Send;
 
     /// Abort the sink
     fn abort(
         self,
         reason: Option<String>,
-    ) -> impl std::future::Future<Output = StreamResult<()>> + Send;
+    ) -> impl std::future::Future<Output = StreamResult<()>> + Send;*/
+
+    fn close(self) -> impl Future<Output = StreamResult<()>> + Send {
+        future::ready(Ok(())) // default no-op
+    }
+
+    fn abort(self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
+        future::ready(Ok(())) // default no-op
+    }
 }
 
 /// Writer with clean async API
