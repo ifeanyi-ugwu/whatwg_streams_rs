@@ -1,14 +1,11 @@
 use super::{CountQueuingStrategy, Locked, QueuingStrategy, StreamError, StreamResult, Unlocked};
+use async_lock::Mutex;
+//use futures::lock::Mutex;
 use futures::{channel::oneshot, future};
 use futures_core::task::{Context, Poll};
 use futures_sink::Sink as FuturesSink;
 use std::{
-    collections::VecDeque,
-    future::Future,
-    marker::PhantomData,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::Waker,
+    collections::VecDeque, future::Future, marker::PhantomData, pin::Pin, sync::Arc, task::Waker,
 };
 
 struct PendingWrite<T> {
@@ -93,7 +90,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> WritableStream<T
 
         // Extract sink for start()
         let sink_to_start = {
-            let mut guard = inner.lock().unwrap();
+            let mut guard = inner.lock().await;
             guard.sink.take()
         };
 
@@ -102,14 +99,14 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> WritableStream<T
 
             // Call start() outside the lock
             if let Err(e) = sink.start(&mut controller).await {
-                let mut guard = inner.lock().unwrap();
+                let mut guard = inner.lock().await;
                 guard.state = StreamState::Errored;
                 guard.abort_reason = Some(format!("start() failed: {:?}", e));
                 return Err(e);
             }
 
             // Put sink back after successful start()
-            let mut guard = inner.lock().unwrap();
+            let mut guard = inner.lock().await;
             guard.sink = Some(sink);
         }
 
@@ -134,7 +131,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> WritableStream<T
         (locked_stream, writer)
     }*/
 
-    pub fn get_writer(
+    pub async fn get_writer(
         self,
     ) -> Result<
         (
@@ -144,7 +141,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> WritableStream<T
         StreamError,
     > {
         let inner_clone = self.inner.clone();
-        let mut guard = inner_clone.lock().unwrap();
+        let mut guard = inner_clone.lock().await;
 
         if guard.locked {
             return Err(StreamError::Custom("Stream is already locked".into()));
@@ -165,7 +162,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> WritableStream<T
         let inner_arc = self.inner.clone();
 
         let sink_to_abort = {
-            let mut guard = inner_arc.lock().unwrap();
+            let mut guard = inner_arc.lock().await;
 
             if guard.state == StreamState::Closed || guard.state == StreamState::Errored {
                 return Ok(());
@@ -231,8 +228,8 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
     }
 
     /// Error the stream
-    pub fn error(&mut self, error: StreamError) {
-        let mut guard = self.inner.lock().unwrap();
+    pub async fn error(&mut self, error: StreamError) {
+        let mut guard = self.inner.lock().await;
         if guard.state == StreamState::Closed || guard.state == StreamState::Errored {
             return; // Already closed or errored, do nothing
         }
@@ -250,8 +247,8 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
         }
     }
 
-    fn set_backpressure(&mut self, backpressure: bool) {
-        let mut guard = self.inner.lock().unwrap();
+    async fn set_backpressure(&mut self, backpressure: bool) {
+        let mut guard = self.inner.lock().await;
         let old = guard.backpressure;
         guard.backpressure = backpressure;
         if old && !backpressure {
@@ -261,8 +258,8 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
         }
     }
 
-    fn request_close(&mut self) {
-        let mut guard = self.inner.lock().unwrap();
+    async fn request_close(&mut self) {
+        let mut guard = self.inner.lock().await;
         guard.close_requested = true;
     }
 }
@@ -372,7 +369,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
         let inner_arc = self.inner.clone();
 
         // Lock to check state and backpressure
-        let mut guard = inner_arc.lock().unwrap();
+        let mut guard = inner_arc.lock().await;
         if guard.state != StreamState::Writable {
             return Err(StreamError::Custom("Stream is not writable".into()));
         }
@@ -413,7 +410,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
             let mut controller = WritableStreamDefaultController::new(inner_arc.clone());
             let write_result = sink_val.write(chunk, &mut controller).await;
 
-            let mut guard = inner_arc.lock().unwrap();
+            let mut guard = inner_arc.lock().await;
 
             match write_result {
                 Ok(()) => {
@@ -449,7 +446,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
     async fn drain_queue(&mut self) -> StreamResult<()> {
         loop {
             let pending_write_opt = {
-                let mut guard = self.inner.lock().unwrap();
+                let mut guard = self.inner.lock().await;
 
                 if guard.state != StreamState::Writable {
                     return Err(StreamError::Custom("Stream is not writable".into()));
@@ -464,7 +461,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
             };
 
             let inner_arc = self.inner.clone();
-            let mut guard = inner_arc.lock().unwrap();
+            let mut guard = inner_arc.lock().await;
             let sink_option = guard.sink.take();
             drop(guard);
 
@@ -473,7 +470,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
 
                 let write_result = sink_val.write(pending_write.chunk, &mut controller).await;
 
-                let mut guard = inner_arc.lock().unwrap();
+                let mut guard = inner_arc.lock().await;
 
                 match write_result {
                     Ok(()) => {
@@ -537,7 +534,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
         let inner_arc = self.inner.clone();
 
         let sink_to_close = {
-            let mut guard = inner_arc.lock().unwrap();
+            let mut guard = inner_arc.lock().await;
 
             if guard.state == StreamState::Closed {
                 return Ok(());
@@ -580,7 +577,7 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
     pub async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
         let inner_arc = self.inner.clone();
         let sink_to_abort = {
-            let mut guard = inner_arc.lock().unwrap();
+            let mut guard = inner_arc.lock().await;
 
             if guard.state == StreamState::Closed || guard.state == StreamState::Errored {
                 return Ok(());
@@ -631,8 +628,8 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
     }
 
     /// Get the desired size (how much more data can be written without backpressure)
-    pub fn desired_size(&self) -> Option<usize> {
-        let inner = self.inner.lock().unwrap();
+    pub async fn desired_size(&self) -> Option<usize> {
+        let inner = self.inner.lock().await;
         if inner.state != StreamState::Writable {
             // Check against Writable
             return None;
@@ -654,8 +651,9 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
         }
         // Since `self` is consumed, the writer is dropped here.
     }*/
-    pub fn release_lock(self) -> WritableStream<T, Sink, Unlocked> {
-        let mut guard = self.inner.lock().unwrap();
+    // Users must have to call this method to release the lock
+    pub async fn release_lock(self) -> WritableStream<T, Sink, Unlocked> {
+        let mut guard = self.inner.lock().await;
         guard.locked = false;
 
         WritableStream {
@@ -665,12 +663,12 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static>
     }
 }
 
-impl<T, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
+/*impl<T, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
     fn drop(&mut self) {
         let mut guard = self.inner.lock().unwrap();
         guard.locked = false;
     }
-}
+}*/
 
 /// Helper Future for WritableStreamDefaultWriter::ready()
 struct ReadyFuture<T, Sink> {
@@ -681,23 +679,24 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> Future for Ready
     type Output = StreamResult<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut guard = self.inner.lock().unwrap();
-
-        if guard.state == StreamState::Errored {
-            return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
+        if let Some(mut guard) = self.inner.try_lock() {
+            // Safely use guard here...
+            if guard.state == StreamState::Errored {
+                return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
+            }
+            if guard.state == StreamState::Closed {
+                return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
+            }
+            if !guard.backpressure {
+                return Poll::Ready(Ok(()));
+            }
+            guard.ready_wakers.push_back(cx.waker().clone());
+            Poll::Pending
+        } else {
+            // Couldn't acquire lock, queue current waker to be woken up later if needed
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
-        if guard.state == StreamState::Closed {
-            return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
-        }
-
-        // If not in backpressure, we are ready
-        if !guard.backpressure {
-            return Poll::Ready(Ok(()));
-        }
-
-        // Register waker to be woken when backpressure clears
-        guard.ready_wakers.push_back(cx.waker().clone());
-        Poll::Pending
     }
 }
 
@@ -710,18 +709,22 @@ impl<T: Send + 'static, Sink: WritableSink<T> + Send + 'static> Future for Close
     type Output = StreamResult<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut guard = self.inner.lock().unwrap();
+        if let Some(mut guard) = self.inner.try_lock() {
+            if guard.state == StreamState::Errored {
+                return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
+            }
+            if guard.state == StreamState::Closed {
+                return Poll::Ready(Ok(())); // Note: stream closed usually means success, not error
+            }
 
-        if guard.state == StreamState::Closed {
-            return Poll::Ready(Ok(()));
+            // Register waker to be woken when stream closes or errors
+            guard.closed_wakers.push_back(cx.waker().clone());
+            Poll::Pending
+        } else {
+            // Could not acquire lock immediately, arrange for the task to be polled again ASAP
+            cx.waker().wake_by_ref();
+            Poll::Pending
         }
-        if guard.state == StreamState::Errored {
-            return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
-        }
-
-        // Register waker to be woken when stream closes or errors
-        guard.closed_wakers.push_back(cx.waker().clone());
-        Poll::Pending
     }
 }
 
@@ -794,7 +797,7 @@ impl<T: Send + 'static> WritableStreamBuilder<T> {
 
                 // Call start() on sink asynchronously
                 let sink_to_start = {
-                    let mut guard = inner.lock().unwrap();
+                    let mut guard = inner.lock().await;
                     guard.sink.take()
                 };
 
@@ -802,13 +805,13 @@ impl<T: Send + 'static> WritableStreamBuilder<T> {
                     let mut controller = WritableStreamDefaultController::new(inner.clone());
 
                     if let Err(e) = sink.start(&mut controller).await {
-                        let mut guard = inner.lock().unwrap();
+                        let mut guard = inner.lock().await;
                         guard.state = StreamState::Errored;
                         guard.abort_reason = Some(format!("start() failed: {:?}", e));
                         return Err(e);
                     }
 
-                    let mut guard = inner.lock().unwrap();
+                    let mut guard = inner.lock().await;
                     guard.sink = Some(sink);
                 }
 
@@ -1140,7 +1143,7 @@ mod tests {
     async fn test_basic_write_and_close() {
         let (sink, data) = CollectorSink::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write some data using the writer
         writer.write(1).await.unwrap();
@@ -1159,7 +1162,7 @@ mod tests {
     async fn test_writer_api() {
         let (sink, data) = CollectorSink::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write using the writer
         writer.write(42).await.unwrap();
@@ -1184,15 +1187,15 @@ mod tests {
             .await
             .unwrap();
 
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write data and check desired size
         writer.write(1).await.unwrap();
-        assert!(writer.desired_size().unwrap() > 0);
+        assert!(writer.desired_size().await.unwrap() > 0);
 
         writer.write(2).await.unwrap();
         // Should be at capacity now
-        assert_eq!(writer.desired_size(), Some(0));
+        assert_eq!(writer.desired_size().await, Some(0));
 
         writer.close().await.unwrap();
 
@@ -1211,14 +1214,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write strings
         writer.write("hello".to_string()).await.unwrap(); // 5 bytes
         writer.write("world".to_string()).await.unwrap(); // 5 bytes
 
         // Should be at capacity (10 bytes)
-        assert_eq!(writer.desired_size(), Some(0));
+        assert_eq!(writer.desired_size().await, Some(0));
 
         writer.close().await.unwrap();
 
@@ -1230,7 +1233,7 @@ mod tests {
     async fn test_error_handling() {
         let sink = ErrorSink::new(true);
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // This should succeed (no write yet)
         let result = writer.write(1).await;
@@ -1241,7 +1244,7 @@ mod tests {
     async fn test_abort() {
         let (sink, data) = CollectorSink::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write some data
         writer.write(1).await.unwrap();
@@ -1262,7 +1265,7 @@ mod tests {
     async fn test_ready_state() {
         let (sink, _data) = CollectorSink::<i32>::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Stream should be ready initially
         writer.ready().await.unwrap();
@@ -1285,7 +1288,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         writer.write("test".to_string()).await.unwrap();
         writer.close().await.unwrap();
@@ -1303,7 +1306,7 @@ mod tests {
         assert!(!stream.locked());
 
         // Can create writer
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write and close
         writer.write(42).await.unwrap();
@@ -1320,16 +1323,16 @@ mod tests {
         let stream = WritableStream::new(sink).await.unwrap();
 
         // Acquire first writer (locks the stream)
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Write some data
         writer.write(42).await.unwrap();
 
         // Release the lock, invalidating the writer
-        let unlocked_stream = writer.release_lock();
+        let unlocked_stream = writer.release_lock().await;
 
         // Now the stream is unlocked; we can get a new writer
-        let (_locked_stream2, mut writer2) = unlocked_stream.get_writer().unwrap();
+        let (_locked_stream2, mut writer2) = unlocked_stream.get_writer().await.unwrap();
 
         // Write more data with the new writer
         writer2.write(84).await.unwrap();
@@ -1348,6 +1351,7 @@ mod tests {
         let (_locked_stream, mut writer1) = stream
             .clone()
             .get_writer()
+            .await
             .expect("First writer acquisition should succeed");
 
         // Attempt to acquire a second writer from the original unlocked stream (which is now consumed)
@@ -1355,7 +1359,7 @@ mod tests {
         let stream_clone = stream.clone();
 
         // The second acquisition should fail because the stream is locked
-        let result = stream_clone.get_writer();
+        let result = stream_clone.get_writer().await;
 
         assert!(
             result.is_err(),
@@ -1366,11 +1370,12 @@ mod tests {
         writer1.write(42).await.expect("Write should succeed");
 
         // Release the lock on the first writer
-        let unlocked_stream = writer1.release_lock();
+        let unlocked_stream = writer1.release_lock().await;
 
         // Now acquiring a new writer should succeed again
         let (_locked_stream2, mut writer2) = unlocked_stream
             .get_writer()
+            .await
             .expect("Writer acquisition after release should succeed");
 
         writer2
@@ -1414,7 +1419,7 @@ mod tests {
         let stream = WritableStream::new(sink)
             .await
             .expect("Stream creation should succeed");
-        let (_locked_stream, mut writer) = stream.get_writer().expect("Should get writer");
+        let (_locked_stream, mut writer) = stream.get_writer().await.expect("Should get writer");
 
         // First write should fail with error
         let err = writer.write(42).await.expect_err("Write should fail");
@@ -1492,7 +1497,7 @@ mod tests {
         let stream = WritableStream::new(sink)
             .await
             .expect("Stream creation should succeed");
-        let (_locked_stream, mut writer) = stream.get_writer().expect("Should get writer");
+        let (_locked_stream, mut writer) = stream.get_writer().await.expect("Should get writer");
 
         // First write succeeds
         writer.write(1).await.expect("First write should succeed");
@@ -1516,12 +1521,12 @@ mod tests {
     async fn test_close_clears_queue_and_rejects_writes() {
         let (sink, _data) = CollectorSink::<i32>::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Queue some writes by simulating backpressure
         // For simplicity, assume backpressure is forced here
         {
-            let mut guard = writer.inner.lock().unwrap();
+            let mut guard = writer.inner.lock().await;
             guard.backpressure = true;
         }
 
@@ -1551,11 +1556,11 @@ mod tests {
     async fn test_abort_clears_queue_and_rejects_writes() {
         let (sink, _data) = CollectorSink::<i32>::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Queue some writes by simulating backpressure
         {
-            let mut guard = writer.inner.lock().unwrap();
+            let mut guard = writer.inner.lock().await;
             guard.backpressure = true;
         }
 
@@ -1580,11 +1585,11 @@ mod tests {
     async fn test_ready_resolves_when_backpressure_clears() {
         let (sink, _data) = CollectorSink::<i32>::new();
         let stream = WritableStream::new(sink).await.unwrap();
-        let (_locked_stream, mut writer) = stream.get_writer().unwrap();
+        let (_locked_stream, mut writer) = stream.get_writer().await.unwrap();
 
         // Force backpressure
         {
-            let mut guard = writer.inner.lock().unwrap();
+            let mut guard = writer.inner.lock().await;
             guard.backpressure = true;
         }
 
@@ -1595,7 +1600,7 @@ mod tests {
 
         // Clear backpressure and wake wakers
         {
-            let mut guard = writer.inner.lock().unwrap();
+            let mut guard = writer.inner.lock().await;
             guard.backpressure = false;
             for waker in guard.ready_wakers.drain(..) {
                 waker.wake();
