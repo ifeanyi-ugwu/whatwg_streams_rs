@@ -1,11 +1,19 @@
 use super::QueuingStrategy;
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::{mpsc, oneshot};
+use futures::future::FutureExt;
+use futures::future::poll_fn;
+use futures::{SinkExt, StreamExt, future};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 #[derive(Clone)]
 pub struct ArcError(Arc<dyn Error + Send + Sync>);
@@ -115,7 +123,7 @@ pub enum StreamCommand<T> {
 
 /// Public handle, clonable, holds task command sender and atomic flags
 pub struct WritableStream<T, Sink, S = Unlocked> {
-    command_tx: mpsc::Sender<StreamCommand<T>>,
+    command_tx: UnboundedSender<StreamCommand<T>>,
     backpressure: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     errored: Arc<AtomicBool>,
@@ -125,10 +133,6 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
 
 pub trait WritableSink<T: Send + 'static>: Sized {
     /// Start the sink
-    /*fn start(
-        &mut self,
-        controller: &mut WritableStreamDefaultController<T, Self>,
-    ) -> impl std::future::Future<Output = StreamResult<()>> + Send;*/
     fn start(
         &mut self,
         controller: &mut WritableStreamDefaultController,
@@ -144,18 +148,11 @@ pub trait WritableSink<T: Send + 'static>: Sized {
     ) -> impl std::future::Future<Output = StreamResult<()>> + Send;
 
     /// Close the sink
-    /*fn close(self) -> impl std::future::Future<Output = StreamResult<()>> + Send;
-
-    /// Abort the sink
-    fn abort(
-        self,
-        reason: Option<String>,
-    ) -> impl std::future::Future<Output = StreamResult<()>> + Send;*/
-
     fn close(self) -> impl Future<Output = StreamResult<()>> + Send {
         future::ready(Ok(())) // default no-op
     }
 
+    /// Abort the sink
     fn abort(self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
         future::ready(Ok(())) // default no-op
     }
@@ -256,7 +253,7 @@ where
 {
     /// Create new WritableStream handle and spawn stream task
     pub fn new(sink: Sink, strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>) -> Self {
-        let (command_tx, command_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
 
         let inner = WritableStreamInner {
             state: StreamState::Writable,
@@ -268,7 +265,10 @@ where
             backpressure: false,
             locked: false,
             close_requested: false,
+            close_completions: Vec::new(),
             abort_reason: None,
+            abort_requested: false,
+            abort_completions: Vec::new(),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
         };
@@ -304,7 +304,7 @@ where
     where
         F: FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static,
     {
-        let (command_tx, command_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
 
         let inner = WritableStreamInner {
             state: StreamState::Writable,
@@ -316,7 +316,10 @@ where
             backpressure: false,
             locked: false,
             close_requested: false,
+            close_completions: Vec::new(),
             abort_reason: None,
+            abort_requested: false,
+            abort_completions: Vec::new(),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
         };
@@ -357,7 +360,7 @@ where
 /// For example, with futures crate ThreadPool:
 /// pool.spawn_ok(stream_task(...)) or with async-std/tokio spawn.
 fn spawn_stream_task<T, Sink>(
-    command_rx: mpsc::Receiver<StreamCommand<T>>,
+    command_rx: UnboundedReceiver<StreamCommand<T>>,
     inner: WritableStreamInner<T, Sink>,
     backpressure: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
@@ -378,504 +381,6 @@ fn spawn_stream_task<T, Sink>(
         ));
     });
 }
-
-use futures::{SinkExt, Stream, StreamExt, future};
-
-/*async fn _stream_task<T, Sink>(
-    mut command_rx: mpsc::Receiver<StreamCommand<T>>,
-    mut inner: WritableStreamInner<T, Sink>,
-    backpressure: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    errored: Arc<AtomicBool>,
-) where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    while let Some(cmd) = command_rx.next().await {
-        match cmd {
-            StreamCommand::Write { chunk, completion } => {
-                let result = process_write(&mut inner, chunk).await;
-                update_flags(&inner, &backpressure, &closed, &errored);
-                println!(
-                    "[stream_task] after process_write: in_flight={}, queued={}, backpressure={}",
-                    inner.in_flight_size, inner.queue_total_size, inner.backpressure
-                );
-
-                let _ = completion.send(result);
-
-                if inner.state == StreamState::Writable {
-                    // Attempt to drain queued writes after any successful write
-                    if let Err(e) = drain_queue(&mut inner).await {
-                        inner.state = StreamState::Errored;
-                        inner.sink = None;
-                        inner.ready_wakers.wake_all();
-                        inner.closed_wakers.wake_all();
-                    }
-                }
-            }
-            StreamCommand::Close { completion } => {
-                let result = process_close(&mut inner).await;
-                update_flags(&inner, &backpressure, &closed, &errored);
-                let _ = completion.send(result);
-            }
-            StreamCommand::Abort { reason, completion } => {
-                let result = process_abort(&mut inner, reason).await;
-                update_flags(&inner, &backpressure, &closed, &errored);
-                let _ = completion.send(result);
-            }
-            StreamCommand::GetDesiredSize { completion } => {
-                let size = if inner.state == StreamState::Writable {
-                    let high_water_mark = inner.strategy.high_water_mark();
-                    let current = inner.queue_total_size + inner.in_flight_size;
-                    if current >= high_water_mark {
-                        Some(0)
-                    } else {
-                        Some(high_water_mark - current)
-                    }
-                } else {
-                    None
-                };
-                let _ = completion.send(size);
-            }
-            StreamCommand::RegisterReadyWaker { waker } => {
-                inner.ready_wakers.register(&waker);
-            }
-            StreamCommand::RegisterClosedWaker { waker } => {
-                inner.closed_wakers.register(&waker);
-            }
-            StreamCommand::LockStream { completion } => {
-                if inner.locked {
-                    let _ =
-                        completion.send(Err(StreamError::Custom("Stream already locked".into())));
-                } else {
-                    inner.locked = true;
-                    let _ = completion.send(Ok(()));
-                }
-            }
-            StreamCommand::UnlockStream { completion } => {
-                if !inner.locked {
-                    let _ = completion.send(Err(StreamError::Custom("Stream not locked".into())));
-                } else {
-                    inner.locked = false;
-                    let _ = completion.send(Ok(()));
-                }
-            }
-        }
-    }
-}
-*/
-
-use futures::future::FutureExt;
-
-/*async fn stream_task<T, Sink>(
-    mut command_rx: mpsc::Receiver<StreamCommand<T>>,
-    mut inner: WritableStreamInner<T, Sink>,
-    backpressure: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    errored: Arc<AtomicBool>,
-) where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    // Represents an in-progress sink write.
-    let mut sink_write_fut: Option<BoxFuture<'static, SinkWriteResult>> = None;
-    // Store completion for the active pending write
-    let mut active_completion: Option<oneshot::Sender<StreamResult<()>>> = None;
-
-    loop {
-        select! {
-            // 1. Receive new command (always available even if sink is slow)
-            cmd = command_rx.next().fuse() => {
-                match cmd {
-                    Some(StreamCommand::Write { chunk, completion }) => {
-                        inner.queue.push_back(PendingWrite { chunk, completion_tx: completion });
-                        let chunk_size = inner.strategy.size(&inner.queue.back().unwrap().chunk);
-                        inner.queue_total_size += chunk_size;
-                        inner.update_backpressure();
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                    }
-                    Some(StreamCommand::Close { completion }) => {
-                        let result = process_close(&mut inner).await;
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        let _ = completion.send(result);
-                    }
-                    Some(StreamCommand::Abort { reason, completion }) => {
-                        let result = process_abort(&mut inner, reason).await;
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        let _ = completion.send(result);
-                    }
-                    Some(StreamCommand::GetDesiredSize { completion }) => {
-                        let high_water_mark = inner.strategy.high_water_mark();
-                        let total = inner.queue_total_size + inner.in_flight_size;
-                        let size = if inner.state == StreamState::Writable {
-                            if total >= high_water_mark {
-                                Some(0)
-                            } else {
-                                Some(high_water_mark - total)
-                            }
-                        } else { None };
-                        let _ = completion.send(size);
-                    }
-                    Some(StreamCommand::RegisterReadyWaker { waker }) => {
-                        inner.ready_wakers.register(&waker);
-                    }
-                    Some(StreamCommand::RegisterClosedWaker { waker }) => {
-                        inner.closed_wakers.register(&waker);
-                    }
-                    Some(StreamCommand::LockStream { completion }) => {
-                        if inner.locked {
-                            let _ = completion.send(Err(StreamError::Custom("Stream already locked".into())));
-                        } else {
-                            inner.locked = true;
-                            let _ = completion.send(Ok(()));
-                        }
-                    }
-                    Some(StreamCommand::UnlockStream { completion }) => {
-                        if !inner.locked {
-                            let _ = completion.send(Err(StreamError::Custom("Stream not locked".into())));
-                        } else {
-                            inner.locked = false;
-                            let _ = completion.send(Ok(()));
-                        }
-                    }
-                    None => break, // Channel closed, exit loop
-                }
-            },
-
-            // 2. If there's an active sink write in progress, await its completion
-            res = async {
-                if let Some(fut) = &mut sink_write_fut {
-                    fut.await
-                } else {
-                    SinkWriteResult::NotActive
-                }
-            }.fuse()=> {
-                if let Some(res) = res {
-                // Sink write finished!
-                if let Some(completion) = active_completion.take() {
-                    let _ = completion.send(res.into_result());
-                }
-                // After completion, update the stream state as needed
-                if let SinkWriteResult::Errored = res {
-                    inner.state = StreamState::Errored;
-                    inner.sink = None;
-                    inner.ready_wakers.wake_all();
-                    inner.closed_wakers.wake_all();
-                }
-                inner.in_flight_size -= res.chunk_size();
-                inner.update_backpressure();
-                update_flags(&inner, &backpressure, &closed, &errored);
-                sink_write_fut = None;
-            }}
-        }
-
-        // After ANY select! branch: If we're not currently writing to sink, kick off the next queued write (if any)
-        if sink_write_fut.is_none() {
-            if let Some(pw) = inner.queue.pop_front() {
-                let chunk_size = inner.strategy.size(&pw.chunk);
-                // Remove from queue stats
-                inner.queue_total_size -= chunk_size;
-                inner.in_flight_size += chunk_size;
-                inner.update_backpressure();
-                update_flags(&inner, &backpressure, &closed, &errored);
-
-                if let Some(sink) = inner.sink.as_mut() {
-                    // Prepare for new async sink write (not tied to runtime)
-                    let mut ctrl = WritableStreamDefaultController::new(&mut inner);
-                    let fut = async move {
-                        let result = sink.write(pw.chunk, &mut ctrl).await;
-                        if let Err(_) = result {
-                            SinkWriteResult::Errored(chunk_size)
-                        } else {
-                            SinkWriteResult::Complete(chunk_size)
-                        }
-                    };
-                    sink_write_fut = Some(fut.boxed());
-                    active_completion = Some(pw.completion_tx);
-                } else {
-                    // If sink is missing, stream is errored.
-                    let _ = pw
-                        .completion_tx
-                        .send(Err(StreamError::Custom("Sink missing".into())));
-                    inner.state = StreamState::Errored;
-                }
-            }
-        }
-    }
-}
-
-/// Internal enum to represent result of a sink write, plus its chunk_size for accounting
-enum SinkWriteResult {
-    Complete(usize), // Success, size written
-    Errored(usize),  // Error, size written
-    NotActive,       // Used when no sink write is active
-}
-
-impl SinkWriteResult {
-    fn chunk_size(&self) -> usize {
-        match *self {
-            SinkWriteResult::Complete(n) | SinkWriteResult::Errored(n) => n,
-            SinkWriteResult::NotActive => 0,
-        }
-    }
-    fn into_result(self) -> StreamResult<()> {
-        match self {
-            SinkWriteResult::Errored(_) => Err(StreamError::Custom("Sink write errored".into())),
-            SinkWriteResult::Complete(_) => Ok(()),
-            SinkWriteResult::NotActive => Err(StreamError::Custom("No write active".into())),
-        }
-    }
-}*/
-
-// Helper enum to track an in-flight write
-/*enum SinkWriteState<T> {
-    None,
-    Active {
-        chunk_size: usize,
-        completion: Option<oneshot::Sender<StreamResult<()>>>,
-        fut: futures::future::BoxFuture<'static, StreamResult<()>>,
-    },
-}
-
-async fn stream_task<T, Sink>(
-    mut command_rx: mpsc::Receiver<StreamCommand<T>>,
-    mut inner: WritableStreamInner<T, Sink>,
-    backpressure: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    errored: Arc<AtomicBool>,
-) where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    use SinkWriteState::*;
-
-    let mut write_state = SinkWriteState::None;
-
-    loop {
-        // 1. Prefer to spawn a new sink write if not active and there’s work.
-        if let None = write_state {
-            if let Some(pw) = inner.queue.pop_front() {
-                let chunk_size = inner.strategy.size(&pw.chunk);
-                inner.queue_total_size -= chunk_size;
-                inner.in_flight_size += chunk_size;
-                inner.update_backpressure();
-                update_flags(&inner, &backpressure, &closed, &errored);
-
-                if let Some(ref mut sink) = inner.sink {
-                    // We're careful to scope this mutable borrow to just this block!
-                    let write_fut = {
-                        // Scope the controller/borrow as tightly as possible.
-                        let mut ctrl = WritableStreamDefaultController::new(&mut inner);
-                        sink.write(pw.chunk, &mut ctrl).boxed()
-                    };
-                    write_state = SinkWriteState::Active {
-                        chunk_size,
-                        completion: Some(pw.completion_tx),
-                        fut: write_fut,
-                    };
-                } else {
-                    let _ = pw
-                        .completion_tx
-                        .send(Err(StreamError::Custom("Sink missing".into())));
-                    inner.state = StreamState::Errored;
-                    continue;
-                }
-            }
-        }
-
-        // 2. Concurrently wait for next command OR completion of in-flight write.
-        futures::select! {
-            cmd = command_rx.next().fuse() => {
-                match cmd {
-                    Some(StreamCommand::Write { chunk, completion }) => {
-                        let chunk_size = inner.strategy.size(&chunk);
-                        inner.queue.push_back(PendingWrite { chunk, completion_tx: completion });
-                        inner.queue_total_size += chunk_size;
-                        inner.update_backpressure();
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                    }
-                    Some(StreamCommand::Close { completion }) => {
-                        let result = process_close(&mut inner).await;
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        let _ = completion.send(result);
-                    }
-                    Some(StreamCommand::Abort { reason, completion }) => {
-                        let result = process_abort(&mut inner, reason).await;
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        let _ = completion.send(result);
-                    }
-                    Some(StreamCommand::GetDesiredSize { completion }) => {
-                        let high_water_mark = inner.strategy.high_water_mark();
-                        let total = inner.queue_total_size + inner.in_flight_size;
-                        let size = if inner.state == StreamState::Writable {
-                            if total >= high_water_mark { Some(0) }
-                            else { Some(high_water_mark - total) }
-                        } else {
-                            None
-                        };
-                        let _ = completion.send(size);
-                    }
-                    Some(StreamCommand::RegisterReadyWaker { waker }) => { inner.ready_wakers.register(&waker); }
-                    Some(StreamCommand::RegisterClosedWaker { waker }) => { inner.closed_wakers.register(&waker); }
-                    Some(StreamCommand::LockStream { completion }) => {
-                        let _ = if inner.locked {
-                            completion.send(Err(StreamError::Custom("Stream already locked".into())))
-                        } else {
-                            inner.locked = true;
-                            completion.send(Ok(()))
-                        };
-                    }
-                    Some(StreamCommand::UnlockStream { completion }) => {
-                        let _ = if !inner.locked {
-                            completion.send(Err(StreamError::Custom("Stream not locked".into())))
-                        } else {
-                            inner.locked = false;
-                            completion.send(Ok(()))
-                        };
-                    }
-                    None => break, // Channel closed, exit loop
-                }
-            }
-            // Only poll the current write if present
-            default => break,
-        }
-
-        // 3. If there's an active sink write, advance it and process the result.
-        if let SinkWriteState::Active {
-            chunk_size,
-            mut completion,
-            fut,
-        } = &mut write_state
-        {
-            let result = fut.await;
-            inner.in_flight_size -= *chunk_size;
-            inner.update_backpressure();
-            update_flags(&inner, &backpressure, &closed, &errored);
-
-            if let Some(tx) = completion.take() {
-                let _ = tx.send(result.clone());
-            }
-
-            if result.is_err() {
-                inner.state = StreamState::Errored;
-                inner.sink = None;
-                inner.ready_wakers.wake_all();
-                inner.closed_wakers.wake_all();
-                write_state = SinkWriteState::None;
-                continue;
-            }
-            write_state = SinkWriteState::None;
-        }
-    }
-}*/
-
-use futures::future::poll_fn;
-use std::task::{Context, Poll};
-
-/*pub async fn _stream_task<T, Sink>(
-    mut command_rx: mpsc::Receiver<StreamCommand<T>>,
-    mut inner: WritableStreamInner<T, Sink>,
-    backpressure: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    errored: Arc<AtomicBool>,
-) where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    let (ctrl_tx, mut ctrl_rx) = unbounded::<ControllerMsg>();
-
-    // Track the in-flight future and its completion channel, if any.
-    let mut inflight: Option<InFlightWrite<Sink>> = None;
-
-    poll_fn(|cx| {
-        eprintln!("poll_fn executing...");
-        process_controller_msgs(&mut inner, &mut ctrl_rx);
-        // 1. Spawn a sink write if none is active and the queue is not empty
-        if inflight.is_none() && inner.state == StreamState::Writable {
-            if let Some(pw) = inner.queue.pop_front() {
-                let chunk_size = inner.strategy.size(&pw.chunk);
-                inner.queue_total_size -= chunk_size;
-                inner.in_flight_size += chunk_size;
-                inner.update_backpressure();
-                update_flags(&inner, &backpressure, &closed, &errored);
-
-                // TAKE (move out) the sink, to give full ownership to the future
-                if let Some(mut sink) = inner.sink.take() {
-                    let mut ctrl = WritableStreamDefaultController::new(ctrl_tx.clone());
-
-                    // Move everything into the async block!
-                    let chunk = pw.chunk;
-                    let completion = pw.completion_tx;
-                    let fut = async move {
-                        // Perform the write with owned sink/controller. This block has all ownership.
-                        let result = sink.write(chunk, &mut ctrl).await;
-                        // Return sink for putting back in struct, plus result and completion channel
-                        (sink, result, completion, chunk_size)
-                    }
-                    .boxed();
-
-                    inflight = Some(InFlightWrite { fut });
-                } else {
-                    let _ = pw
-                        .completion_tx
-                        .send(Err(StreamError::Custom("Sink missing".into())));
-                    inner.state = StreamState::Errored;
-                }
-            }
-        }
-
-        // 2. Poll the command receiver (never blocks)
-        match command_rx.poll_next_unpin(cx) {
-            Poll::Ready(Some(cmd)) => {
-                eprintln!("Got StreamCommand:");
-                // eprintln!("Got StreamCommand: {:?}", &cmd);
-                process_command(cmd, &mut inner, &backpressure, &closed, &errored, cx);
-                // We'll always continue polling this future on any event
-            }
-            Poll::Ready(None) => return Poll::Ready(()), // Channel closed, finish
-            Poll::Pending => {}
-        }
-
-        // 3. Poll the sink write if it's active
-        if let Some(inflight_write) = &mut inflight {
-            match inflight_write.fut.as_mut().poll(cx) {
-                Poll::Ready((sink, result, completion, chunk_size)) => {
-                    inner.sink = Some(sink);
-                    inner.in_flight_size -= chunk_size;
-                    inner.update_backpressure();
-                    update_flags(&inner, &backpressure, &closed, &errored);
-
-                    let _ = completion.send(result.clone());
-
-                    if result.is_err() {
-                        inner.state = StreamState::Errored;
-                        inner.sink = None;
-                        inner.ready_wakers.wake_all();
-                        inner.closed_wakers.wake_all();
-                    }
-                    inflight = None;
-                    // We'll poll again immediately, to start the next write if needed!
-                }
-                Poll::Pending => {}
-            }
-        }
-
-        // Always keep polling until receiver is closed and all work is done!
-        Poll::Pending
-    })
-    .await;
-}*/
-
-/*type SinkWriteOutput<Sink> = (
-    Sink,
-    StreamResult<()>,
-    oneshot::Sender<StreamResult<()>>,
-    usize,
-);
-
-struct InFlightWrite<Sink> {
-    fut: futures::future::BoxFuture<'static, SinkWriteOutput<Sink>>,
-}*/
 
 // Helper to process each command. Break out to keep task flat.
 fn process_command<T, Sink>(
@@ -901,14 +406,36 @@ fn process_command<T, Sink>(
             update_flags(&inner, backpressure, closed, errored);
         }
         StreamCommand::Close { completion } => {
-            let result = futures::executor::block_on(process_close(inner)); // sync block for brevity
+            if inner.state == StreamState::Errored {
+                let _ = completion.send(Err(StreamError::Custom("Stream is errored".into())));
+                return;
+            }
+            if inner.state == StreamState::Closed {
+                let _ = completion.send(Ok(()));
+                return;
+            }
+            // If close already requested, add this completion to waiters
+            if inner.close_requested {
+                inner.close_completions.push(completion);
+            } else {
+                inner.close_requested = true;
+                inner.close_completions.push(completion);
+            }
             update_flags(&inner, backpressure, closed, errored);
-            let _ = completion.send(result);
         }
         StreamCommand::Abort { reason, completion } => {
-            let result = futures::executor::block_on(process_abort(inner, reason));
+            if inner.state == StreamState::Closed || inner.state == StreamState::Errored {
+                let _ = completion.send(Ok(()));
+                return;
+            }
+            if inner.abort_requested {
+                inner.abort_completions.push(completion);
+            } else {
+                inner.abort_requested = true;
+                inner.abort_completions.push(completion);
+                inner.abort_reason = reason;
+            }
             update_flags(&inner, backpressure, closed, errored);
-            let _ = completion.send(result);
         }
         StreamCommand::GetDesiredSize { completion } => {
             let high_water_mark = inner.strategy.high_water_mark();
@@ -949,135 +476,7 @@ fn process_command<T, Sink>(
     }
 }
 
-/*async fn process_write<T, Sink>(
-    inner: &mut WritableStreamInner<T, Sink>,
-    chunk: T,
-    ctrl_tx: &UnboundedSender<ControllerMsg>,
-) -> StreamResult<()>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    if inner.state != StreamState::Writable {
-        return Err(StreamError::Custom("Stream is not writable".into()));
-    }
-
-    let chunk_size = inner.strategy.size(&chunk);
-    let total = inner.queue_total_size + inner.in_flight_size;
-    let high_water_mark = inner.strategy.high_water_mark();
-
-    if total >= high_water_mark {
-        // Create a oneshot channel so the caller can await completion when write is flushed
-        let (tx, rx) = oneshot::channel();
-
-        // Enqueue the write request
-        inner.queue.push_back(PendingWrite {
-            chunk,
-            completion_tx: tx,
-        });
-
-        inner.queue_total_size += chunk_size;
-        //inner.backpressure = inner.queue_total_size >= inner.strategy.high_water_mark();
-        inner.update_backpressure();
-
-        // Return a future that will complete when the queued write is done
-        // But since this is inside the task, we can only return an error here.
-        // Instead, instruct caller to await the returned future.
-        // Optionally, for full design, you can enqueue and the caller waits on the rx.
-        return Err(StreamError::Custom(
-            "Backpressure applied; write queued".into(),
-        ));
-    }
-
-    // No backpressure: write immediately
-    /*if let Some(sink) = inner.sink.as_mut() {
-        let mut controller = WritableStreamDefaultController::new(inner);
-        let result = sink.write(chunk, &mut controller).await;
-
-        if let Err(_) = result {
-            inner.state = StreamState::Errored;
-            inner.sink = None;
-            // Wake all
-            inner.ready_wakers.wake_all();
-            inner.closed_wakers.wake_all();
-            return result;
-        }
-
-        inner.queue_total_size += chunk_size;
-        inner.backpressure = inner.queue_total_size >= inner.strategy.high_water_mark();
-
-        if !inner.backpressure {
-            inner.ready_wakers.wake_all();
-        }
-
-        Ok(())
-    } else {
-        Err(StreamError::Custom("Sink missing".into()))
-    }*/
-    if let Some(mut sink) = inner.sink.take() {
-        // Inflight write is starting
-        inner.in_flight_size += chunk_size;
-        inner.update_backpressure();
-
-        let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
-
-        //let mut controller = WritableStreamDefaultController::new(inner);
-
-        let result = sink.write(chunk, &mut controller).await;
-
-        // Write finished, inflight complete
-        inner.in_flight_size -= chunk_size;
-        inner.update_backpressure();
-
-        // Put the sink back after write
-        inner.sink = Some(sink);
-
-        if let Err(_) = result {
-            inner.state = StreamState::Errored;
-            inner.sink = None;
-            inner.ready_wakers.wake_all();
-            inner.closed_wakers.wake_all();
-            return result;
-        }
-
-        //inner.queue_total_size += chunk_size;
-        //inner.backpressure = inner.queue_total_size >= inner.strategy.high_water_mark();
-        //inner.update_backpressure();
-
-        if !inner.backpressure {
-            inner.ready_wakers.wake_all();
-        }
-
-        Ok(())
-    } else {
-        Err(StreamError::Custom("Sink missing".into()))
-    }
-}
-*/
-
-use std::mem::replace;
-use std::pin::Pin;
-
 // Inflight operations being driven
-/*enum InFlight<Sink> {
-    Write {
-        fut: Pin<Box<dyn futures::Future<Output = StreamResult<()>> + Send>>,
-        completion: oneshot::Sender<StreamResult<()>>,
-        chunk_size: usize,
-        sink: Sink,
-    },
-    Close {
-        fut: Pin<Box<dyn futures::Future<Output = StreamResult<()>> + Send>>,
-        completion: oneshot::Sender<StreamResult<()>>,
-        sink: Sink,
-    },
-    Abort {
-        fut: Pin<Box<dyn futures::Future<Output = StreamResult<()>> + Send>>,
-        completion: oneshot::Sender<StreamResult<()>>,
-        sink: Sink,
-    },
-}*/
-
 enum InFlight<Sink> {
     Write {
         fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)> + Send>>,
@@ -1085,19 +484,17 @@ enum InFlight<Sink> {
         chunk_size: usize,
     },
     Close {
-        //fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)> + Send>>,
         fut: Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>,
-        completion: Option<oneshot::Sender<StreamResult<()>>>,
+        completions: Vec<oneshot::Sender<StreamResult<()>>>,
     },
     Abort {
-        //fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)> + Send>>,
         fut: Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>,
-        completion: Option<oneshot::Sender<StreamResult<()>>>,
+        completions: Vec<oneshot::Sender<StreamResult<()>>>,
     },
 }
 
 pub async fn stream_task<T, Sink>(
-    mut command_rx: mpsc::Receiver<StreamCommand<T>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<T>>,
     mut inner: WritableStreamInner<T, Sink>,
     backpressure: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
@@ -1111,165 +508,6 @@ pub async fn stream_task<T, Sink>(
         UnboundedSender<ControllerMsg>,
         UnboundedReceiver<ControllerMsg>,
     ) = unbounded();
-
-    /*poll_fn(|cx| {
-        process_controller_msgs(&mut inner, &mut ctrl_rx);
-        // Process in-flight write/close/abort
-        if let Some(op) = &mut inflight {
-            match op {
-                InFlight::Write {
-                    fut,
-                    completion,
-                    chunk_size,
-                    //sink,
-                } => match fut.as_mut().poll(cx) {
-                    Poll::Ready((mut sink, res)) => {
-                        inner.sink = Some(replace(&mut sink, panic!("sink used")));
-                        let _ = completion.send(res);
-                        inner.in_flight_size -= *chunk_size;
-                        inner.update_backpressure();
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        inflight = None;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-                InFlight::Close {
-                    fut, completion, ..
-                } => match fut.as_mut().poll(cx) {
-                    Poll::Ready(res) => {
-                        //let _ = completion.send(res);
-                        if let Some(sender) = completion.take() {
-                            let _ = sender.send(res);
-                        }
-                        inner.state = StreamState::Closed;
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        inflight = None;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-                InFlight::Abort {
-                    fut, completion, ..
-                } => match fut.as_mut().poll(cx) {
-                    Poll::Ready(res) => {
-                        //let _ = completion.send(res);
-                        if let Some(sender) = completion.take() {
-                            let _ = sender.send(res);
-                        }
-                        inner.state = StreamState::Errored;
-                        update_flags(&inner, &backpressure, &closed, &errored);
-                        inflight = None;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-            }
-        }
-
-        // Drain queued writes if none in-flight
-        if inflight.is_none() && inner.state == StreamState::Writable {
-            if let Some(pw) = inner.queue.pop_front() {
-                if let Some(mut sink) = inner.sink.take() {
-                    let chunk_size = inner.strategy.size(&pw.chunk);
-                    let mut ctrl = WritableStreamDefaultController::new(ctrl_tx.clone());
-
-                    let fut = async move {
-                        let res = sink.write(pw.chunk, &mut ctrl).await;
-                        (sink, res)
-                    }
-                    .boxed();
-                    inflight = Some(InFlight::Write {
-                        fut,
-                        completion: pw.completion_tx,
-                        chunk_size,
-                    });
-                    inner.in_flight_size += chunk_size;
-                    inner.update_backpressure();
-                    update_flags(&inner, &backpressure, &closed, &errored);
-                } else {
-                    let _ = pw
-                        .completion_tx
-                        .send(Err(StreamError::Custom("Sink missing".into())));
-                    inner.state = StreamState::Errored;
-                    update_flags(&inner, &backpressure, &closed, &errored);
-                }
-            }
-        }
-
-        // Handle command queue if idle
-        if inflight.is_none() {
-            match Pin::new(&mut command_rx).poll_next(cx) {
-                Poll::Ready(Some(cmd)) => {
-                    match cmd {
-                        StreamCommand::Write { chunk, completion } => {
-                            if let Some(mut sink) = inner.sink.take() {
-                                let chunk_size = inner.strategy.size(&chunk);
-                                let mut ctrl =
-                                    WritableStreamDefaultController::new(ctrl_tx.clone());
-
-                                let fut = async move {
-                                    let res = sink.write(chunk, &mut ctrl).await;
-                                    (sink, res)
-                                }
-                                .boxed();
-                                inflight = Some(InFlight::Write {
-                                    fut,
-                                    completion,
-                                    chunk_size,
-                                });
-                                inner.in_flight_size += chunk_size;
-                                inner.update_backpressure();
-                                update_flags(&inner, &backpressure, &closed, &errored);
-                            } else {
-                                let _ = completion
-                                    .send(Err(StreamError::Custom("Sink missing".into())));
-                                inner.state = StreamState::Errored;
-                                update_flags(&inner, &backpressure, &closed, &errored);
-                            }
-                        }
-                        StreamCommand::Close { completion } => {
-                            if let Some(sink) = inner.sink.take() {
-                                let fut = async move { sink.close().await }.boxed();
-                                inflight = Some(InFlight::Close {
-                                    fut,
-                                    completion: Some(completion),
-                                });
-                            } else {
-                                let _ = completion.send(Ok(()));
-                                inner.state = StreamState::Closed;
-                                update_flags(&inner, &backpressure, &closed, &errored);
-                            }
-                        }
-                        StreamCommand::Abort { reason, completion } => {
-                            if let Some(sink) = inner.sink.take() {
-                                let fut = async move {
-                                    let res = sink.abort(reason).await;
-                                    res
-                                }
-                                .boxed();
-                                inflight = Some(InFlight::Abort {
-                                    fut,
-                                    completion: Some(completion),
-                                });
-                            } else {
-                                let _ = completion.send(Ok(()));
-                                inner.state = StreamState::Errored;
-                                update_flags(&inner, &backpressure, &closed, &errored);
-                            }
-                        }
-                        // Handle any other command variants from your protocol.
-                        _ => {
-                            // Add additional command handling logic as needed.
-                        }
-                    }
-                }
-                Poll::Ready(None) => return Poll::Ready(()), // Channel closed, task exits
-                Poll::Pending => {}
-            }
-        }
-
-        // Continue polling until explicit finish
-        Poll::Pending
-    })
-    .await;*/
 
     poll_fn(|cx| {
         eprintln!("poll_fn executing...");
@@ -1324,7 +562,7 @@ pub async fn stream_task<T, Sink>(
                         update_flags(&inner, &backpressure, &closed, &errored);
                     }
                     StreamCommand::Close { completion } => {
-                        if let Some(sink) = inner.sink.take() {
+                        /*if let Some(sink) = inner.sink.take() {
                             let fut = async move { sink.close().await }.boxed();
                             inflight = Some(InFlight::Close {
                                 fut,
@@ -1334,10 +572,15 @@ pub async fn stream_task<T, Sink>(
                             let _ = completion.send(Ok(()));
                             inner.state = StreamState::Closed;
                             update_flags(&inner, &backpressure, &closed, &errored);
-                        }
+                        }*/
+                        // Instead of starting inflight here,
+                        // *this must be deferred to the flag+completions handling block below*
+                        // Just make sure completion was pushed in process_command.
+                        // So do nothing here or just ignore the completion.
+                        // (You already queued completion sender in process_command)
                     }
                     StreamCommand::Abort { reason, completion } => {
-                        if let Some(sink) = inner.sink.take() {
+                        /*if let Some(sink) = inner.sink.take() {
                             let fut = async move { sink.abort(reason).await }.boxed();
                             inflight = Some(InFlight::Abort {
                                 fut,
@@ -1347,9 +590,42 @@ pub async fn stream_task<T, Sink>(
                             let _ = completion.send(Ok(()));
                             inner.state = StreamState::Errored;
                             update_flags(&inner, &backpressure, &closed, &errored);
-                        }
+                        }*/
+                        // Same as above for abort.
+                        // No action here; completion is queued in process_command.
                     }
                     _ => {}
+                }
+            }
+
+            if inner.close_requested {
+                if let Some(sink) = inner.sink.take() {
+                    let fut = async move { sink.close().await }.boxed();
+                    let completions = std::mem::take(&mut inner.close_completions);
+                    inflight = Some(InFlight::Close { fut, completions });
+                    inner.close_requested = false;
+                } else {
+                    for c in inner.close_completions.drain(..) {
+                        let _ = c.send(Ok(()));
+                    }
+                    inner.state = StreamState::Closed;
+                    inner.close_requested = false;
+                    update_flags(&inner, &backpressure, &closed, &errored);
+                }
+            } else if inner.abort_requested {
+                if let Some(sink) = inner.sink.take() {
+                    let reason = inner.abort_reason.take();
+                    let fut = async move { sink.abort(reason).await }.boxed();
+                    let completions = std::mem::take(&mut inner.abort_completions);
+                    inflight = Some(InFlight::Abort { fut, completions });
+                    inner.abort_requested = false;
+                } else {
+                    for c in inner.abort_completions.drain(..) {
+                        let _ = c.send(Ok(()));
+                    }
+                    inner.state = StreamState::Errored;
+                    inner.abort_requested = false;
+                    update_flags(&inner, &backpressure, &closed, &errored);
                 }
             }
         }
@@ -1385,33 +661,6 @@ pub async fn stream_task<T, Sink>(
         }
 
         // 4. ---- Poll the in-flight future if present ----
-        /*if let Some(inflight_write) = &mut inflight {
-            match inflight_write.fut.as_mut().poll(cx) {
-                Poll::Ready((maybe_sink, result, completion, chunk_size)) => {
-                    if let Some(sink) = maybe_sink {
-                        inner.sink = Some(sink);
-                    }
-                    if chunk_size > 0 {
-                        inner.in_flight_size -= chunk_size;
-                    }
-                    inner.update_backpressure();
-                    update_flags(&inner, &backpressure, &closed, &errored);
-
-                    let _ = completion.send(result.clone());
-
-                    if result.is_err() {
-                        inner.state = StreamState::Errored;
-                        inner.sink = None;
-                        inner.ready_wakers.wake_all();
-                        inner.closed_wakers.wake_all();
-                    }
-                    inflight = None;
-                    cx.waker().wake_by_ref(); // ensure continued draining
-                }
-                Poll::Pending => {}
-            }
-        }*/
-        // 4. ---- Poll the in-flight future if present ----
         if let Some(inflight_op) = &mut inflight {
             match inflight_op {
                 InFlight::Write {
@@ -1444,24 +693,28 @@ pub async fn stream_task<T, Sink>(
                         Poll::Pending => {}
                     }
                 }
-                InFlight::Close { fut, completion } => match fut.as_mut().poll(cx) {
+                InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
-                        if let Some(sender) = completion.take() {
-                            let _ = sender.send(res);
+                        // Notify all waiting close callers
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(res.clone());
                         }
                         inner.state = StreamState::Closed;
+                        inner.close_requested = false;
                         update_flags(&inner, &backpressure, &closed, &errored);
                         inflight = None;
                         cx.waker().wake_by_ref();
                     }
                     Poll::Pending => {}
                 },
-                InFlight::Abort { fut, completion } => match fut.as_mut().poll(cx) {
+                InFlight::Abort { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
-                        if let Some(sender) = completion.take() {
-                            let _ = sender.send(res);
+                        // Notify all waiting abort callers
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(res.clone());
                         }
                         inner.state = StreamState::Errored;
+                        inner.abort_requested = false;
                         update_flags(&inner, &backpressure, &closed, &errored);
                         inflight = None;
                         cx.waker().wake_by_ref();
@@ -1635,111 +888,6 @@ where
     }
 }
 
-/*async fn drain_queue<T, Sink>(
-    inner: &mut WritableStreamInner<T, Sink>,
-    ctrl_tx: &UnboundedSender<ControllerMsg>,
-) -> StreamResult<()>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    // Important: Use a loop that allows modifying the VecDeque,
-    // and process one item at a time.
-    // If you need to break the loop or return early, pop the item first.
-
-    // Using `inner.queue.pop_front()` outside the `if let Some(sink)` block ensures
-    // the item is removed from the queue even if the sink isn't available.
-
-    while let Some(pw) = inner.queue.pop_front() {
-        // pw is now owned
-        if inner.state != StreamState::Writable {
-            let _ = pw
-                .completion_tx
-                .send(Err(StreamError::Custom("Stream is not writable".into())));
-            // We've already popped, so just return.
-            return Err(StreamError::Custom("Stream is not writable".into()));
-        }
-
-        // --- Crucial part: Separate the mutable borrows ---
-
-        // 1. Take mutable ownership of the sink if available.
-        //    We must take ownership here (or re-borrow) because the controller
-        //    also needs a mutable reference to 'inner'.
-        let sink_option = inner.sink.take(); // Temporarily take ownership of the sink
-
-        if let Some(mut sink) = sink_option {
-            let chunk_size = inner.strategy.size(&pw.chunk);
-
-            // Remove from queued total
-            inner.queue_total_size -= chunk_size;
-            inner.update_backpressure();
-
-            // Mark as in-flight
-            inner.in_flight_size += chunk_size;
-            inner.update_backpressure();
-
-            // mutable 'sink' now
-            // Now, 'inner' is available for borrowing by the controller
-            //let mut controller = WritableStreamDefaultController::new(inner);
-            let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
-
-            // Perform the write operation
-            let res = sink.write(pw.chunk, &mut controller).await;
-
-            // When sink write is done, update in-flight
-            inner.in_flight_size -= chunk_size;
-            inner.update_backpressure();
-
-            // After `sink.write` and `controller` are no longer needed for this iteration,
-            // put the sink back into `inner`.
-            inner.sink = Some(sink); // Put the sink back
-
-            // --- Continue with error handling and state updates ---
-            if res.is_err() {
-                inner.state = StreamState::Errored;
-                inner.sink = None; // If errored, permanently remove the sink
-                inner.ready_wakers.wake_all();
-                inner.closed_wakers.wake_all();
-
-                let _ = pw.completion_tx.send(res.clone());
-                return res; // Stop draining on error
-            }
-
-            // Update queue size (recalculating is safer after a pop)
-            /*inner.queue_total_size = inner
-            .queue
-            .iter()
-            .map(|w| inner.strategy.size(&w.chunk))
-            .sum(); // This recalculates total size based on remaining items*/
-
-            //let old_backpressure = inner.backpressure;
-            //inner.backpressure = inner.queue_total_size >= inner.strategy.high_water_mark();
-            //inner.update_backpressure();
-
-            /*if old_backpressure && !inner.backpressure {
-                inner.ready_wakers.wake_all();
-            }*/
-            // Wake .ready() if backpressure cleared
-            if !inner.backpressure {
-                inner.ready_wakers.wake_all();
-            }
-
-            let _ = pw.completion_tx.send(Ok(()));
-        } else {
-            // Sink was already missing (e.g., errored or closed already)
-            let _ = pw
-                .completion_tx
-                .send(Err(StreamError::Custom("Sink missing".into())));
-            // Since we already popped, this is a clean exit for this item.
-            // If the stream is in an errored/closed state, the outer loop will handle it.
-            return Err(StreamError::Custom("Sink missing during drain".into())); // Indicate an issue and stop.
-        }
-    }
-
-    Ok(())
-}
-*/
-
 use std::task::Waker;
 
 pub struct WritableStreamInner<T, Sink> {
@@ -1752,9 +900,15 @@ pub struct WritableStreamInner<T, Sink> {
 
     backpressure: bool,
     locked: bool,
+
+    /// `close()` in progress flag and completions waiting for close
     close_requested: bool,
+    close_completions: Vec<oneshot::Sender<StreamResult<()>>>,
 
     abort_reason: Option<String>,
+    /// `abort()` in progress flag and completions waiting for abort
+    abort_requested: bool,
+    abort_completions: Vec<oneshot::Sender<StreamResult<()>>>,
 
     ready_wakers: WakerSet,
     closed_wakers: WakerSet,
@@ -1788,8 +942,6 @@ pub enum ControllerMsg {
     // Maybe signal custom logic for specific sinks
 }
 
-use futures::channel::mpsc::UnboundedReceiver;
-
 /// Handle all controller-to-driver messages in a single step.
 /// Call this in your poll_fn, before or after handling work.
 fn process_controller_msgs<T, Sink>(
@@ -1817,8 +969,6 @@ fn process_controller_msgs<T, Sink>(
     }
 }
 
-use futures::channel::mpsc::{UnboundedSender, unbounded};
-
 pub struct WritableStreamDefaultController {
     tx: UnboundedSender<ControllerMsg>,
 }
@@ -1841,90 +991,6 @@ impl WritableStreamDefaultController {
             .unbounded_send(ControllerMsg::SetBackpressure(backpressure));
     }
 }
-
-/*use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-pub struct ReadyFuture<T, Sink> {
-    stream: WritableStream<T, Sink>,
-}
-
-impl<T, Sink> ReadyFuture<T, Sink> {
-    pub fn new(stream: WritableStream<T, Sink>) -> Self {
-        Self { stream }
-    }
-}
-
-impl<T, Sink> Future for ReadyFuture<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    type Output = StreamResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.stream.errored.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
-        }
-        if self.stream.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
-        }
-        if !self.stream.backpressure.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-        // If backpressure, register waker - this requires additional channel or mechanism
-        // For brevity, we wake to retry polling later
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-}
-
-pub struct ClosedFuture<T, Sink> {
-    stream: WritableStream<T, Sink>,
-}
-
-impl<T, Sink> ClosedFuture<T, Sink> {
-    pub fn new(stream: WritableStream<T, Sink>) -> Self {
-        Self { stream }
-    }
-}
-
-impl<T, Sink> Future for ClosedFuture<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    type Output = StreamResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.stream.errored.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
-        }
-        if self.stream.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-        // Not closed yet, register waker similarly (simplified)
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-}
-
-impl<T, Sink> WritableStream<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    pub fn ready(&self) -> impl Future<Output = StreamResult<()>> + Send {
-        ReadyFuture::new(self.clone())
-    }
-
-    pub fn closed(&self) -> impl Future<Output = StreamResult<()>> + Send {
-        ClosedFuture::new(self.clone())
-    }
-}
-*/
-use std::future::Future;
 
 pub struct ReadyFuture<T, Sink> {
     stream: WritableStream<T, Sink>,
@@ -1955,13 +1021,18 @@ where
         }
         // Not ready, register waker:
         let waker = cx.waker().clone();
-        let mut sender = self.stream.command_tx.clone();
+        //let mut sender = self.stream.command_tx.clone();
         // Spawn a task to send the waker asynchronously because poll must be sync
         // Note: in real executor, consider futures::task::spawn_local or other task spawner
-        std::thread::spawn(move || {
+        /* std::thread::spawn(move || {
             futures::executor::block_on(sender.send(StreamCommand::RegisterReadyWaker { waker }))
                 .ok();
-        });
+        });*/
+        let _ = self
+            .stream
+            .command_tx
+            .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+        // If the channel is full or busy, that's okay—the next poll will try again.
         Poll::Pending
     }
 }
@@ -1991,11 +1062,10 @@ where
             return Poll::Ready(Ok(()));
         }
         let waker = cx.waker().clone();
-        let mut sender = self.stream.command_tx.clone();
-        std::thread::spawn(move || {
-            futures::executor::block_on(sender.send(StreamCommand::RegisterClosedWaker { waker }))
-                .ok();
-        });
+        let _ = self
+            .stream
+            .command_tx
+            .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
         Poll::Pending
     }
 }
