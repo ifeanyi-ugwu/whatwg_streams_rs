@@ -1,7 +1,7 @@
 use super::QueuingStrategy;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use futures::channel::{mpsc, oneshot};
+use futures::channel::oneshot;
 use futures::future::FutureExt;
 use futures::future::poll_fn;
 use futures::{SinkExt, StreamExt, future};
@@ -530,9 +530,8 @@ pub async fn stream_task<T, Sink>(
         eprintln!("poll_fn executing...");
 
         process_controller_msgs(&mut inner, &mut ctrl_rx);
-        //let mut pending_cmd: Option<StreamCommand<T>> = None;
 
-        // Drain all commands, admin *and* work commands
+        // Drain all commands, admin and work commands
         loop {
             match command_rx.poll_next_unpin(cx) {
                 Poll::Ready(Some(cmd)) => {
@@ -566,61 +565,7 @@ pub async fn stream_task<T, Sink>(
         }
 
         // 2. ---- If not currently working, handle one "work" command ----
-        //let mut pending_cmd: Option<StreamCommand<T>> = None; // add this declaration outside poll_fn if you want a true static; else make it mutable at appropriate scope above.
-        // (Best practice: move pending_cmd into an outer scope if you want to buffer only one.)
-
         if inflight.is_none() {
-            /*if let Some(cmd) = { pending_cmd.take() } {
-                            match cmd {
-                                StreamCommand::Write { chunk, completion } => {
-                                    let chunk_size = inner.strategy.size(&chunk);
-                                    let pw = PendingWrite {
-                                        chunk,
-                                        completion_tx: completion,
-                                    };
-                                    inner.queue.push_back(pw);
-                                    inner.queue_total_size += chunk_size;
-                                    inner.update_backpressure();
-                                    update_flags(&inner, &backpressure, &closed, &errored);
-                                }
-                                StreamCommand::Close { completion } => {
-                                    /*if let Some(sink) = inner.sink.take() {
-                                        let fut = async move { sink.close().await }.boxed();
-                                        inflight = Some(InFlight::Close {
-                                            fut,
-                                            completion: Some(completion),
-                                        });
-                                    } else {
-                                        let _ = completion.send(Ok(()));
-                                        inner.state = StreamState::Closed;
-                                        update_flags(&inner, &backpressure, &closed, &errored);
-                                    }*/
-                                    // Instead of starting inflight here,
-                                    // *this must be deferred to the flag+completions handling block below*
-                                    // Just make sure completion was pushed in process_command.
-                                    // So do nothing here or just ignore the completion.
-                                    // (You already queued completion sender in process_command)
-                                }
-                                StreamCommand::Abort { reason, completion } => {
-                                    /*if let Some(sink) = inner.sink.take() {
-                                        let fut = async move { sink.abort(reason).await }.boxed();
-                                        inflight = Some(InFlight::Abort {
-                                            fut,
-                                            completion: Some(completion),
-                                        });
-                                    } else {
-                                        let _ = completion.send(Ok(()));
-                                        inner.state = StreamState::Errored;
-                                        update_flags(&inner, &backpressure, &closed, &errored);
-                                    }*/
-                                    // Same as above for abort.
-                                    // No action here; completion is queued in process_command.
-                                }
-                                _ => {}
-                            }
-                        }
-            */
-
             if inner.close_requested {
                 if let Some(sink) = inner.sink.take() {
                     let fut = async move { sink.close().await }.boxed();
@@ -641,9 +586,6 @@ pub async fn stream_task<T, Sink>(
                     let fut = async move { sink.abort(reason).await }.boxed();
                     let completions = std::mem::take(&mut inner.abort_completions);
                     inflight = Some(InFlight::Abort { fut, completions });
-                    //inner.abort_requested = false;
-                    // Clear abort_requested here is optional — keep until future completes for clarity
-                    // inner.abort_requested = false; // **DO NOT clear here; only after future completes**
                 } else {
                     // No sink to abort — consider abort complete
                     for c in inner.abort_completions.drain(..) {
@@ -709,8 +651,7 @@ pub async fn stream_task<T, Sink>(
                             if result.is_err() {
                                 inner.state = StreamState::Errored;
                                 inner.sink = None;
-                                //inner.ready_wakers.wake_all();
-                                //inner.closed_wakers.wake_all();
+
                                 update_flags(&mut inner, &backpressure, &closed, &errored);
                             }
                             inflight = None;
@@ -931,10 +872,6 @@ where
 pub enum ControllerMsg {
     /// Trigger a stream error (controller.error(...))
     Error(StreamError),
-    /// Set/clear backpressure (if you expose this—which in WHATWG is not required, but up to you)
-    SetBackpressure(bool),
-    // Add more actions if your controller needs (close, abort, etc)
-    // Maybe signal custom logic for specific sinks
 }
 
 /// Handle all controller-to-driver messages in a single step.
@@ -953,13 +890,6 @@ fn process_controller_msgs<T, Sink>(
                 inner.ready_wakers.wake_all();
                 inner.closed_wakers.wake_all();
             }
-            ControllerMsg::SetBackpressure(bp) => {
-                let old = inner.backpressure;
-                inner.backpressure = bp;
-                if old && !bp {
-                    inner.ready_wakers.wake_all();
-                }
-            } // Add custom pattern matches for any other messages
         }
     }
 }
@@ -977,13 +907,6 @@ impl WritableStreamDefaultController {
     pub fn error(&self, error: StreamError) {
         // ignore send failure if receiver is dropped
         let _ = self.tx.unbounded_send(ControllerMsg::Error(error));
-    }
-
-    /// Update backpressure state and wake ready futures if needed
-    pub fn set_backpressure(&self, backpressure: bool) {
-        let _ = self
-            .tx
-            .unbounded_send(ControllerMsg::SetBackpressure(backpressure));
     }
 }
 
@@ -1016,13 +939,6 @@ where
         }
         // Not ready, register waker:
         let waker = cx.waker().clone();
-        //let mut sender = self.stream.command_tx.clone();
-        // Spawn a task to send the waker asynchronously because poll must be sync
-        // Note: in real executor, consider futures::task::spawn_local or other task spawner
-        /* std::thread::spawn(move || {
-            futures::executor::block_on(sender.send(StreamCommand::RegisterReadyWaker { waker }))
-                .ok();
-        });*/
         let _ = self
             .stream
             .command_tx
