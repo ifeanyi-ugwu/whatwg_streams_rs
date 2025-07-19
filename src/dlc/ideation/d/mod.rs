@@ -1,6 +1,7 @@
 pub mod readable;
 pub mod transform;
 pub mod writable;
+pub mod writable_new;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
