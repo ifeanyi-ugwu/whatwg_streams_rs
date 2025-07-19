@@ -1,4 +1,4 @@
-use super::{Locked, StreamError, StreamResult, StreamState, Unlocked};
+use super::{Locked, StreamError, StreamResult, Unlocked};
 use futures_core::Stream;
 use std::{
     future::Future,
@@ -6,6 +6,12 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+
+pub enum StreamState {
+    Readable,
+    Closed,
+    Errored,
+}
 
 /// ReadableStream with typestate to prevent misuse
 pub struct ReadableStream<T, S = Unlocked> {
