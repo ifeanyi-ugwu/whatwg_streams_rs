@@ -60,8 +60,8 @@ impl From<String> for ArcError {
 #[derive(Debug, Clone)]
 pub enum StreamError {
     Canceled,
-    TypeError(String),
-    NetworkError(String),
+    //TypeError(String),
+    //NetworkError(String),
     Custom(ArcError),
 }
 
@@ -201,18 +201,17 @@ where
         rx.await
             .map_err(|_| StreamError::Custom("Lock response lost".into()))??;
 
+        let locked = WritableStream {
+            command_tx: self.command_tx.clone(),
+            backpressure: Arc::clone(&self.backpressure),
+            closed: Arc::clone(&self.closed),
+            errored: Arc::clone(&self.errored),
+            _sink: PhantomData,
+            _state: PhantomData::<Locked>,
+        };
+
         // Upon success, produce the locked stream and writer
-        Ok((
-            WritableStream {
-                command_tx: self.command_tx.clone(),
-                backpressure: Arc::clone(&self.backpressure),
-                closed: Arc::clone(&self.closed),
-                errored: Arc::clone(&self.errored),
-                _sink: PhantomData,
-                _state: PhantomData::<Locked>,
-            },
-            WritableStreamDefaultWriter::new(self.clone()),
-        ))
+        Ok((locked.clone(), WritableStreamDefaultWriter::new(locked)))
     }
 }
 
@@ -745,7 +744,7 @@ fn update_flags<T, Sink>(
 }
 
 pub struct WritableStreamDefaultWriter<T, Sink> {
-    stream: WritableStream<T, Sink>,
+    stream: WritableStream<T, Sink, Locked>,
 }
 
 impl<T, Sink> WritableStreamDefaultWriter<T, Sink>
@@ -754,7 +753,7 @@ where
     Sink: WritableSink<T> + Send + 'static,
 {
     /// Create a new writer linked to the stream
-    pub fn new(stream: WritableStream<T, Sink>) -> Self {
+    pub fn new(stream: WritableStream<T, Sink, Locked>) -> Self {
         Self { stream }
     }
 
