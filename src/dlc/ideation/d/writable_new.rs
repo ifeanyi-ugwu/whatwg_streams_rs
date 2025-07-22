@@ -11,7 +11,7 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -101,9 +101,9 @@ pub enum StreamCommand<T> {
         reason: Option<String>,
         completion: oneshot::Sender<StreamResult<()>>,
     },
-    GetDesiredSize {
+    /*GetDesiredSize {
         completion: oneshot::Sender<Option<usize>>,
-    },
+    },*/
     RegisterReadyWaker {
         waker: Waker,
     },
@@ -111,15 +111,17 @@ pub enum StreamCommand<T> {
     RegisterClosedWaker {
         waker: Waker,
     },
-
-    LockStream {
+    /*LockStream {
         completion: oneshot::Sender<Result<(), StreamError>>,
     },
     UnlockStream {
-        completion: oneshot::Sender<Result<(), StreamError>>,
-    },
+        completion: Option<oneshot::Sender<Result<(), StreamError>>>,
+    },*/
     // Later add GetWriter, ReleaseLock, etc
 }
+
+pub struct Unlocked;
+pub struct Locked;
 
 /// Public handle, clonable, holds task command sender and atomic flags
 pub struct WritableStream<T, Sink, S = Unlocked> {
@@ -127,8 +129,319 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
     backpressure: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     errored: Arc<AtomicBool>,
+    locked: Arc<AtomicBool>,
+    queue_total_size: Arc<AtomicUsize>,
+    in_flight_size: Arc<AtomicUsize>,
+    high_water_mark: Arc<AtomicUsize>,
     _sink: PhantomData<Sink>,
     _state: PhantomData<S>,
+}
+
+impl<T, Sink, S> WritableStream<T, Sink, S> {
+    pub fn locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst)
+    }
+}
+
+impl<T, Sink> WritableStream<T, Sink>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    pub fn ready(&self) -> ReadyFuture<T, Sink> {
+        ReadyFuture::new(self.clone())
+    }
+
+    pub fn closed(&self) -> ClosedFuture<T, Sink> {
+        ClosedFuture::new(self.clone())
+    }
+}
+
+impl<T, Sink, S> WritableStream<T, Sink, S>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    /// Abort the stream, signaling that no more data will be written.
+    /// This rejects all pending writes and errors the stream.
+    /// Matches WritableStream.abort() in WHATWG spec.
+    pub async fn abort(&self, reason: Option<String>) -> StreamResult<()> {
+        let (tx, rx) = oneshot::channel();
+
+        // Send the Abort command to the stream task
+        self.command_tx
+            .clone()
+            .send(StreamCommand::Abort {
+                reason,
+                completion: tx,
+            })
+            .await
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+
+        // Await the completion of the abort operation
+        rx.await
+            .unwrap_or_else(|_| Err(StreamError::Custom("Abort operation canceled".into())))
+    }
+
+    pub async fn close(&self) -> StreamResult<()> {
+        let (tx, rx) = oneshot::channel();
+
+        self.command_tx
+            .clone()
+            .send(StreamCommand::Close { completion: tx })
+            .await
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+
+        rx.await
+            .unwrap_or_else(|_| Err(StreamError::Custom("Close canceled".into())))
+    }
+}
+
+impl<T, Sink> WritableStream<T, Sink, Unlocked>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    /*pub async fn get_writer(
+        self,
+    ) -> Result<
+        (
+            WritableStream<T, Sink, Locked>,
+            WritableStreamDefaultWriter<T, Sink>,
+        ),
+        StreamError,
+    > {
+        let (tx, rx) = oneshot::channel();
+
+        // Send a special LockStream command to stream task to acquire lock
+        self.command_tx
+            .clone()
+            .send(StreamCommand::LockStream { completion: tx })
+            .await
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+
+        // Wait for lock acquisition confirmation
+        rx.await
+            .map_err(|_| StreamError::Custom("Lock response lost".into()))??;
+
+        let locked = WritableStream {
+            command_tx: self.command_tx.clone(),
+            backpressure: Arc::clone(&self.backpressure),
+            closed: Arc::clone(&self.closed),
+            errored: Arc::clone(&self.errored),
+            locked: Arc::clone(&self.locked),
+            _sink: PhantomData,
+            _state: PhantomData::<Locked>,
+        };
+
+        // Upon success, produce the locked stream and writer
+        Ok((locked.clone(), WritableStreamDefaultWriter::new(locked)))
+    }*/
+    pub fn get_writer(
+        &self,
+    ) -> Result<
+        (
+            WritableStream<T, Sink, Locked>,
+            WritableStreamDefaultWriter<T, Sink>,
+        ),
+        StreamError,
+    > {
+        // Attempt to atomically acquire the lock:
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(StreamError::Custom(ArcError::from("Stream already locked")));
+        }
+
+        let locked = WritableStream {
+            command_tx: self.command_tx.clone(),
+            backpressure: Arc::clone(&self.backpressure),
+            closed: Arc::clone(&self.closed),
+            errored: Arc::clone(&self.errored),
+            locked: Arc::clone(&self.locked),
+            queue_total_size: Arc::clone(&self.queue_total_size),
+            in_flight_size: Arc::clone(&self.in_flight_size),
+            high_water_mark: Arc::clone(&self.high_water_mark),
+            _sink: PhantomData,
+            _state: PhantomData::<Locked>,
+        };
+
+        Ok((locked.clone(), WritableStreamDefaultWriter::new(locked)))
+    }
+}
+
+impl<T, Sink> WritableStream<T, Sink>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    /// Create new WritableStream handle and spawn stream task
+    pub fn new(sink: Sink, strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>) -> Self {
+        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
+        let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
+
+        let inner = WritableStreamInner {
+            state: StreamState::Writable,
+            queue: VecDeque::new(),
+            queue_total_size: 0,
+            in_flight_size: 0,
+            strategy,
+            sink: Some(sink),
+            backpressure: false,
+            //locked: false,
+            close_requested: false,
+            close_completions: Vec::new(),
+            abort_reason: None,
+            abort_requested: false,
+            abort_completions: Vec::new(),
+            ready_wakers: WakerSet::new(),
+            closed_wakers: WakerSet::new(),
+        };
+
+        let backpressure = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let errored = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        let queue_total_size = Arc::new(AtomicUsize::new(0));
+        let in_flight_size = Arc::new(AtomicUsize::new(0));
+
+        // Spawn the async stream task that processes stream commands
+        spawn_stream_task(
+            command_rx,
+            inner,
+            Arc::clone(&backpressure),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&in_flight_size),
+        );
+
+        Self {
+            command_tx,
+            backpressure,
+            closed,
+            errored,
+            locked,
+            queue_total_size,
+            in_flight_size,
+            high_water_mark,
+            _sink: PhantomData,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn new_with_spawn<F>(
+        sink: Sink,
+        strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>,
+        spawn_fn: F,
+    ) -> Self
+    where
+        F: FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static,
+    {
+        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
+        let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
+
+        let inner = WritableStreamInner {
+            state: StreamState::Writable,
+            queue: VecDeque::new(),
+            queue_total_size: 0,
+            in_flight_size: 0,
+            strategy,
+            sink: Some(sink),
+            backpressure: false,
+            //locked: false,
+            close_requested: false,
+            close_completions: Vec::new(),
+            abort_reason: None,
+            abort_requested: false,
+            abort_completions: Vec::new(),
+            ready_wakers: WakerSet::new(),
+            closed_wakers: WakerSet::new(),
+        };
+
+        let backpressure = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let errored = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        let queue_total_size = Arc::new(AtomicUsize::new(0));
+        let in_flight_size = Arc::new(AtomicUsize::new(0));
+
+        let backpressure_clone = backpressure.clone();
+        let closed_clone = closed.clone();
+        let errored_clone = errored.clone();
+        let queue_total_size_clone = queue_total_size.clone();
+        let in_flight_size_clone = in_flight_size.clone();
+        let fut = async move {
+            stream_task(
+                command_rx,
+                inner,
+                backpressure_clone,
+                closed_clone,
+                errored_clone,
+                queue_total_size_clone,
+                in_flight_size_clone,
+            )
+            .await;
+        };
+
+        spawn_fn(Box::pin(fut));
+
+        Self {
+            command_tx,
+            backpressure,
+            closed,
+            errored,
+            locked,
+            queue_total_size,
+            in_flight_size,
+            high_water_mark,
+            _sink: PhantomData,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl<T, Sink, S> WritableStream<T, Sink, S>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    fn desired_size(&self) -> Option<usize> {
+        if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
+            return None;
+        }
+
+        let queue_size = self.queue_total_size.load(Ordering::SeqCst);
+        let inflight_size = self.in_flight_size.load(Ordering::SeqCst);
+        let hwm = self.high_water_mark.load(Ordering::SeqCst);
+
+        let total_size = queue_size + inflight_size;
+
+        if total_size >= hwm {
+            Some(0)
+        } else {
+            Some(hwm - total_size)
+        }
+    }
+}
+
+impl<T, Sink, S> Clone for WritableStream<T, Sink, S> {
+    fn clone(&self) -> Self {
+        Self {
+            command_tx: self.command_tx.clone(),
+            backpressure: Arc::clone(&self.backpressure),
+            closed: Arc::clone(&self.closed),
+            errored: Arc::clone(&self.errored),
+            locked: Arc::clone(&self.locked),
+            queue_total_size: Arc::clone(&self.queue_total_size),
+            in_flight_size: Arc::clone(&self.in_flight_size),
+            high_water_mark: Arc::clone(&self.high_water_mark),
+            _sink: PhantomData,
+            _state: PhantomData,
+        }
+    }
 }
 
 pub trait WritableSink<T: Send + 'static>: Sized {
@@ -158,202 +471,6 @@ pub trait WritableSink<T: Send + 'static>: Sized {
     }
 }
 
-pub struct Unlocked;
-pub struct Locked;
-
-impl<T, Sink, S> Clone for WritableStream<T, Sink, S> {
-    fn clone(&self) -> Self {
-        Self {
-            command_tx: self.command_tx.clone(),
-            backpressure: Arc::clone(&self.backpressure),
-            closed: Arc::clone(&self.closed),
-            errored: Arc::clone(&self.errored),
-            _sink: PhantomData,
-            _state: PhantomData,
-        }
-    }
-}
-
-impl<T, Sink> WritableStream<T, Sink, Unlocked>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    pub async fn get_writer(
-        self,
-    ) -> Result<
-        (
-            WritableStream<T, Sink, Locked>,
-            WritableStreamDefaultWriter<T, Sink>,
-        ),
-        StreamError,
-    > {
-        let (tx, rx) = oneshot::channel();
-
-        // Send a special LockStream command to stream task to acquire lock
-        self.command_tx
-            .clone()
-            .send(StreamCommand::LockStream { completion: tx })
-            .await
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
-
-        // Wait for lock acquisition confirmation
-        rx.await
-            .map_err(|_| StreamError::Custom("Lock response lost".into()))??;
-
-        let locked = WritableStream {
-            command_tx: self.command_tx.clone(),
-            backpressure: Arc::clone(&self.backpressure),
-            closed: Arc::clone(&self.closed),
-            errored: Arc::clone(&self.errored),
-            _sink: PhantomData,
-            _state: PhantomData::<Locked>,
-        };
-
-        // Upon success, produce the locked stream and writer
-        Ok((locked.clone(), WritableStreamDefaultWriter::new(locked)))
-    }
-}
-
-impl<T, Sink> WritableStreamDefaultWriter<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    pub async fn release_lock(self) -> WritableStream<T, Sink, Unlocked> {
-        let (tx, rx) = oneshot::channel();
-
-        self.stream
-            .command_tx
-            .clone()
-            .send(StreamCommand::UnlockStream { completion: tx })
-            .await
-            .expect("Stream task dropped");
-
-        rx.await
-            .expect("Unlock response lost")
-            .expect("Unlock failed");
-
-        WritableStream {
-            command_tx: self.stream.command_tx.clone(),
-            backpressure: Arc::clone(&self.stream.backpressure),
-            closed: Arc::clone(&self.stream.closed),
-            errored: Arc::clone(&self.stream.errored),
-            _sink: PhantomData,
-            _state: PhantomData::<Unlocked>,
-        }
-    }
-}
-
-impl<T, Sink> WritableStream<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    /// Create new WritableStream handle and spawn stream task
-    pub fn new(sink: Sink, strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>) -> Self {
-        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
-
-        let inner = WritableStreamInner {
-            state: StreamState::Writable,
-            queue: VecDeque::new(),
-            queue_total_size: 0,
-            in_flight_size: 0,
-            strategy,
-            sink: Some(sink),
-            backpressure: false,
-            locked: false,
-            close_requested: false,
-            close_completions: Vec::new(),
-            abort_reason: None,
-            abort_requested: false,
-            abort_completions: Vec::new(),
-            ready_wakers: WakerSet::new(),
-            closed_wakers: WakerSet::new(),
-        };
-
-        let backpressure = Arc::new(AtomicBool::new(false));
-        let closed = Arc::new(AtomicBool::new(false));
-        let errored = Arc::new(AtomicBool::new(false));
-
-        // Spawn the async stream task that processes stream commands
-        spawn_stream_task(
-            command_rx,
-            inner,
-            Arc::clone(&backpressure),
-            Arc::clone(&closed),
-            Arc::clone(&errored),
-        );
-
-        Self {
-            command_tx,
-            backpressure,
-            closed,
-            errored,
-            _sink: PhantomData,
-            _state: PhantomData,
-        }
-    }
-
-    pub fn new_with_spawn<F>(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>,
-        spawn_fn: F,
-    ) -> Self
-    where
-        F: FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static,
-    {
-        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
-
-        let inner = WritableStreamInner {
-            state: StreamState::Writable,
-            queue: VecDeque::new(),
-            queue_total_size: 0,
-            in_flight_size: 0,
-            strategy,
-            sink: Some(sink),
-            backpressure: false,
-            locked: false,
-            close_requested: false,
-            close_completions: Vec::new(),
-            abort_reason: None,
-            abort_requested: false,
-            abort_completions: Vec::new(),
-            ready_wakers: WakerSet::new(),
-            closed_wakers: WakerSet::new(),
-        };
-
-        let backpressure = Arc::new(AtomicBool::new(false));
-        let closed = Arc::new(AtomicBool::new(false));
-        let errored = Arc::new(AtomicBool::new(false));
-
-        let backpressure_clone = backpressure.clone();
-        let closed_clone = closed.clone();
-        let errored_clone = errored.clone();
-        let fut = async move {
-            stream_task(
-                command_rx,
-                inner,
-                backpressure_clone,
-                closed_clone,
-                errored_clone,
-            )
-            .await;
-        };
-
-        spawn_fn(Box::pin(fut));
-
-        Self {
-            command_tx,
-            backpressure,
-            closed,
-            errored,
-            _sink: PhantomData,
-            _state: PhantomData,
-        }
-    }
-}
-
 /// Replace with actual spawning mechanism async executor/runtime
 ///
 /// For example, with futures crate ThreadPool:
@@ -364,6 +481,8 @@ fn spawn_stream_task<T, Sink>(
     backpressure: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     errored: Arc<AtomicBool>,
+    queue_total_size: Arc<AtomicUsize>,
+    in_flight_size: Arc<AtomicUsize>,
 ) where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
@@ -377,6 +496,8 @@ fn spawn_stream_task<T, Sink>(
             backpressure,
             closed,
             errored,
+            queue_total_size,
+            in_flight_size,
         ));
     });
 }
@@ -388,6 +509,8 @@ fn process_command<T, Sink>(
     backpressure: &Arc<AtomicBool>,
     closed: &Arc<AtomicBool>,
     errored: &Arc<AtomicBool>,
+    queue_total_size: &Arc<AtomicUsize>,
+    in_flight_size: &Arc<AtomicUsize>,
     _cx: &mut Context<'_>,
 ) where
     T: Send + 'static,
@@ -410,6 +533,7 @@ fn process_command<T, Sink>(
             });
             inner.queue_total_size += chunk_size;
             inner.update_backpressure();
+            update_atomic_counters(inner, queue_total_size, in_flight_size);
             update_flags(&inner, backpressure, closed, errored);
         }
         StreamCommand::Close { completion } => {
@@ -453,7 +577,7 @@ fn process_command<T, Sink>(
             }
             update_flags(&inner, backpressure, closed, errored);
         }
-        StreamCommand::GetDesiredSize { completion } => {
+        /*StreamCommand::GetDesiredSize { completion } => {
             let high_water_mark = inner.strategy.high_water_mark();
             let total = inner.queue_total_size + inner.in_flight_size;
             let size = if inner.state == StreamState::Writable {
@@ -466,29 +590,32 @@ fn process_command<T, Sink>(
                 None
             };
             let _ = completion.send(size);
-        }
+        }*/
         StreamCommand::RegisterReadyWaker { waker } => {
             inner.ready_wakers.register(&waker);
         }
         StreamCommand::RegisterClosedWaker { waker } => {
             inner.closed_wakers.register(&waker);
-        }
-        StreamCommand::LockStream { completion } => {
-            let _ = if inner.locked {
-                completion.send(Err(StreamError::Custom("Stream already locked".into())))
-            } else {
-                inner.locked = true;
-                completion.send(Ok(()))
-            };
-        }
-        StreamCommand::UnlockStream { completion } => {
-            let _ = if !inner.locked {
-                completion.send(Err(StreamError::Custom("Stream not locked".into())))
-            } else {
-                inner.locked = false;
-                completion.send(Ok(()))
-            };
-        }
+        } /*StreamCommand::LockStream { completion } => {
+              let _ = if inner.locked {
+                  completion.send(Err(StreamError::Custom("Stream already locked".into())))
+              } else {
+                  inner.locked = true;
+                  completion.send(Ok(()))
+              };
+          }
+          StreamCommand::UnlockStream { completion } => {
+              let _ = if !inner.locked {
+                  if let Some(c) = completion {
+                      let _ = c.send(Err(StreamError::Custom("Stream not locked".into())));
+                  }
+              } else {
+                  inner.locked = false;
+                  if let Some(c) = completion {
+                      let _ = c.send(Ok(()));
+                  }
+              };
+          }*/
     }
 }
 
@@ -515,6 +642,8 @@ pub async fn stream_task<T, Sink>(
     backpressure: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     errored: Arc<AtomicBool>,
+    queue_total_size: Arc<AtomicUsize>,
+    in_flight_size: Arc<AtomicUsize>,
 ) where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
@@ -526,15 +655,22 @@ pub async fn stream_task<T, Sink>(
     ) = unbounded();
 
     poll_fn(|cx| {
-        eprintln!("poll_fn executing...");
-
         process_controller_msgs(&mut inner, &mut ctrl_rx);
 
         // Drain all commands, admin and work commands
         loop {
             match command_rx.poll_next_unpin(cx) {
                 Poll::Ready(Some(cmd)) => {
-                    process_command(cmd, &mut inner, &backpressure, &closed, &errored, cx);
+                    process_command(
+                        cmd,
+                        &mut inner,
+                        &backpressure,
+                        &closed,
+                        &errored,
+                        &queue_total_size,
+                        &in_flight_size,
+                        cx,
+                    );
                     // Continue draining all commands in the same poll
                 }
                 Poll::Ready(None) => return Poll::Ready(()),
@@ -753,7 +889,7 @@ where
     Sink: WritableSink<T> + Send + 'static,
 {
     /// Create a new writer linked to the stream
-    pub fn new(stream: WritableStream<T, Sink, Locked>) -> Self {
+    fn new(stream: WritableStream<T, Sink, Locked>) -> Self {
         Self { stream }
     }
 
@@ -809,7 +945,7 @@ where
     }
 
     /// Get the desired size asynchronously (how much data the stream can accept)
-    pub async fn desired_size(&self) -> Option<usize> {
+    /*pub async fn desired_size(&self) -> Option<usize> {
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -820,6 +956,89 @@ where
             .await;
 
         rx.await.ok().flatten()
+    }*/
+
+    /// Get the desired size synchronously (how much data the stream can accept)
+    /// Returns None if the stream is closed or errored
+    pub fn desired_size(&self) -> Option<usize> {
+        self.stream.desired_size()
+    }
+}
+
+// Update the stream task to maintain the atomic counters
+fn update_atomic_counters<T, Sink>(
+    inner: &WritableStreamInner<T, Sink>,
+    queue_total_size: &Arc<AtomicUsize>,
+    in_flight_size: &Arc<AtomicUsize>,
+) {
+    queue_total_size.store(inner.queue_total_size, Ordering::SeqCst);
+    in_flight_size.store(inner.in_flight_size, Ordering::SeqCst);
+}
+
+impl<T, Sink> WritableStreamDefaultWriter<T, Sink>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    /*pub async fn release_lock(self) -> WritableStream<T, Sink, Unlocked> {
+        let (tx, rx) = oneshot::channel();
+
+        self.stream
+            .command_tx
+            .clone()
+            .send(StreamCommand::UnlockStream { completion: tx })
+            .await
+            .expect("Stream task dropped");
+
+        rx.await
+            .expect("Unlock response lost")
+            .expect("Unlock failed");
+
+        WritableStream {
+            command_tx: self.stream.command_tx.clone(),
+            backpressure: Arc::clone(&self.stream.backpressure),
+            closed: Arc::clone(&self.stream.closed),
+            errored: Arc::clone(&self.stream.errored),
+            _sink: PhantomData,
+            _state: PhantomData::<Unlocked>,
+        }
+    }*/
+    /*pub async fn release_lock_async(self) -> Result<(), StreamError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream
+            .command_tx
+            .clone()
+            .send(StreamCommand::UnlockStream {
+                completion: Some(tx),
+            })
+            .await
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+
+        rx.await
+            .map_err(|_| StreamError::Custom("Unlock response lost".into()))??
+        // `??` to propagate both errors
+    }*/
+    /*pub fn release_lock(self) -> StreamResult<()> {
+        self.stream
+            .command_tx
+            .unbounded_send(StreamCommand::UnlockStream { completion: None })
+            .map_err(|_| StreamError::Custom(ArcError::from("Stream task dropped")))?;
+        Ok(())
+        // Do NOT await any response here, immediate release.
+        // Drop self afterwards.
+    }*/
+    pub fn release_lock(self) -> StreamResult<()> {
+        self.stream.locked.store(false, Ordering::SeqCst);
+
+        Ok(())
+    }
+}
+
+//TODO: ready and closed may be rightful belong here
+
+impl<T, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
+    fn drop(&mut self) {
+        self.stream.locked.store(false, Ordering::SeqCst);
     }
 }
 
@@ -834,8 +1053,7 @@ pub struct WritableStreamInner<T, Sink> {
     sink: Option<Sink>,
 
     backpressure: bool,
-    locked: bool,
-
+    //locked: bool,
     /// `close()` in progress flag and completions waiting for close
     close_requested: bool,
     close_completions: Vec<oneshot::Sender<StreamResult<()>>>,
@@ -854,8 +1072,6 @@ where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
-    // ...other methods...
-
     /// Update the stream's backpressure flag to reflect the current load.
     fn update_backpressure(&mut self) {
         let total = self.queue_total_size + self.in_flight_size;
@@ -988,20 +1204,6 @@ where
     }
 }
 
-impl<T, Sink> WritableStream<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    pub fn ready(&self) -> ReadyFuture<T, Sink> {
-        ReadyFuture::new(self.clone())
-    }
-
-    pub fn closed(&self) -> ClosedFuture<T, Sink> {
-        ClosedFuture::new(self.clone())
-    }
-}
-
 /// A lightweight, thread-safe set storing multiple wakers.
 /// It ensures wakers are stored without duplicates (based on `will_wake`).
 #[derive(Clone, Default)]
@@ -1087,7 +1289,7 @@ mod tests {
         /*let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
             tokio::spawn(fut);
         });*/
-        let (locked_stream, writer) = stream.get_writer().await.expect("get_writer");
+        let (locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Write some chunks
         writer.write(vec![1, 2, 3]).await.expect("write");
@@ -1109,7 +1311,7 @@ mod tests {
         let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |future| {
             tokio::spawn(future);
         });
-        let (_locked_stream, writer) = stream.get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Write data chunks asynchronously
         writer.write(vec![1, 2, 3]).await.expect("write 1");
@@ -1160,7 +1362,7 @@ mod tests {
         let sink = CountingSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink.clone(), strategy);
-        let (_locked_stream, writer) = stream.get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         writer.write(vec![1]).await.expect("write 1");
         writer.write(vec![2]).await.expect("write 2");
@@ -1222,7 +1424,7 @@ mod tests {
         let (sink, notify) = DelayedSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(1)); // low HWM forces backpressure early
         let stream = WritableStream::new(sink.clone(), strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
 
@@ -1331,7 +1533,7 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(1));
         let stream = WritableStream::new(sink.clone(), strategy);
 
-        let (_locked_stream, writer) = stream.get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Abort the stream with a reason
         writer
@@ -1361,24 +1563,21 @@ mod tests {
         let stream = WritableStream::new(sink.clone(), strategy);
 
         // Get first writer (locks stream)
-        let (_locked_stream, writer1) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer1) = stream.clone().get_writer().expect("get_writer");
 
         // Try to get second writer — should fail because locked
         let write_future = stream.clone().get_writer();
 
-        match write_future.await {
+        match write_future {
             Err(e) => assert!(matches!(e, StreamError::Custom(_))),
             Ok(_) => panic!("Acquired second writer while stream is locked!"),
         }
 
         // Release lock
-        let unlocked_stream = writer1.release_lock().await;
+        writer1.release_lock().unwrap();
 
         // Now get_writer should succeed
-        let (_locked_stream2, _writer2) = unlocked_stream
-            .get_writer()
-            .await
-            .expect("get_writer again");
+        let (_locked_stream2, _writer2) = stream.get_writer().expect("get_writer again");
     }
 
     #[tokio::test]
@@ -1438,7 +1637,7 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(2));
 
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
 
@@ -1573,7 +1772,7 @@ mod tests {
         let (sink, notify) = BlockSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(1usize));
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
         let writer_clone = writer.clone();
@@ -1698,19 +1897,19 @@ mod tests {
         let stream = WritableStream::new(sink, strategy);
 
         // Immediately close the stream by sending Close command through writer
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
         writer.close().await.expect("close");
 
         // desired_size *must* return None after close
-        let after_close = writer.desired_size().await;
+        let after_close = writer.desired_size();
         assert_eq!(after_close, None, "desired_size after close must be None");
 
-        writer.release_lock().await;
+        writer.release_lock();
         // Simulate errored state by calling abort
-        let (_locked_stream, writer) = stream.get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
         writer.abort(None).await.expect("abort");
 
-        let after_error = writer.desired_size().await;
+        let after_error = writer.desired_size();
         assert_eq!(after_error, None, "desired_size after error must be None");
     }
 
@@ -1721,23 +1920,20 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink, strategy);
 
-        let (_locked_stream, writer1) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer1) = stream.clone().get_writer().expect("get_writer");
 
         // Try to get second writer; should fail with a lock error
-        let result2 = stream.clone().get_writer().await;
+        let result2 = stream.clone().get_writer();
         assert!(
             matches!(result2, Err(_)),
             "Second get_writer should fail when locked"
         );
 
         // Release the lock in writer1
-        let unlocked_stream = writer1.release_lock().await;
+        writer1.release_lock();
 
         // Now new writer acquisition must succeed
-        let (_locked_stream2, writer2) = unlocked_stream
-            .get_writer()
-            .await
-            .expect("get_writer after release");
+        let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer after release");
         drop(writer2);
     }
 
@@ -1830,21 +2026,21 @@ mod tests {
         let sink = DummySink;
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         writer.close().await.expect("close");
 
-        let ds_after_close = writer.desired_size().await;
+        let ds_after_close = writer.desired_size();
         assert_eq!(
             ds_after_close, None,
             "desired_size after close must be None"
         );
 
-        writer.release_lock().await;
-        let (_locked_stream2, writer2) = stream.get_writer().await.expect("get_writer");
+        writer.release_lock();
+        let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer");
         writer2.abort(None).await.expect("abort");
 
-        let ds_after_abort = writer2.desired_size().await;
+        let ds_after_abort = writer2.desired_size();
         assert_eq!(
             ds_after_abort, None,
             "desired_size after abort must be None"
@@ -1856,7 +2052,7 @@ mod tests {
         let sink = DummySink;
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         // Close stream - closed future resolves ok
         writer.close().await.expect("close");
@@ -1866,7 +2062,7 @@ mod tests {
 
         // Abort an opened stream errors correctly
         let stream2 = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
-        let (_locked_stream2, writer2) = stream2.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream2, writer2) = stream2.clone().get_writer().expect("get_writer");
         writer2
             .abort(Some("reason".to_string()))
             .await
@@ -1938,7 +2134,7 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink.clone(), strategy);
 
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         // Writing a chunk causes sink.write error => stream errors
         let write_result = writer.write(vec![1]).await;
@@ -2017,7 +2213,7 @@ mod tests {
         let stream = WritableStream::new_with_spawn(sink, strategy, |future| {
             tokio::spawn(future);
         });
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
         let writer_clone = writer.clone();
@@ -2086,30 +2282,27 @@ mod tests {
         let stream = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
 
         // Acquire first writer lock
-        let (_locked_stream, writer1) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer1) = stream.clone().get_writer().expect("get_writer");
 
         // Attempt to get second writer lock concurrently must fail
-        let res2 = stream.clone().get_writer().await;
+        let res2 = stream.clone().get_writer();
         assert!(
             res2.is_err(),
             "second get_writer acquisition while locked should fail"
         );
 
         // Release lock via writer1
-        let unlocked_stream = writer1.release_lock().await;
+        let _ = writer1.release_lock();
 
         // Now getting writer must succeed
-        let (_locked_stream2, writer2) = unlocked_stream
-            .get_writer()
-            .await
-            .expect("get_writer after release");
+        let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer after release");
         drop(writer2);
     }
 
     #[tokio::test]
     async fn test_close_and_closed_future() {
         let stream = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
-        let (_locked_stream, writer) = stream.clone().get_writer().await.expect("get_writer");
+        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
 
         writer.close().await.expect("close");
 
