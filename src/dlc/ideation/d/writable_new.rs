@@ -929,19 +929,27 @@ where
     /// unbounded queue growth.
     ///
     /// [`write_when_ready()`]: Self::write_when_ready
-    pub async fn write(&self, chunk: T) -> StreamResult<()> {
+    pub fn write(&self, chunk: T) -> impl std::future::Future<Output = StreamResult<()>> + Send {
         let (tx, rx) = oneshot::channel();
 
-        self.stream
+        let enqueue_result = self
+            .stream
             .command_tx
             .unbounded_send(StreamCommand::Write {
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()));
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Write canceled".into())))
+        // Return a future that handles the completion waiting
+        async move {
+            // First check if enqueueing failed
+            enqueue_result?;
+
+            // Then wait for the write to complete
+            rx.await
+                .unwrap_or_else(|_| Err(StreamError::Custom("Write canceled".into())))
+        }
     }
 
     /// Waits for the stream to be ready (i.e., no backpressure) before performing a write.
@@ -2408,5 +2416,67 @@ mod tests {
         // Further writes after close fail
         let write_err = writer.write(vec![1]).await;
         assert!(write_err.is_err(), "write after close must fail");
+    }
+
+    #[tokio::test]
+    async fn write_when_ready_test() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct CountingSink {
+            write_count: Arc<Mutex<usize>>,
+        }
+
+        impl CountingSink {
+            fn new() -> Self {
+                CountingSink {
+                    write_count: Arc::new(Mutex::new(0)),
+                }
+            }
+            fn get_count(&self) -> usize {
+                *self.write_count.lock().unwrap()
+            }
+        }
+
+        impl WritableSink<Vec<u8>> for CountingSink {
+            fn write(
+                &mut self,
+                _chunk: Vec<u8>,
+                _controller: &mut WritableStreamDefaultController,
+            ) -> impl std::future::Future<Output = StreamResult<()>> + Send {
+                let count = self.write_count.clone();
+                async move {
+                    let mut guard = count.lock().unwrap();
+                    *guard += 1;
+                    Ok(())
+                }
+            }
+        }
+
+        let sink = CountingSink::new();
+        let strategy = Box::new(CountQueuingStrategy::new(2));
+        let stream = WritableStream::new(sink.clone(), strategy);
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
+
+        // Use write_when_ready to write multiple chunks, which waits for readiness before writing.
+        writer
+            .write_when_ready(vec![1, 2, 3])
+            .await
+            .expect("write when ready 1");
+        writer
+            .write_when_ready(vec![4, 5, 6])
+            .await
+            .expect("write when ready 2");
+
+        // Wait for the stream to be drained; ensures writes complete
+        //writer.ready().await.expect("ready after writes");
+
+        // Write one more chunk and wait for completion
+        writer.write(vec![7]).await.expect("write last");
+
+        writer.close().await.expect("close");
+
+        // Confirm the underlying sink received both writes
+        assert_eq!(sink.get_count(), 3);
     }
 }
