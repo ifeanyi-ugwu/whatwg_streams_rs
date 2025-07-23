@@ -143,7 +143,7 @@ impl<T, Sink, S> WritableStream<T, Sink, S> {
     }
 }
 
-impl<T, Sink> WritableStream<T, Sink>
+/*impl<T, Sink> WritableStream<T, Sink>
 where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
@@ -155,7 +155,7 @@ where
     pub fn closed(&self) -> ClosedFuture<T, Sink> {
         ClosedFuture::new(self.clone())
     }
-}
+}*/
 
 impl<T, Sink, S> WritableStream<T, Sink, S>
 where
@@ -408,6 +408,7 @@ where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
+    // private helper
     fn desired_size(&self) -> Option<usize> {
         if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
             return None;
@@ -893,22 +894,95 @@ where
         Self { stream }
     }
 
-    /// Write a chunk asynchronously
+    /// Write a chunk to the stream by immediately enqueueing it for writing.
+    ///
+    /// This method sends the chunk to the stream's internal queue immediately and returns
+    /// a future that resolves when the write has been fully processed by the sink.
+    /// Awaiting this method ensures the write completes before proceeding.
+    ///
+    /// # Important
+    ///
+    /// Calling `write()` repeatedly *without* first awaiting `ready()` (or without
+    /// respecting backpressure) can cause unbounded growth of the internal queue,
+    /// leading to increased memory usage and potential performance degradation.
+    ///
+    /// To avoid excessive buffering, it is recommended to either:
+    /// - Await `ready()` before calling `write()` to respect backpressure signals, or
+    /// - Use the [`write_when_ready()`] helper method which does this automatically.
+    ///
+    /// # Specification Compliance
+    ///
+    /// This method closely corresponds to the WHATWG Streams specification's default
+    /// writer `write()` method. The responsibility for backpressure handling lies with
+    /// the caller.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// // Await ready before writing to avoid queue buildup:
+    /// writer.stream.ready().await?;
+    /// writer.write(chunk).await?;
+    /// ```
+    ///
+    /// For high throughput scenarios without awaiting each write completion,
+    /// call `write()` without awaiting, but this disables backpressure and risks
+    /// unbounded queue growth.
+    ///
+    /// [`write_when_ready()`]: Self::write_when_ready
     pub async fn write(&self, chunk: T) -> StreamResult<()> {
         let (tx, rx) = oneshot::channel();
 
         self.stream
             .command_tx
-            .clone()
-            .send(StreamCommand::Write {
+            .unbounded_send(StreamCommand::Write {
                 chunk,
                 completion: tx,
             })
-            .await
             .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
 
         rx.await
             .unwrap_or_else(|_| Err(StreamError::Custom("Write canceled".into())))
+    }
+
+    /// Waits for the stream to be ready (i.e., no backpressure) before performing a write.
+    ///
+    /// This method asynchronously waits until the stream signals it can accept more data,
+    /// via the `ready()` future, before enqueuing the write operation. This helps avoid
+    /// excessive queue buildup and memory usage, resulting in better throughput when
+    /// producing data at a high rate.
+    ///
+    /// **Note:** This method is *not* part of the WHATWG Streams specification, but is
+    /// provided as a convenient helper to implement efficient backpressure-aware writing.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// // Write data only when the stream is ready to accept it
+    /// writer.write_when_ready(chunk).await?;
+    /// ```
+    ///
+    /// # Behavior
+    ///
+    /// - Awaits the stream becoming ready (no backpressure).
+    /// - Then enqueues the write but doesn't await its completion (like `write()`).
+    ///
+    /// This approach balances throughput and memory by respecting the stream’s backpressure
+    /// signals before each write.
+    ///
+    /// # Caveats
+    ///
+    /// Users who want maximum throughput without waiting should call `write()` directly,
+    /// and optionally use `ready()` separately to monitor backpressure.
+    ///
+    /// This helper simplifies the common pattern of waiting on `ready()` before writing,
+    /// but callers should choose based on desired flow control characteristics.
+    pub async fn write_when_ready(&self, chunk: T) -> StreamResult<()> {
+        self.ready().await?;
+
+        // Enqueue the write but don't await completion
+        let _write_future = self.write(chunk);
+
+        Ok(())
     }
 
     /// Close the stream asynchronously
@@ -962,6 +1036,14 @@ where
     /// Returns None if the stream is closed or errored
     pub fn desired_size(&self) -> Option<usize> {
         self.stream.desired_size()
+    }
+
+    pub fn ready(&self) -> ReadyFuture<T, Sink> {
+        ReadyFuture::new(self.clone())
+    }
+
+    pub fn closed(&self) -> ClosedFuture<T, Sink> {
+        ClosedFuture::new(self.clone())
     }
 }
 
@@ -1039,6 +1121,14 @@ where
 impl<T, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
     fn drop(&mut self) {
         self.stream.locked.store(false, Ordering::SeqCst);
+    }
+}
+
+impl<T, Sink> Clone for WritableStreamDefaultWriter<T, Sink> {
+    fn clone(&self) -> Self {
+        Self {
+            stream: self.stream.clone(),
+        }
     }
 }
 
@@ -1126,12 +1216,12 @@ impl WritableStreamDefaultController {
 }
 
 pub struct ReadyFuture<T, Sink> {
-    stream: WritableStream<T, Sink>,
+    writer: WritableStreamDefaultWriter<T, Sink>,
 }
 
 impl<T, Sink> ReadyFuture<T, Sink> {
-    pub fn new(stream: WritableStream<T, Sink>) -> Self {
-        Self { stream }
+    pub fn new(stream: WritableStreamDefaultWriter<T, Sink>) -> Self {
+        Self { writer: stream }
     }
 }
 
@@ -1143,24 +1233,25 @@ where
     type Output = StreamResult<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.stream.errored.load(Ordering::SeqCst) {
+        if self.writer.stream.errored.load(Ordering::SeqCst) {
             return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
         }
-        if self.stream.closed.load(Ordering::SeqCst) {
+        if self.writer.stream.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
         }
-        if !self.stream.backpressure.load(Ordering::SeqCst) {
+        if !self.writer.stream.backpressure.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
         }
         // Not ready, register waker:
         let waker = cx.waker().clone();
         let _ = self
+            .writer
             .stream
             .command_tx
             .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
         // If the channel is full or busy, that's okay—the next poll will try again.
         // Re-check backpressure after registration
-        if !self.stream.backpressure.load(Ordering::SeqCst) {
+        if !self.writer.stream.backpressure.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
         }
         Poll::Pending
@@ -1168,12 +1259,12 @@ where
 }
 
 pub struct ClosedFuture<T, Sink> {
-    stream: WritableStream<T, Sink>,
+    writer: WritableStreamDefaultWriter<T, Sink>,
 }
 
 impl<T, Sink> ClosedFuture<T, Sink> {
-    pub fn new(stream: WritableStream<T, Sink>) -> Self {
-        Self { stream }
+    pub fn new(stream: WritableStreamDefaultWriter<T, Sink>) -> Self {
+        Self { writer: stream }
     }
 }
 
@@ -1185,19 +1276,20 @@ where
     type Output = StreamResult<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.stream.errored.load(Ordering::SeqCst) {
+        if self.writer.stream.errored.load(Ordering::SeqCst) {
             return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
         }
-        if self.stream.closed.load(Ordering::SeqCst) {
+        if self.writer.stream.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
         }
         let waker = cx.waker().clone();
         let _ = self
+            .writer
             .stream
             .command_tx
             .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
         // Re-check closed after registration
-        if self.stream.closed.load(Ordering::SeqCst) {
+        if self.writer.stream.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
         }
         Poll::Pending
@@ -1442,7 +1534,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The ready() future resolves when backpressure clears
-        let ready_fut = stream.ready();
+        let ready_fut = writer.ready();
         tokio::pin!(ready_fut);
 
         // Poll once, should be pending due to backpressure
@@ -1672,7 +1764,7 @@ mod tests {
         );
 
         // `ready()` should be pending while backpressure applies
-        let mut ready_fut = stream.ready();
+        let mut ready_fut = writer.ready();
         tokio::pin!(ready_fut);
         use futures::task::{Context, Poll};
         use std::task::Waker;
@@ -1800,7 +1892,7 @@ mod tests {
         );
 
         // Poll `ready()` future; should be Pending while backpressure is active
-        let mut ready = stream.ready();
+        let mut ready = writer.ready();
 
         use futures::task::noop_waker_ref;
         use futures::task::{Context, Poll};
@@ -2057,7 +2149,7 @@ mod tests {
         // Close stream - closed future resolves ok
         writer.close().await.expect("close");
 
-        let closed_res = stream.closed().await;
+        let closed_res = writer.closed().await;
         assert!(closed_res.is_ok(), "closed future must resolve after close");
 
         // Abort an opened stream errors correctly
@@ -2068,7 +2160,7 @@ mod tests {
             .await
             .expect("abort");
 
-        let closed_res2 = stream2.closed().await;
+        let closed_res2 = writer2.closed().await;
         assert!(
             closed_res2.is_err(),
             "closed future must reject after abort/error"
@@ -2153,7 +2245,7 @@ mod tests {
         );
 
         // Check that closed future rejects due to error
-        let closed_future_result = stream.closed().await;
+        let closed_future_result = writer.closed().await;
         assert!(
             closed_future_result.is_err(),
             "closed future should reject on error"
@@ -2245,7 +2337,7 @@ mod tests {
 
         // Get ready future: should be pending due to backpressure
         // Poll twice to simulate waker registration behavior
-        let mut ready_fut = stream.ready();
+        let mut ready_fut = writer.ready();
         futures::pin_mut!(ready_fut);
 
         use std::task::{Context, Poll};
@@ -2307,7 +2399,7 @@ mod tests {
         writer.close().await.expect("close");
 
         // closed() future resolves successfully
-        let closed_res = stream.closed().await;
+        let closed_res = writer.closed().await;
         assert!(
             closed_res.is_ok(),
             "closed() should resolve after stream closes"
