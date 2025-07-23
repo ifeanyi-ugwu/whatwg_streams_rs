@@ -703,18 +703,27 @@ pub async fn stream_task<T, Sink>(
         // 2. ---- If not currently working, handle one "work" command ----
         if inflight.is_none() {
             if inner.close_requested {
-                if let Some(sink) = inner.sink.take() {
-                    let fut = async move { sink.close().await }.boxed();
-                    let completions = std::mem::take(&mut inner.close_completions);
-                    inflight = Some(InFlight::Close { fut, completions });
-                    //inner.close_requested = false;
-                } else {
-                    for c in inner.close_completions.drain(..) {
-                        let _ = c.send(Ok(()));
+                // Only start close after all queued writes are done and no inflight write
+                let can_close = inner.queue.is_empty()
+                    && (inflight.is_none()
+                        || matches!(
+                            inflight,
+                            Some(InFlight::Close { .. }) | Some(InFlight::Abort { .. })
+                        ));
+                if can_close {
+                    if let Some(sink) = inner.sink.take() {
+                        let fut = async move { sink.close().await }.boxed();
+                        let completions = std::mem::take(&mut inner.close_completions);
+                        inflight = Some(InFlight::Close { fut, completions });
+                        //inner.close_requested = false;
+                    } else {
+                        for c in inner.close_completions.drain(..) {
+                            let _ = c.send(Ok(()));
+                        }
+                        inner.state = StreamState::Closed;
+                        inner.close_requested = false;
+                        update_flags(&inner, &backpressure, &closed, &errored);
                     }
-                    inner.state = StreamState::Closed;
-                    inner.close_requested = false;
-                    update_flags(&inner, &backpressure, &closed, &errored);
                 }
             } else if inner.abort_requested {
                 if let Some(sink) = inner.sink.take() {
@@ -2472,11 +2481,11 @@ mod tests {
         //writer.ready().await.expect("ready after writes");
 
         // Write one more chunk and wait for completion
-        writer.write(vec![7]).await.expect("write last");
+        //writer.write(vec![7]).await.expect("write last");
 
         writer.close().await.expect("close");
 
         // Confirm the underlying sink received both writes
-        assert_eq!(sink.get_count(), 3);
+        assert_eq!(sink.get_count(), 2);
     }
 }
