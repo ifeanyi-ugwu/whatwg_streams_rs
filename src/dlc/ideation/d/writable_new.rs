@@ -1254,7 +1254,8 @@ where
             return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
         }
         if self.writer.stream.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
+            //return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
+            return Poll::Ready(Ok(()));
         }
         if !self.writer.stream.backpressure.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
