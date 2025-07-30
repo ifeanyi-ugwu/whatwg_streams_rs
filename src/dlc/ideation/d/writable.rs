@@ -1318,6 +1318,7 @@ mod tests {
     }
 
     #[tokio::test]
+    //TODO: this test hangs
     async fn test_writer_release_lock_and_reacquire() {
         let (sink, _data) = CollectorSink::<i32>::new();
         let stream = WritableStream::new(sink).await.unwrap();
@@ -1342,6 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
+    //TODO: this test hangs
     async fn test_stream_locking_prevents_multiple_writers() {
         // Create a new stream with a sink
         let (sink, _data) = CollectorSink::<i32>::new();
@@ -1491,6 +1493,7 @@ mod tests {
     }
 
     #[tokio::test]
+    //TODO: this test hangs
     async fn test_write_success_then_error() {
         let (sink, data, fail_flag) = PartialFailSink::new();
 
