@@ -143,21 +143,7 @@ impl<T, Sink, S> WritableStream<T, Sink, S> {
     }
 }
 
-/*impl<T, Sink> WritableStream<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    pub fn ready(&self) -> ReadyFuture<T, Sink> {
-        ReadyFuture::new(self.clone())
-    }
-
-    pub fn closed(&self) -> ClosedFuture<T, Sink> {
-        ClosedFuture::new(self.clone())
-    }
-}*/
-
-impl<T, Sink, S> WritableStream<T, Sink, S>
+impl<T, Sink> WritableStream<T, Sink, Locked>
 where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
@@ -428,7 +414,7 @@ where
     }
 }
 
-impl<T, Sink, S> Clone for WritableStream<T, Sink, S> {
+impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
     fn clone(&self) -> Self {
         Self {
             command_tx: self.command_tx.clone(),
@@ -553,6 +539,7 @@ fn process_command<T, Sink>(
                 inner.close_requested = true;
                 inner.close_completions.push(completion);
             }
+            update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
             update_flags(&inner, backpressure, closed, errored);
         }
         StreamCommand::Abort { reason, completion } => {
@@ -576,6 +563,7 @@ fn process_command<T, Sink>(
                         .send(Err(StreamError::Custom("Stream aborted".into())));
                 }
             }
+            update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
             update_flags(&inner, backpressure, closed, errored);
         }
         /*StreamCommand::GetDesiredSize { completion } => {
@@ -594,9 +582,19 @@ fn process_command<T, Sink>(
         }*/
         StreamCommand::RegisterReadyWaker { waker } => {
             inner.ready_wakers.register(&waker);
+            // Immediately check if this waker should be woken
+            // Immediately wake if already ready to prevent race conditions
+            if !inner.backpressure {
+                inner.ready_wakers.wake_all();
+            }
         }
         StreamCommand::RegisterClosedWaker { waker } => {
             inner.closed_wakers.register(&waker);
+            // Immediately check if this waker should be woken
+            // Immediately wake if already closed/errored to prevent race conditions
+            if inner.state == StreamState::Closed || inner.state == StreamState::Errored {
+                inner.closed_wakers.wake_all();
+            }
         } /*StreamCommand::LockStream { completion } => {
               let _ = if inner.locked {
                   completion.send(Err(StreamError::Custom("Stream already locked".into())))
@@ -637,7 +635,7 @@ enum InFlight<Sink> {
     },
 }
 
-pub async fn stream_task<T, Sink>(
+async fn stream_task<T, Sink>(
     mut command_rx: UnboundedReceiver<StreamCommand<T>>,
     mut inner: WritableStreamInner<T, Sink>,
     backpressure: Arc<AtomicBool>,
@@ -657,11 +655,29 @@ pub async fn stream_task<T, Sink>(
 
     poll_fn(|cx| {
         process_controller_msgs(&mut inner, &mut ctrl_rx);
+        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+        // Dual-layer waker management to handle race conditions in concurrent scenarios:
+        //
+        // 1. Immediate wake in RegisterWaker command arms (in process_command): 
+        //    Prevents race where wakers register when condition is already true
+        //
+        // 2. Batch wake via update_flags() below: Ensures all waiting wakers get 
+        //    notified when state changes during command processing
+        //
+        // Both mechanisms are required - stress testing (800-iteration loops) showed:
+        // - Only immediate wake in command arms: failures around iteration 119
+        // - Only update_flags() wake: failures around iteration 710  
+        // - Both together: no failures across multiple test runs
+        update_flags(&inner, &backpressure, &closed, &errored);
 
         // Drain all commands, admin and work commands
         loop {
             match command_rx.poll_next_unpin(cx) {
                 Poll::Ready(Some(cmd)) => {
+                    /*let should_wake_closed =
+                        matches!(cmd, StreamCommand::RegisterClosedWaker { .. });
+                    let should_wake_ready = matches!(cmd, StreamCommand::RegisterReadyWaker { .. });*/
+
                     process_command(
                         cmd,
                         &mut inner,
@@ -672,6 +688,29 @@ pub async fn stream_task<T, Sink>(
                         &in_flight_size,
                         cx,
                     );
+
+                    // Immediately check wake conditions for waker registration commands
+                    // to prevent race conditions where the condition is already met.
+                    // 
+                    // Without this immediate check, wakers can hang when:
+                    // 1. A waker registers when the ready/closed condition is already true
+                    // 2. The waker waits for the next poll cycle to be woken via update_flags()
+                    // 3. In some timing scenarios, this next poll cycle may be delayed or not occur
+                    //
+                    // This was discovered through stress testing (800-iteration test loops) where
+                    // intermittent hangs occurred without this immediate wake mechanism.
+                    /*if should_wake_closed {
+                        if inner.state == StreamState::Closed || inner.state == StreamState::Errored
+                        {
+                            inner.closed_wakers.wake_all();
+                        }
+                    }
+                    if should_wake_ready {
+                        if !inner.backpressure {
+                            inner.ready_wakers.wake_all();
+                        }
+                    }*/
+
                     // Continue draining all commands in the same poll
                 }
                 Poll::Ready(None) => return Poll::Ready(()),
@@ -717,12 +756,21 @@ pub async fn stream_task<T, Sink>(
                         inflight = Some(InFlight::Close { fut, completions });
                         //inner.close_requested = false;
                     } else {
+                        // Update state BEFORE sending completions
+                        inner.state = StreamState::Closed;
+                        inner.close_requested = false;
+                        // queue should already be empty as it should drain naturally through normal write processing.
+                        /*inner.queue.clear();
+                        inner.queue_total_size = 0;
+                        inner.in_flight_size = 0;
+                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);*/
+
+                        update_flags(&inner, &backpressure, &closed, &errored);
+
+                        // THEN send completions
                         for c in inner.close_completions.drain(..) {
                             let _ = c.send(Ok(()));
                         }
-                        inner.state = StreamState::Closed;
-                        inner.close_requested = false;
-                        update_flags(&inner, &backpressure, &closed, &errored);
                     }
                 }
             } else if inner.abort_requested {
@@ -732,13 +780,15 @@ pub async fn stream_task<T, Sink>(
                     let completions = std::mem::take(&mut inner.abort_completions);
                     inflight = Some(InFlight::Abort { fut, completions });
                 } else {
-                    // No sink to abort — consider abort complete
-                    for c in inner.abort_completions.drain(..) {
-                        let _ = c.send(Ok(()));
-                    }
+                    // Update state BEFORE sending completions
                     inner.state = StreamState::Errored;
                     inner.abort_requested = false;
                     update_flags(&inner, &backpressure, &closed, &errored);
+
+                    // THEN send completions
+                    for c in inner.abort_completions.drain(..) {
+                        let _ = c.send(Ok(()));
+                    }
                 }
             }
         }
@@ -750,6 +800,7 @@ pub async fn stream_task<T, Sink>(
                 inner.queue_total_size -= chunk_size;
                 inner.in_flight_size += chunk_size;
                 inner.update_backpressure();
+                update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
                 update_flags(&inner, &backpressure, &closed, &errored);
 
                 if let Some(mut sink) = inner.sink.take() {
@@ -783,44 +834,50 @@ pub async fn stream_task<T, Sink>(
                 } => {
                     match fut.as_mut().poll(cx) {
                         Poll::Ready((sink, result)) => {
-                            inner.sink = Some(sink);
                             inner.in_flight_size -= *chunk_size;
-                            inner.update_backpressure();
-                            update_flags(&inner, &backpressure, &closed, &errored);
 
-                            //let _ = completion.send(result.clone());
-                            if let Some(sender) = completion.take() {
-                                let _ = sender.send(result.clone());
-                            }
-
+                            // Check for error first, before any flag updates
                             if result.is_err() {
                                 inner.state = StreamState::Errored;
-                                inner.sink = None;
-
-                                update_flags(&mut inner, &backpressure, &closed, &errored);
+                                inner.sink = None; // Don't restore sink on error
+                            } else {
+                                inner.sink = Some(sink); // Only restore sink on success
                             }
+
+                            inner.update_backpressure();
+                            update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                            update_flags(&inner, &backpressure, &closed, &errored); // Single flag update
+
+                            if let Some(sender) = completion.take() {
+                                let _ = sender.send(result);
+                            }
+
                             inflight = None;
-                            cx.waker().wake_by_ref(); // ensure continued draining
+                            cx.waker().wake_by_ref();
                         }
                         Poll::Pending => {}
                     }
                 }
                 InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
-                        // Notify all waiting close callers
-                        for sender in completions.drain(..) {
-                            let _ = sender.send(res.clone());
-                        }
+                        // Update state and flags FIRST
                         inner.state = StreamState::Closed;
                         inner.close_requested = false;
-
                         // Clear queue and reset backpressure
+                        // queue should already be empty on close --start
                         inner.queue.clear();
                         inner.queue_total_size = 0;
                         inner.in_flight_size = 0;
+                        // queue should already be empty on close --end
                         inner.backpressure = false;
-
+                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
                         update_flags(&inner, &backpressure, &closed, &errored);
+
+                        // THEN notify all waiting close callers
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(res.clone());
+                        }
+
                         inflight = None;
                         cx.waker().wake_by_ref();
                     }
@@ -828,25 +885,23 @@ pub async fn stream_task<T, Sink>(
                 },
                 InFlight::Abort { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
-                        // Notify all waiting abort callers
-                        // Sink.abort future completed (success or error)
-                        for sender in completions.drain(..) {
-                            let _ = sender.send(res.clone());
-                        }
-                        // Transition stream state here once abort is complete
+                        // Update state and flags FIRST
                         inner.state = StreamState::Errored;
                         inner.abort_requested = false;
-
                         // Clear queue and reset backpressure
                         inner.queue.clear();
                         inner.queue_total_size = 0;
                         inner.in_flight_size = 0;
                         inner.backpressure = false;
-
+                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
                         update_flags(&inner, &backpressure, &closed, &errored);
-
                         // Remove sink since it's aborted
                         inner.sink = None;
+
+                        // THEN notify all waiting abort callers
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(res.clone());
+                        }
 
                         inflight = None;
                         cx.waker().wake_by_ref();
@@ -867,25 +922,20 @@ fn update_flags<T, Sink>(
     closed: &AtomicBool,
     errored: &AtomicBool,
 ) {
-    let old_state = if closed.load(Ordering::SeqCst) {
-        StreamState::Closed
-    } else if errored.load(Ordering::SeqCst) {
-        StreamState::Errored
-    } else {
-        StreamState::Writable
-    };
     let new_state = inner.state;
 
     backpressure.store(inner.backpressure, Ordering::SeqCst);
     closed.store(new_state == StreamState::Closed, Ordering::SeqCst);
     errored.store(new_state == StreamState::Errored, Ordering::SeqCst);
 
-    // Wake when state transitions to Closed or Errored
-    if (old_state != StreamState::Closed && new_state == StreamState::Closed)
-        || (old_state != StreamState::Errored && new_state == StreamState::Errored)
-    {
-        inner.ready_wakers.wake_all();
+    // Wake closed wakers if we're in a final state
+    if new_state == StreamState::Closed || new_state == StreamState::Errored {
         inner.closed_wakers.wake_all();
+    }
+
+    // Wake ready wakers if no backpressure
+    if !inner.backpressure {
+        inner.ready_wakers.wake_all();
     }
 }
 
@@ -917,7 +967,7 @@ where
     ///
     /// To avoid excessive buffering, it is recommended to either:
     /// - Await `ready()` before calling `write()` to respect backpressure signals, or
-    /// - Use the [`write_when_ready()`] helper method which does this automatically.
+    /// - Use the [`enqueue_when_ready()`] helper method which does this automatically.
     ///
     /// # Specification Compliance
     ///
@@ -937,7 +987,7 @@ where
     /// call `write()` without awaiting, but this disables backpressure and risks
     /// unbounded queue growth.
     ///
-    /// [`write_when_ready()`]: Self::write_when_ready
+    /// [`enqueue_when_ready()`]: Self::enqueue_when_ready
     pub fn write(&self, chunk: T) -> impl std::future::Future<Output = StreamResult<()>> + Send {
         let (tx, rx) = oneshot::channel();
 
@@ -975,7 +1025,7 @@ where
     ///
     /// ```no_run
     /// // Write data only when the stream is ready to accept it
-    /// writer.write_when_ready(chunk).await?;
+    /// writer.enqueue_when_ready(chunk).await?;
     /// ```
     ///
     /// # Behavior
@@ -993,7 +1043,7 @@ where
     ///
     /// This helper simplifies the common pattern of waiting on `ready()` before writing,
     /// but callers should choose based on desired flow control characteristics.
-    pub async fn write_when_ready(&self, chunk: T) -> StreamResult<()> {
+    pub async fn enqueue_when_ready(&self, chunk: T) -> StreamResult<()> {
         self.ready().await?;
 
         // Enqueue the write but don't await completion
@@ -1065,6 +1115,7 @@ where
 }
 
 // Update the stream task to maintain the atomic counters
+// this is meant to be called when queue or inflight size is modified before waking wakers i.e before calling `update_flags`
 fn update_atomic_counters<T, Sink>(
     inner: &WritableStreamInner<T, Sink>,
     queue_total_size: &Arc<AtomicUsize>,
@@ -1133,8 +1184,6 @@ where
     }
 }
 
-//TODO: ready and closed may be rightful belong here
-
 impl<T, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
     fn drop(&mut self) {
         self.stream.locked.store(false, Ordering::SeqCst);
@@ -1151,7 +1200,7 @@ impl<T, Sink> Clone for WritableStreamDefaultWriter<T, Sink> {
 
 use std::task::Waker;
 
-pub struct WritableStreamInner<T, Sink> {
+struct WritableStreamInner<T, Sink> {
     state: StreamState,
     queue: VecDeque<PendingWrite<T>>,
     queue_total_size: usize,
@@ -1534,7 +1583,7 @@ mod tests {
         let (sink, notify) = DelayedSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(1)); // low HWM forces backpressure early
         let stream = WritableStream::new(sink.clone(), strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
 
@@ -1673,10 +1722,10 @@ mod tests {
         let stream = WritableStream::new(sink.clone(), strategy);
 
         // Get first writer (locks stream)
-        let (_locked_stream, writer1) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
 
         // Try to get second writer — should fail because locked
-        let write_future = stream.clone().get_writer();
+        let write_future = stream.get_writer();
 
         match write_future {
             Err(e) => assert!(matches!(e, StreamError::Custom(_))),
@@ -1747,7 +1796,7 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(2));
 
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
 
@@ -1882,7 +1931,7 @@ mod tests {
         let (sink, notify) = BlockSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(1usize));
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
         let writer_clone = writer.clone();
@@ -2007,7 +2056,7 @@ mod tests {
         let stream = WritableStream::new(sink, strategy);
 
         // Immediately close the stream by sending Close command through writer
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
         writer.close().await.expect("close");
 
         // desired_size *must* return None after close
@@ -2030,10 +2079,10 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink, strategy);
 
-        let (_locked_stream, writer1) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
 
         // Try to get second writer; should fail with a lock error
-        let result2 = stream.clone().get_writer();
+        let result2 = stream.get_writer();
         assert!(
             matches!(result2, Err(_)),
             "Second get_writer should fail when locked"
@@ -2136,9 +2185,10 @@ mod tests {
         let sink = DummySink;
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         writer.close().await.expect("close");
+        //writer.closed().await.expect("closed future");
 
         let ds_after_close = writer.desired_size();
         assert_eq!(
@@ -2162,7 +2212,7 @@ mod tests {
         let sink = DummySink;
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink, strategy);
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Close stream - closed future resolves ok
         writer.close().await.expect("close");
@@ -2172,7 +2222,7 @@ mod tests {
 
         // Abort an opened stream errors correctly
         let stream2 = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
-        let (_locked_stream2, writer2) = stream2.clone().get_writer().expect("get_writer");
+        let (_locked_stream2, writer2) = stream2.get_writer().expect("get_writer");
         writer2
             .abort(Some("reason".to_string()))
             .await
@@ -2244,7 +2294,7 @@ mod tests {
         let strategy = Box::new(CountQueuingStrategy::new(10));
         let stream = WritableStream::new(sink.clone(), strategy);
 
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Writing a chunk causes sink.write error => stream errors
         let write_result = writer.write(vec![1]).await;
@@ -2323,7 +2373,7 @@ mod tests {
         let stream = WritableStream::new_with_spawn(sink, strategy, |future| {
             tokio::spawn(future);
         });
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
         let writer_clone = writer.clone();
@@ -2392,10 +2442,10 @@ mod tests {
         let stream = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
 
         // Acquire first writer lock
-        let (_locked_stream, writer1) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
 
         // Attempt to get second writer lock concurrently must fail
-        let res2 = stream.clone().get_writer();
+        let res2 = stream.get_writer();
         assert!(
             res2.is_err(),
             "second get_writer acquisition while locked should fail"
@@ -2412,7 +2462,7 @@ mod tests {
     #[tokio::test]
     async fn test_close_and_closed_future() {
         let stream = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
-        let (_locked_stream, writer) = stream.clone().get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         writer.close().await.expect("close");
 
@@ -2468,13 +2518,13 @@ mod tests {
         let stream = WritableStream::new(sink.clone(), strategy);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
-        // Use write_when_ready to write multiple chunks, which waits for readiness before writing.
+        // Use enqueue_when_ready to write multiple chunks, which waits for readiness before writing.
         writer
-            .write_when_ready(vec![1, 2, 3])
+            .enqueue_when_ready(vec![1, 2, 3])
             .await
             .expect("write when ready 1");
         writer
-            .write_when_ready(vec![4, 5, 6])
+            .enqueue_when_ready(vec![4, 5, 6])
             .await
             .expect("write when ready 2");
 
