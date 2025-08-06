@@ -37,8 +37,6 @@ where
 }
 
 pub trait ReadableByteSource: Send + Sized + 'static {
-    //type StreamType: StreamTypeMarker = ByteStream;
-    //type Controller: StreamController<Vec<u8>> = ReadableByteStreamController;
     type StreamType: StreamTypeMarker;
     type Controller: StreamController<Vec<u8>>;
 
@@ -64,42 +62,16 @@ pub trait ReadableByteSource: Send + Sized + 'static {
 pub trait StreamTypeMarker: Send + Sync + 'static {
     type Item: Send + 'static;
     type Controller: StreamController<Self::Item>;
-    type Reader<Source, LockState>: StreamReader<Self::Item>
-    where
-        Source: Send + 'static,
-        LockState: Send + 'static;
 }
-
-/*impl StreamTypeMarker for DefaultStream {
-    type Item = (); // This will be overridden by the actual source
-    type Controller = ReadableStreamDefaultController<Self::Item>;
-    type Reader<Source, LockState> = ReadableStreamDefaultReader<Self::Item, Source, LockState>;
-}*/
 
 impl StreamTypeMarker for DefaultStream {
     type Item = ();
     type Controller = ReadableStreamDefaultController<Self::Item>;
-    type Reader<Source, LockState>
-        = ReadableStreamDefaultReader<Self::Item, Source, LockState>
-    where
-        Source: Send + 'static,
-        LockState: Send + 'static;
 }
-
-/*impl StreamTypeMarker for ByteStream {
-    type Item = Vec<u8>;
-    type Controller = ReadableByteStreamController;
-    type Reader<Source, LockState> = ReadableStreamBYOBReader<Source, LockState>;
-}*/
 
 impl StreamTypeMarker for ByteStream {
     type Item = Vec<u8>;
     type Controller = ReadableByteStreamController;
-    type Reader<Source, LockState>
-        = ReadableStreamBYOBReader<Source, LockState>
-    where
-        Source: Send + 'static,
-        LockState: Send + 'static;
 }
 
 // ----------- Controller Trait -----------
@@ -117,8 +89,7 @@ where
     StreamType: StreamTypeMarker,
     LockState: Send + 'static,
 {
-    // Your existing fields
-    command_tx: std::sync::mpsc::Sender<StreamCommand<T>>, // Simplified for example
+    command_tx: std::sync::mpsc::Sender<StreamCommand<T>>,
     _phantom: PhantomData<(T, Source, StreamType, LockState)>,
 }
 
@@ -129,9 +100,8 @@ where
     Source: ReadableSource<T, StreamType = DefaultStream> + Send + 'static,
 {
     pub fn new_default(source: Source) -> Self {
-        // Implementation for default streams
         Self {
-            command_tx: todo!(), // Your actual implementation
+            command_tx: todo!(),
             _phantom: PhantomData,
         }
     }
@@ -142,54 +112,85 @@ where
     Source: ReadableByteSource + Send + 'static,
 {
     pub fn new_bytes(source: Source) -> Self {
-        // Implementation for byte streams
         Self {
-            command_tx: todo!(), // Your actual implementation
+            command_tx: todo!(),
             _phantom: PhantomData,
         }
     }
 }
 
-// ----------- Generic Constructor (The Rusty Way) -----------
+// ----------- Generic Constructor -----------
 impl<T, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
 where
     T: Send + 'static,
     Source: Send + 'static,
     StreamType: StreamTypeMarker,
 {
-    /// Generic constructor that works for any source that implements the right trait
     pub fn new(source: Source) -> Self
     where
         Source: ReadableSource<T, StreamType = StreamType>,
     {
         Self {
-            command_tx: todo!(), // Your actual implementation
+            command_tx: todo!(),
             _phantom: PhantomData,
         }
     }
 }
 
-// ----------- Reader Methods -----------
-impl<T, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
+// ----------- Reader Methods for Default Streams -----------
+impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
     T: Send + 'static,
     Source: Send + 'static,
-    StreamType: StreamTypeMarker,
 {
+    /// Default streams can only return default readers
     pub fn get_reader(
         self,
     ) -> (
-        ReadableStream<T, Source, StreamType, Locked>,
-        StreamType::Reader<Source, Locked>,
+        ReadableStream<T, Source, DefaultStream, Locked>,
+        ReadableStreamDefaultReader<T, Source, Locked>,
     ) {
         let locked_stream = ReadableStream {
             command_tx: self.command_tx,
             _phantom: PhantomData,
         };
+        let reader = ReadableStreamDefaultReader(PhantomData);
+        (locked_stream, reader)
+    }
+}
 
-        // The reader type is determined by the StreamType
-        let reader = todo!(); // Create the appropriate reader type
+// ----------- Reader Methods for Byte Streams -----------
+impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+where
+    Source: Send + 'static,
+{
+    /// Byte streams return a default reader by default
+    pub fn get_reader(
+        self,
+    ) -> (
+        ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
+        ReadableStreamDefaultReader<Vec<u8>, Source, Locked>,
+    ) {
+        let locked_stream = ReadableStream {
+            command_tx: self.command_tx,
+            _phantom: PhantomData,
+        };
+        let reader = ReadableStreamDefaultReader(PhantomData);
+        (locked_stream, reader)
+    }
 
+    /// Byte streams can also return a BYOB reader
+    pub fn get_byob_reader(
+        self,
+    ) -> (
+        ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
+        ReadableStreamBYOBReader<Source, Locked>,
+    ) {
+        let locked_stream = ReadableStream {
+            command_tx: self.command_tx,
+            _phantom: PhantomData,
+        };
+        let reader = ReadableStreamBYOBReader(PhantomData);
         (locked_stream, reader)
     }
 }
@@ -208,14 +209,11 @@ where
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        // Your polling implementation
         todo!()
     }
 }
 
 // ----------- Example Source Implementations -----------
-
-// Default stream source
 pub struct IteratorSource<I> {
     iter: I,
 }
@@ -233,7 +231,6 @@ where
     }
 }
 
-// Byte stream source
 pub struct FileSource {
     // File handle or similar
 }
@@ -247,31 +244,35 @@ impl ReadableByteSource for FileSource {
         _controller: &mut Self::Controller,
         buffer: &mut [u8],
     ) -> StreamResult<usize> {
-        // Read bytes into buffer
         StreamResult(Ok(0)) // Placeholder
     }
 }
 
 // ----------- Usage Examples -----------
 pub fn usage_examples() {
-    // This automatically creates a default stream
+    // Default stream - only supports default readers
     let default_stream = ReadableStream::new(IteratorSource {
         iter: vec![1, 2, 3].into_iter(),
     });
-
-    // This automatically creates a byte stream
-    let byte_stream = ReadableStream::new_bytes(FileSource {});
-
-    // The type system ensures you get the right reader
     let (_locked_stream, _reader) = default_stream.get_reader();
-    // reader is automatically ReadableStreamDefaultReader
+    // _reader is ReadableStreamDefaultReader<i32, _, Locked>
 
-    let (_locked_byte_stream, _byte_reader) = byte_stream.get_reader();
-    // byte_reader is automatically ReadableStreamBYOBReader
+    // This would be a COMPILE-TIME ERROR for default streams:
+    // let result = default_stream.get_byob_reader(); // ❌ Method doesn't exist!
+
+    // Byte stream - get_reader() returns default reader
+    let byte_stream = ReadableStream::new_bytes(FileSource {});
+    let (_locked_stream, _default_reader) = byte_stream.get_reader();
+    // _default_reader is ReadableStreamDefaultReader<Vec<u8>, _, Locked>
+
+    // Byte stream - get_byob_reader() returns BYOB reader
+    let byte_stream2 = ReadableStream::new_bytes(FileSource {});
+    let (_locked_stream2, _byob_reader) = byte_stream2.get_byob_reader();
+    // _byob_reader is ReadableStreamBYOBReader<_, Locked>
 }
 
 // ----------- Placeholder types for completeness -----------
-pub struct StreamResult<T>(Result<T, StreamError>);
+pub struct StreamResult<T>(pub Result<T, StreamError>);
 pub struct StreamError;
 pub struct ReadableStreamDefaultController<T>(PhantomData<T>);
 pub struct ReadableByteStreamController;
@@ -292,9 +293,11 @@ impl<T: Send + 'static> StreamController<T> for ReadableStreamDefaultController<
     fn enqueue(&mut self, _chunk: T) -> StreamResult<()> {
         todo!()
     }
+
     fn close(&mut self) -> StreamResult<()> {
         todo!()
     }
+
     fn error(&mut self, _error: StreamError) {
         todo!()
     }
@@ -304,9 +307,11 @@ impl StreamController<Vec<u8>> for ReadableByteStreamController {
     fn enqueue(&mut self, _chunk: Vec<u8>) -> StreamResult<()> {
         todo!()
     }
+
     fn close(&mut self) -> StreamResult<()> {
         todo!()
     }
+
     fn error(&mut self, _error: StreamError) {
         todo!()
     }
