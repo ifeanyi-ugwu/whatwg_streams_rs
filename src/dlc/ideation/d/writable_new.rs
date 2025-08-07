@@ -465,7 +465,7 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
     }
 }
 
-impl<T, SinkType, S> futures::Sink<T> for WritableStream<T, SinkType, S>
+impl<T, SinkType> futures::Sink<T> for WritableStream<T, SinkType, Unlocked>
 where
     T: Send + 'static,
     SinkType: WritableSink<T> + Send + 'static,
