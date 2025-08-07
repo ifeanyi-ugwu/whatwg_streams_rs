@@ -12,7 +12,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
 #[derive(Clone)]
@@ -62,6 +62,9 @@ pub enum StreamError {
     Canceled,
     //TypeError(String),
     //NetworkError(String),
+    Aborted(Option<String>),
+    Closing,
+    Closed,
     Custom(ArcError),
 }
 
@@ -71,6 +74,24 @@ where
 {
     fn from(e: E) -> Self {
         StreamError::Custom(ArcError(Arc::new(e)))
+    }
+}
+
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamError::Canceled => write!(f, "Stream operation was canceled"),
+            StreamError::Aborted(reason) => {
+                if let Some(reason) = reason {
+                    write!(f, "Stream was aborted: {}", reason)
+                } else {
+                    write!(f, "Stream was aborted")
+                }
+            }
+            StreamError::Closing => write!(f, "Cannot write to stream while close is in progress"),
+            StreamError::Closed => write!(f, "Cannot write to a closed stream"),
+            StreamError::Custom(err) => write!(f, "{}", err),
+        }
     }
 }
 
@@ -133,6 +154,7 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
     queue_total_size: Arc<AtomicUsize>,
     in_flight_size: Arc<AtomicUsize>,
     high_water_mark: Arc<AtomicUsize>,
+    stored_error: Arc<RwLock<Option<StreamError>>>,
     _sink: PhantomData<Sink>,
     _state: PhantomData<S>,
 }
@@ -250,6 +272,7 @@ where
             queue_total_size: Arc::clone(&self.queue_total_size),
             in_flight_size: Arc::clone(&self.in_flight_size),
             high_water_mark: Arc::clone(&self.high_water_mark),
+            stored_error: Arc::clone(&self.stored_error),
             _sink: PhantomData,
             _state: PhantomData::<Locked>,
         };
@@ -267,6 +290,7 @@ where
     pub fn new(sink: Sink, strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>) -> Self {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
+        let stored_error = Arc::new(RwLock::new(None));
 
         let inner = WritableStreamInner {
             state: StreamState::Writable,
@@ -282,6 +306,8 @@ where
             abort_reason: None,
             abort_requested: false,
             abort_completions: Vec::new(),
+            //stored_error: None,
+            stored_error: Arc::clone(&stored_error),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
         };
@@ -292,6 +318,7 @@ where
         let locked = Arc::new(AtomicBool::new(false));
         let queue_total_size = Arc::new(AtomicUsize::new(0));
         let in_flight_size = Arc::new(AtomicUsize::new(0));
+        //let stored_error = Arc::new(RwLock::new(None));
 
         // Spawn the async stream task that processes stream commands
         spawn_stream_task(
@@ -313,6 +340,7 @@ where
             queue_total_size,
             in_flight_size,
             high_water_mark,
+            stored_error,
             _sink: PhantomData,
             _state: PhantomData,
         }
@@ -328,6 +356,7 @@ where
     {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
+        let stored_error = Arc::new(RwLock::new(None));
 
         let inner = WritableStreamInner {
             state: StreamState::Writable,
@@ -343,6 +372,8 @@ where
             abort_reason: None,
             abort_requested: false,
             abort_completions: Vec::new(),
+            //stored_error: None,
+            stored_error: Arc::clone(&stored_error),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
         };
@@ -353,6 +384,7 @@ where
         let locked = Arc::new(AtomicBool::new(false));
         let queue_total_size = Arc::new(AtomicUsize::new(0));
         let in_flight_size = Arc::new(AtomicUsize::new(0));
+        //let stored_error = Arc::new(RwLock::new(None));
 
         let backpressure_clone = backpressure.clone();
         let closed_clone = closed.clone();
@@ -383,6 +415,7 @@ where
             queue_total_size,
             in_flight_size,
             high_water_mark,
+            stored_error,
             _sink: PhantomData,
             _state: PhantomData,
         }
@@ -425,6 +458,7 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
             queue_total_size: Arc::clone(&self.queue_total_size),
             in_flight_size: Arc::clone(&self.in_flight_size),
             high_water_mark: Arc::clone(&self.high_water_mark),
+            stored_error: Arc::clone(&self.stored_error),
             _sink: PhantomData,
             _state: PhantomData,
         }
@@ -506,11 +540,32 @@ fn process_command<T, Sink>(
     match cmd {
         StreamCommand::Write { chunk, completion } => {
             if inner.state == StreamState::Errored {
-                let _ = completion.send(Err(StreamError::Custom("Stream is errored".into())));
+                /*let error = inner
+                .stored_error
+                .clone()
+                .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
+                let error = {
+                    let opt_err = match inner.stored_error.read() {
+                        Ok(err_guard) => err_guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                };
+                let _ = completion.send(Err(error));
                 return;
             }
             if inner.state == StreamState::Closed {
-                let _ = completion.send(Err(StreamError::Custom("Stream is closed".into())));
+                //let _ = completion.send(Err(StreamError::Custom("Stream is closed".into())));
+                let _ = completion.send(Err(StreamError::Closed));
+                return;
+            }
+            // NEW: Also reject writes if close has been requested (stream is closing)
+            // This matches the spec: "During this time any further attempts to write will fail"
+            if inner.close_requested {
+                /*let _ = completion.send(Err(StreamError::Custom(
+                    "Cannot write to stream: close in progress".into()
+                )));*/
+                let _ = completion.send(Err(StreamError::Closing));
                 return;
             }
             let chunk_size = inner.strategy.size(&chunk);
@@ -525,7 +580,18 @@ fn process_command<T, Sink>(
         }
         StreamCommand::Close { completion } => {
             if inner.state == StreamState::Errored {
-                let _ = completion.send(Err(StreamError::Custom("Stream is errored".into())));
+                /*let error = inner
+                .stored_error
+                .clone()
+                .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
+                let error = {
+                    let opt_err = match inner.stored_error.read() {
+                        Ok(err_guard) => err_guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                };
+                let _ = completion.send(Err(error));
                 return;
             }
             if inner.state == StreamState::Closed {
@@ -547,20 +613,28 @@ fn process_command<T, Sink>(
                 let _ = completion.send(Ok(()));
                 return;
             }
+
             if inner.abort_requested {
                 // Abort already requested: queue completion
                 inner.abort_completions.push(completion);
             } else {
                 // First abort request: mark flag, reason, queue completion
+                inner.state = StreamState::Errored;
+                //inner.stored_error = Some(StreamError::Aborted(inner.abort_reason.clone()));
+                {
+                    let mut stored_err_guard = inner.stored_error.write().unwrap();
+                    *stored_err_guard = Some(StreamError::Aborted(inner.abort_reason.clone()));
+                }
+
                 inner.abort_requested = true;
                 inner.abort_completions.push(completion);
                 inner.abort_reason = reason;
 
                 // Immediately reject all pending queued writes
                 while let Some(pw) = inner.queue.pop_front() {
-                    let _ = pw
-                        .completion_tx
-                        .send(Err(StreamError::Custom("Stream aborted".into())));
+                    let error = StreamError::Aborted(inner.abort_reason.clone());
+
+                    let _ = pw.completion_tx.send(Err(error));
                 }
             }
             update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
@@ -781,7 +855,7 @@ async fn stream_task<T, Sink>(
                     inflight = Some(InFlight::Abort { fut, completions });
                 } else {
                     // Update state BEFORE sending completions
-                    inner.state = StreamState::Errored;
+                    //inner.state = StreamState::Errored;
                     inner.abort_requested = false;
                     update_flags(&inner, &backpressure, &closed, &errored);
 
@@ -838,6 +912,17 @@ async fn stream_task<T, Sink>(
 
                             // Check for error first, before any flag updates
                             if result.is_err() {
+                                //inner.stored_error = Some(result.clone().err().unwrap());
+                                /*if let Err(e) = result.clone() {
+                                    inner.stored_error = Some(e);
+                                }*/
+                                if let Err(e) = result.clone() {
+                                    let mut stored_err_guard = match inner.stored_error.write() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => poisoned.into_inner(),
+                                    };
+                                    *stored_err_guard = Some(e);
+                                }
                                 inner.state = StreamState::Errored;
                                 inner.sink = None; // Don't restore sink on error
                             } else {
@@ -858,7 +943,7 @@ async fn stream_task<T, Sink>(
                         Poll::Pending => {}
                     }
                 }
-                InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
+                /*InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
                         // Update state and flags FIRST
                         inner.state = StreamState::Closed;
@@ -882,9 +967,53 @@ async fn stream_task<T, Sink>(
                         cx.waker().wake_by_ref();
                     }
                     Poll::Pending => {}
+                },*/
+                InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
+                    Poll::Ready(res) => {
+                        // Update state and flags based on result of sink.close()
+                        match &res {
+                            Ok(()) => {
+                                // Successful close: mark stream Closed
+                                inner.state = StreamState::Closed;
+                            }
+                            Err(err) => {
+                                // Close failed: mark stream Errored with stored error
+                                inner.state = StreamState::Errored;
+                                //inner.stored_error = Some(err.clone());
+                                /*{
+                                    let mut stored_err_guard = match inner.stored_error.write() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => poisoned.into_inner(), // recover from poison
+                                    };
+
+                                    *stored_err_guard = Some(err.clone());
+                                }*/
+                                set_stored_error(&inner.stored_error, err.clone());
+                            }
+                        }
+
+                        inner.close_requested = false;
+                        // Clear queue and reset backpressure
+                        inner.queue.clear();
+                        inner.queue_total_size = 0;
+                        inner.in_flight_size = 0;
+                        inner.backpressure = false;
+
+                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                        update_flags(&inner, &backpressure, &closed, &errored);
+
+                        // Notify all waiting close callers with the actual close result
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(res.clone());
+                        }
+
+                        inflight = None;
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::Pending => {}
                 },
                 InFlight::Abort { fut, completions } => match fut.as_mut().poll(cx) {
-                    Poll::Ready(res) => {
+                    /*Poll::Ready(res) => {
                         // Update state and flags FIRST
                         inner.state = StreamState::Errored;
                         inner.abort_requested = false;
@@ -902,6 +1031,63 @@ async fn stream_task<T, Sink>(
                         for sender in completions.drain(..) {
                             let _ = sender.send(res.clone());
                         }
+
+                        inflight = None;
+                        cx.waker().wake_by_ref();
+                    }*/
+                    Poll::Ready(sink_abort_result) => {
+                        match sink_abort_result {
+                            Ok(()) => {
+                                // Sink abort succeeded - don't error the stream
+                                // Just complete the abort operation successfully
+                                // Sink abort succeeded - close the stream (don't error it)
+                                //inner.state = StreamState::Closed; // CHANGE: Close, don't leave writable
+                                //inner.sink = None; // ADD: Remove sink
+                                //inner.state = StreamState::Errored;
+                                //inner.stored_error = Some(abort_reason.clone());
+                                //inner.state = StreamState::Errored;
+                                /*inner.stored_error = Some(StreamError::Aborted(
+                                    inner.abort_reason.clone()
+                                ));*/
+                                // Keep stored_error as is (abort reason)
+                                inner.sink = None;
+
+                                for sender in completions.drain(..) {
+                                    let _ = sender.send(Ok(()));
+                                }
+                            }
+                            Err(sink_error) => {
+                                // Sink abort failed - error the stream with this error (sink error)
+                                //inner.state = StreamState::Errored;
+                                // Overwrite stored_error with sink's error
+                                //inner.stored_error = Some(sink_error.clone());
+                                /*{
+                                    let mut stored_err_guard = match inner.stored_error.write() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => poisoned.into_inner(), // recover from poisoning if any
+                                    };
+                                    *stored_err_guard = Some(sink_error.clone());
+                                }*/
+                                set_stored_error(&inner.stored_error, sink_error.clone());
+                                inner.sink = None;
+
+                                // Abort calls should reject with the sink error
+                                for sender in completions.drain(..) {
+                                    let _ = sender.send(Err(sink_error.clone()));
+                                }
+                            }
+                        }
+
+                        inner.abort_requested = false;
+                        // Clear remaining state
+                        // Queue should already be empty (it was cleared when abort was requested)
+                        inner.queue.clear();
+                        inner.queue_total_size = 0;
+                        inner.in_flight_size = 0;
+                        inner.backpressure = false;
+
+                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                        update_flags(&inner, &backpressure, &closed, &errored);
 
                         inflight = None;
                         cx.waker().wake_by_ref();
@@ -937,6 +1123,14 @@ fn update_flags<T, Sink>(
     if !inner.backpressure {
         inner.ready_wakers.wake_all();
     }
+}
+
+fn set_stored_error(stored_error: &Arc<RwLock<Option<StreamError>>>, err: StreamError) {
+    let mut guard = match stored_error.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(err);
 }
 
 pub struct WritableStreamDefaultWriter<T, Sink> {
@@ -1219,6 +1413,9 @@ struct WritableStreamInner<T, Sink> {
     abort_requested: bool,
     abort_completions: Vec<oneshot::Sender<StreamResult<()>>>,
 
+    //stored_error: Option<StreamError>,
+    stored_error: Arc<RwLock<Option<StreamError>>>,
+
     ready_wakers: WakerSet,
     closed_wakers: WakerSet,
 }
@@ -1300,7 +1497,19 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.writer.stream.errored.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
+            /*let error = inner
+            .stored_error
+            .clone()
+            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
+
+            let error = {
+                let opt_err = match self.writer.stream.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
         }
         if self.writer.stream.closed.load(Ordering::SeqCst) {
             //return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
@@ -1344,7 +1553,20 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.writer.stream.errored.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
+            /*let error = inner
+            .stored_error
+            .clone()
+            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
+
+            //return Poll::Ready(Err(StreamError::Custom("Stream is errored".into())));
+            let error = {
+                let opt_err = match self.writer.stream.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
         }
         if self.writer.stream.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
