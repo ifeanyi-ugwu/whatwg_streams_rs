@@ -465,6 +465,203 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
     }
 }
 
+impl<T, SinkType, S> futures::Sink<T> for WritableStream<T, SinkType, S>
+where
+    T: Send + 'static,
+    SinkType: WritableSink<T> + Send + 'static,
+{
+    type Error = StreamError;
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Check if stream is in an error state
+        if self.errored.load(Ordering::SeqCst) {
+            let error = {
+                let opt_err = match self.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
+        }
+
+        // Check if stream is closed
+        if self.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(StreamError::Closed));
+        }
+
+        // Check if there's backpressure
+        if !self.backpressure.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            // Register waker to get notified when backpressure clears:
+            let waker = cx.waker().clone();
+            let _ = self
+                .command_tx
+                .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+
+            // Double-check backpressure after registering waker to avoid race conditions
+            if !self.backpressure.load(Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        // Pre-flight checks before sending
+        if self.errored.load(Ordering::SeqCst) {
+            let error = {
+                let opt_err = match self.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Err(error);
+        }
+
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(StreamError::Closed);
+        }
+
+        // Check if backpressure is active - Sink contract says start_send should only
+        // be called after poll_ready returns Ready(Ok(()))
+        if self.backpressure.load(Ordering::SeqCst) {
+            return Err(StreamError::Custom(
+                "start_send called while backpressure is active - call poll_ready first".into(),
+            ));
+        }
+
+        let (tx, _rx) = oneshot::channel();
+        self.command_tx
+            .unbounded_send(StreamCommand::Write {
+                chunk: item,
+                completion: tx,
+            })
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+
+        // For the Sink trait, we return immediately after enqueueing.
+        // The actual write completion is handled asynchronously by the stream task.
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Check error state
+        if self.errored.load(Ordering::SeqCst) {
+            let error = {
+                let opt_err = match self.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
+        }
+
+        // Check if all writes are flushed (both queue and in-flight should be empty)
+        if self.queue_total_size.load(Ordering::SeqCst) == 0
+            && self.in_flight_size.load(Ordering::SeqCst) == 0
+        {
+            Poll::Ready(Ok(()))
+        } else {
+            // Register waker to be notified when flush completes
+            let waker = cx.waker().clone();
+            let _ = self
+                .command_tx
+                .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+
+            // Double-check after registering waker
+            if self.queue_total_size.load(Ordering::SeqCst) == 0
+                && self.in_flight_size.load(Ordering::SeqCst) == 0
+            {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // If already closed, return success
+        if self.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+
+        // If errored, return the error
+        if self.errored.load(Ordering::SeqCst) {
+            let error = {
+                let opt_err = match self.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
+        }
+
+        // Send the close command exactly once (you'd want to track here if previously sent)
+        // Then register a waker to get notified when closed:
+        // Assuming you have an atomic flag or method to track close command sent:
+        // Pseudocode:
+        // if !self.close_requested {
+        //   self.close_requested = true;
+        //   self.command_tx.unbounded_send(StreamCommand::Close { completion: some channel });
+        // }
+        // Register waker for closed:
+        /*let waker = cx.waker().clone();
+        let _ = self
+            .command_tx
+            .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
+        Poll::Pending*/
+
+        // We need to track whether we've already initiated the close to avoid sending
+        // multiple close commands. Since we can't modify self in poll_close, we'll
+        // send the close command each time and let the stream task handle deduplication.
+
+        // Send close command (stream task will handle deduplication)
+        let (tx, mut rx) = oneshot::channel();
+        if self
+            .command_tx
+            .unbounded_send(StreamCommand::Close { completion: tx })
+            .is_err()
+        {
+            return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+        }
+
+        // Try to receive the close completion result
+        match Pin::new(&mut rx).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(StreamError::Custom("Close operation canceled".into())))
+            }
+            Poll::Pending => {
+                // Also register a waker for closed state changes
+                let waker = cx.waker().clone();
+                let _ = self
+                    .command_tx
+                    .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
+
+                // Double-check closed state after registering waker
+                if self.closed.load(Ordering::SeqCst) {
+                    Poll::Ready(Ok(()))
+                } else if self.errored.load(Ordering::SeqCst) {
+                    let error = {
+                        let opt_err = match self.stored_error.read() {
+                            Ok(guard) => guard.clone(),
+                            Err(poisoned) => poisoned.into_inner().clone(),
+                        };
+                        opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                    };
+                    Poll::Ready(Err(error))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
 pub trait WritableSink<T: Send + 'static>: Sized {
     /// Start the sink
     fn start(
