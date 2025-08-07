@@ -165,7 +165,7 @@ impl<T, Sink, S> WritableStream<T, Sink, S> {
     }
 }
 
-impl<T, Sink> WritableStream<T, Sink, Locked>
+impl<T, Sink> WritableStream<T, Sink, Unlocked>
 where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
