@@ -5,6 +5,7 @@ use futures::channel::oneshot;
 use futures::future::FutureExt;
 use futures::future::poll_fn;
 use futures::{AsyncWrite, SinkExt, StreamExt, future};
+use pin_project::pin_project;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -161,6 +162,13 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
     stored_error: Arc<RwLock<Option<StreamError>>>,
     _sink: PhantomData<Sink>,
     _state: PhantomData<S>,
+    #[pin]
+    flush_receiver: Option<oneshot::Receiver<StreamResult<()>>>,
+    #[pin]
+    close_receiver: Option<oneshot::Receiver<Result<(), StreamError>>>,
+    #[pin]
+    write_receiver: Option<oneshot::Receiver<Result<(), StreamError>>>,
+    pending_write_len: Option<usize>,
 }
 
 impl<T, Sink, S> WritableStream<T, Sink, S> {
@@ -279,6 +287,10 @@ where
             stored_error: Arc::clone(&self.stored_error),
             _sink: PhantomData,
             _state: PhantomData::<Locked>,
+            flush_receiver: None,
+            close_receiver: None,
+            write_receiver: None,
+            pending_write_len: None,
         };
 
         Ok((locked.clone(), WritableStreamDefaultWriter::new(locked)))
@@ -349,6 +361,10 @@ where
             stored_error,
             _sink: PhantomData,
             _state: PhantomData,
+            flush_receiver: None,
+            close_receiver: None,
+            write_receiver: None,
+            pending_write_len: None,
         }
     }
 
@@ -426,6 +442,10 @@ where
             stored_error,
             _sink: PhantomData,
             _state: PhantomData,
+            flush_receiver: None,
+            close_receiver: None,
+            write_receiver: None,
+            pending_write_len: None,
         }
     }
 }
@@ -469,6 +489,10 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
             stored_error: Arc::clone(&self.stored_error),
             _sink: PhantomData,
             _state: PhantomData,
+            flush_receiver: None,
+            close_receiver: None,
+            write_receiver: None,
+            pending_write_len: None,
         }
     }
 }
@@ -554,8 +578,8 @@ where
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // Check error state
+    /*fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Check error state first
         if self.errored.load(Ordering::SeqCst) {
             let error = {
                 let opt_err = match self.stored_error.read() {
@@ -567,105 +591,230 @@ where
             return Poll::Ready(Err(error));
         }
 
-        // Check if all writes are flushed (both queue and in-flight should be empty)
-        if self.queue_total_size.load(Ordering::SeqCst) == 0
-            && self.in_flight_size.load(Ordering::SeqCst) == 0
-        {
-            Poll::Ready(Ok(()))
-        } else {
-            // Register waker to be notified when flush completes
-            let waker = cx.waker().clone();
-            let _ = self
-                .command_tx
-                .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
-
-            // Double-check after registering waker
-            if self.queue_total_size.load(Ordering::SeqCst) == 0
-                && self.in_flight_size.load(Ordering::SeqCst) == 0
-            {
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
-        }
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // If already closed, return success
-        if self.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-
-        // If errored, return the error
-        if self.errored.load(Ordering::SeqCst) {
-            let error = {
-                let opt_err = match self.stored_error.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-            };
-            return Poll::Ready(Err(error));
-        }
-
-        // Send the close command exactly once (you'd want to track here if previously sent)
-        // Then register a waker to get notified when closed:
-        // Assuming you have an atomic flag or method to track close command sent:
-        // Pseudocode:
-        // if !self.close_requested {
-        //   self.close_requested = true;
-        //   self.command_tx.unbounded_send(StreamCommand::Close { completion: some channel });
-        // }
-        // Register waker for closed:
-        /*let waker = cx.waker().clone();
-        let _ = self
-            .command_tx
-            .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
-        Poll::Pending*/
-
-        // We need to track whether we've already initiated the close to avoid sending
-        // multiple close commands. Since we can't modify self in poll_close, we'll
-        // send the close command each time and let the stream task handle deduplication.
-
-        // Send close command (stream task will handle deduplication)
         let (tx, mut rx) = oneshot::channel();
+
         if self
             .command_tx
-            .unbounded_send(StreamCommand::Close { completion: tx })
+            .unbounded_send(StreamCommand::Flush { completion: tx })
             .is_err()
         {
             return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
         }
 
-        // Try to receive the close completion result
+        // Poll the completion receiver
         match Pin::new(&mut rx).poll(cx) {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
             Poll::Ready(Err(_)) => {
-                Poll::Ready(Err(StreamError::Custom("Close operation canceled".into())))
+                Poll::Ready(Err(StreamError::Custom("Flush operation canceled".into())))
             }
-            Poll::Pending => {
-                // Also register a waker for closed state changes
-                let waker = cx.waker().clone();
-                let _ = self
-                    .command_tx
-                    .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
+            Poll::Pending => Poll::Pending,
+        }
+    }*/
 
-                // Double-check closed state after registering waker
-                if self.closed.load(Ordering::SeqCst) {
-                    Poll::Ready(Ok(()))
-                } else if self.errored.load(Ordering::SeqCst) {
-                    let error = {
-                        let opt_err = match self.stored_error.read() {
-                            Ok(guard) => guard.clone(),
-                            Err(poisoned) => poisoned.into_inner().clone(),
-                        };
-                        opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+    /*fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            let this = self.get_mut();
+
+            if this.errored.load(Ordering::SeqCst) {
+                let error = {
+                    let opt_err = match this.stored_error.read() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
                     };
-                    Poll::Ready(Err(error))
-                } else {
-                    Poll::Pending
+                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                };
+                return Poll::Ready(Err(error));
+            }
+
+            // If there's no receiver stored, send a flush command and save the receiver
+            if this.flush_receiver.is_none() {
+                let (tx, rx) = oneshot::channel();
+                if this
+                    .command_tx
+                    .unbounded_send(StreamCommand::Flush { completion: tx })
+                    .is_err()
+                {
+                    return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+                }
+                this.flush_receiver = Some(rx);
+            }
+
+            // Poll the stored receiver
+            if let Some(rx) = &mut this.flush_receiver {
+                match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok(result)) => {
+                        this.flush_receiver = None;
+                        Poll::Ready(result)
+                    }
+                    Poll::Ready(Err(_)) => {
+                        this.flush_receiver = None;
+                        Poll::Ready(Err(StreamError::Custom("Flush operation canceled".into())))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            } else {
+                // Should not reach here
+                Poll::Ready(Err(StreamError::Custom("Flush receiver missing".into())))
+            }
+        }
+    */
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Project the pinned fields
+        let mut this = self.project();
+
+        // Check for errors
+        if this.errored.load(Ordering::SeqCst) {
+            let error = {
+                let opt_err = match this.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
+        }
+
+        // If there's no flush_receiver yet, initiate a flush and store the receiver
+        if this.flush_receiver.is_none() {
+            let (tx, rx) = oneshot::channel();
+            if this
+                .command_tx
+                .unbounded_send(StreamCommand::Flush { completion: tx })
+                .is_err()
+            {
+                return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+            }
+
+            *this.flush_receiver = Some(rx);
+        }
+
+        // Poll the flush_receiver
+        if let Some(rx) = this.flush_receiver.as_mut().as_pin_mut() {
+            match rx.poll(cx) {
+                Poll::Ready(Ok(result)) => {
+                    *this.flush_receiver = None;
+                    Poll::Ready(result)
+                }
+                Poll::Ready(Err(_)) => {
+                    *this.flush_receiver = None;
+                    Poll::Ready(Err(StreamError::Custom("Flush operation canceled".into())))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Err(StreamError::Custom("Flush receiver missing".into())))
+        }
+    }
+
+    /*fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            // If already closed, return success
+            if self.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+
+            // If errored, return the error
+            if self.errored.load(Ordering::SeqCst) {
+                let error = {
+                    let opt_err = match self.stored_error.read() {
+                        Ok(guard) => guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                };
+                return Poll::Ready(Err(error));
+            }
+
+            let (tx, mut rx) = oneshot::channel();
+            if self
+                .command_tx
+                .unbounded_send(StreamCommand::Close { completion: tx })
+                .is_err()
+            {
+                return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+            }
+
+            // Poll the completion receiver
+            match Pin::new(&mut rx).poll(cx) {
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                Poll::Ready(Err(_)) => {
+                    Poll::Ready(Err(StreamError::Custom("Close operation canceled".into())))
+                }
+                Poll::Pending => {
+                    // Register waker for state changes as backup
+                    let waker = cx.waker().clone();
+                    let _ = self
+                        .command_tx
+                        .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
+
+                    // Double-check state after registering waker
+                    if self.closed.load(Ordering::SeqCst) {
+                        Poll::Ready(Ok(()))
+                    } else if self.errored.load(Ordering::SeqCst) {
+                        let error = {
+                            let opt_err = match self.stored_error.read() {
+                                Ok(guard) => guard.clone(),
+                                Err(poisoned) => poisoned.into_inner().clone(),
+                            };
+                            opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                        };
+                        Poll::Ready(Err(error))
+                    } else {
+                        Poll::Pending
+                    }
                 }
             }
+        }
+    */
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Project the pinned fields
+        let mut this = self.project();
+
+        // Already closed?
+        if this.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+
+        // If errored, return error
+        if this.errored.load(Ordering::SeqCst) {
+            let error = {
+                let opt_err = match this.stored_error.read() {
+                    Ok(guard) => guard.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            };
+            return Poll::Ready(Err(error));
+        }
+
+        // Initiate close if not already started
+        if this.close_receiver.is_none() {
+            let (tx, rx) = oneshot::channel();
+            if this
+                .command_tx
+                .unbounded_send(StreamCommand::Close { completion: tx })
+                .is_err()
+            {
+                return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+            }
+            *this.close_receiver = Some(rx);
+        }
+
+        // Poll the close_receiver future
+        if let Some(rx) = this.close_receiver.as_mut().as_pin_mut() {
+            match rx.poll(cx) {
+                Poll::Ready(Ok(result)) => {
+                    *this.close_receiver = None;
+                    Poll::Ready(result)
+                }
+                Poll::Ready(Err(_)) => {
+                    *this.close_receiver = None;
+                    Poll::Ready(Err(StreamError::Custom("Close operation canceled".into())))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Err(StreamError::Custom("Close receiver missing".into())))
         }
     }
 }
@@ -1205,6 +1354,29 @@ async fn stream_task<T, Sink>(
         UnboundedSender<ControllerMsg>,
         UnboundedReceiver<ControllerMsg>,
     ) = unbounded();
+
+    if let Some(mut sink) = inner.sink.take() {
+        let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
+
+        // Await start on sink
+        let start_result = sink.start(&mut controller).await;
+
+        match start_result {
+            Ok(()) => {
+                // Success: restore the sink to inner
+                inner.sink = Some(sink);
+            }
+            Err(error) => {
+                // Failed to start: mark errored state
+                inner.state = StreamState::Errored;
+                set_stored_error(&inner.stored_error, error);
+                inner.sink = None; // Drop the sink on failure
+                // Optionally you may want to wake closed and ready wakers here
+                update_flags(&inner, &backpressure, &closed, &errored);
+                // Since start failed, allow the loop to run and reject commands naturally as they would check for the error state.
+            }
+        }
+    }
 
     poll_fn(|cx| {
         process_controller_msgs(&mut inner, &mut ctrl_rx);
@@ -3417,5 +3589,562 @@ mod tests {
 
         // Confirm the underlying sink received both writes
         assert_eq!(sink.get_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod sink_integration_tests {
+    use super::*;
+    use futures::{SinkExt, StreamExt, stream};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Test sink implementation that tracks all operations
+    #[derive(Debug, Clone)]
+    struct TestSink {
+        id: String,
+        received_items: Arc<Mutex<Vec<String>>>,
+        write_delay: Option<Duration>,
+        fail_on_write: Option<usize>, // Fail on nth write
+        fail_on_close: bool,
+        fail_on_abort: bool,
+        operation_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestSink {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                received_items: Arc::new(Mutex::new(Vec::new())),
+                write_delay: None,
+                fail_on_write: None,
+                fail_on_close: false,
+                fail_on_abort: false,
+                operation_log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_write_delay(mut self, delay: Duration) -> Self {
+            self.write_delay = Some(delay);
+            self
+        }
+
+        fn with_write_failure(mut self, fail_on_nth: usize) -> Self {
+            self.fail_on_write = Some(fail_on_nth);
+            self
+        }
+
+        fn with_close_failure(mut self) -> Self {
+            self.fail_on_close = true;
+            self
+        }
+
+        fn _with_abort_failure(mut self) -> Self {
+            self.fail_on_abort = true;
+            self
+        }
+
+        fn get_received_items(&self) -> Vec<String> {
+            self.received_items.lock().unwrap().clone()
+        }
+
+        fn get_operation_log(&self) -> Vec<String> {
+            self.operation_log.lock().unwrap().clone()
+        }
+
+        fn log_operation(&self, op: &str) {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("{}: {}", self.id, op));
+        }
+    }
+
+    impl WritableSink<String> for TestSink {
+        async fn start(
+            &mut self,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.log_operation("start called");
+            Ok(())
+        }
+
+        async fn write(
+            &mut self,
+            chunk: String,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.log_operation(&format!("write called with: {}", chunk));
+
+            // Simulate write delay if configured
+            if let Some(delay) = self.write_delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            // Check if we should fail on this write
+            let current_count = self.received_items.lock().unwrap().len();
+            if let Some(fail_on) = self.fail_on_write {
+                if current_count >= fail_on {
+                    self.log_operation(&format!("write failed on item {}", current_count + 1));
+                    return Err(StreamError::Custom(ArcError::from(format!(
+                        "Intentional write failure on item {}",
+                        current_count + 1
+                    ))));
+                }
+            }
+
+            // Store the item
+            self.received_items.lock().unwrap().push(chunk.clone());
+            self.log_operation(&format!("write completed: {}", chunk));
+            Ok(())
+        }
+
+        async fn close(self) -> StreamResult<()> {
+            self.log_operation("close called");
+
+            if self.fail_on_close {
+                self.log_operation("close failed");
+                return Err(StreamError::Custom(ArcError::from(
+                    "Intentional close failure",
+                )));
+            }
+
+            self.log_operation("close completed");
+            Ok(())
+        }
+
+        async fn abort(self, reason: Option<String>) -> StreamResult<()> {
+            let reason_str = reason.as_deref().unwrap_or("no reason");
+            self.log_operation(&format!("abort called with reason: {}", reason_str));
+
+            if self.fail_on_abort {
+                self.log_operation("abort failed");
+                return Err(StreamError::Custom(ArcError::from(
+                    "Intentional abort failure",
+                )));
+            }
+
+            self.log_operation("abort completed");
+            Ok(())
+        }
+    }
+
+    // Simple queuing strategy for testing
+    struct TestQueuingStrategy {
+        high_water_mark: usize,
+    }
+
+    impl TestQueuingStrategy {
+        fn new(high_water_mark: usize) -> Self {
+            Self { high_water_mark }
+        }
+    }
+
+    impl QueuingStrategy<String> for TestQueuingStrategy {
+        fn size(&self, _chunk: &String) -> usize {
+            1 // Each string counts as size 1
+        }
+
+        fn high_water_mark(&self) -> usize {
+            self.high_water_mark
+        }
+    }
+
+    #[tokio::test]
+    async fn test_basic_sink_operations() {
+        let sink = TestSink::new("basic");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // Test poll_ready and start_send
+        assert!(
+            sink_handle
+                .poll_ready_unpin(&mut std::task::Context::from_waker(
+                    &futures::task::noop_waker()
+                ))
+                .is_ready()
+        );
+
+        // Send some items
+        sink_handle.start_send_unpin("item1".to_string()).unwrap();
+        sink_handle.start_send_unpin("item2".to_string()).unwrap();
+        sink_handle.start_send_unpin("item3".to_string()).unwrap();
+
+        //println!("flush called from test");
+        // Flush to ensure all writes complete
+        sink_handle.flush().await.unwrap();
+        //println!("flush call from test returns");
+
+        // Verify items were received
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["item1", "item2", "item3"]);
+
+        // Close the sink
+        sink_handle.close().await.unwrap();
+
+        // Verify operations log
+        let log = sink.get_operation_log();
+        assert!(log.contains(&"basic: start called".to_string()));
+        assert!(log.contains(&"basic: write completed: item1".to_string()));
+        assert!(log.contains(&"basic: close completed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_handling() {
+        let sink = TestSink::new("backpressure");
+        let strategy = Box::new(TestQueuingStrategy::new(2)); // Small buffer
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // Fill up the buffer
+        sink_handle.send("item1".to_string()).await.unwrap();
+        sink_handle.send("item2".to_string()).await.unwrap();
+
+        // This should trigger backpressure
+        let start = std::time::Instant::now();
+        sink_handle.send("item3".to_string()).await.unwrap();
+
+        // Verify backpressure caused some delay (items had to be processed)
+        assert!(start.elapsed() > Duration::from_millis(1));
+
+        sink_handle.close().await.unwrap();
+
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["item1", "item2", "item3"]);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_writes() {
+        use tokio::sync::Mutex;
+
+        let sink = TestSink::new("concurrent").with_write_delay(Duration::from_millis(10));
+        let strategy = Box::new(TestQueuingStrategy::new(10));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        /*let mut sink_handle = stream;
+
+        // Send multiple items concurrently
+        let mut futures = Vec::new();
+        for i in 0..5 {
+            let item = format!("concurrent_item_{}", i);
+            futures.push(sink_handle.send(item));
+        }
+
+        // Wait for all sends to complete
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        sink_handle.close().await.unwrap();
+        */
+
+        let sink_handle = Arc::new(Mutex::new(stream));
+
+        let mut futures = Vec::new();
+        for i in 0..5 {
+            let sink_clone = Arc::clone(&sink_handle);
+            let item = format!("concurrent_item_{}", i);
+            futures.push(tokio::spawn(async move {
+                let mut sink = sink_clone.lock().await;
+                sink.send(item).await
+            }));
+        }
+
+        // Wait for all sends to complete
+        let results = futures::future::join_all(futures).await;
+        for result in results {
+            result.unwrap().unwrap();
+        }
+
+        sink_handle.lock().await.close().await.unwrap();
+
+        let received = sink.get_received_items();
+        assert_eq!(received.len(), 5);
+        // Items should all be present (order might vary due to concurrency)
+        for i in 0..5 {
+            let expected_item = format!("concurrent_item_{}", i);
+            assert!(received.contains(&expected_item));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_failure_handling() {
+        let sink = TestSink::new("write_fail").with_write_failure(2); // Fail on 3rd write (index 2)
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // First two writes should succeed
+        sink_handle.send("item1".to_string()).await.unwrap();
+        sink_handle.send("item2".to_string()).await.unwrap();
+
+        // Third write should fail
+        let result = sink_handle.send("item3".to_string()).await;
+        assert!(result.is_err());
+
+        // Verify sink is now in error state
+        let ready_result = sink_handle.poll_ready_unpin(&mut std::task::Context::from_waker(
+            &futures::task::noop_waker(),
+        ));
+        match ready_result {
+            std::task::Poll::Ready(Err(_)) => {} // Expected
+            other => panic!("Expected error state, got: {:?}", other),
+        }
+
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["item1", "item2"]);
+    }
+
+    #[tokio::test]
+    async fn test_close_failure_handling() {
+        let sink = TestSink::new("close_fail").with_close_failure();
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // Send some items
+        sink_handle.send("item1".to_string()).await.unwrap();
+        sink_handle.send("item2".to_string()).await.unwrap();
+
+        // Close should fail
+        let close_result = sink_handle.close().await;
+        assert!(close_result.is_err());
+
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["item1", "item2"]);
+    }
+
+    #[tokio::test]
+    async fn test_operations_after_close() {
+        let sink = TestSink::new("after_close");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // Send an item and close
+        sink_handle.send("item1".to_string()).await.unwrap();
+        sink_handle.close().await.unwrap();
+
+        // Further operations should fail
+        let send_result = sink_handle.send("item2".to_string()).await;
+        assert!(send_result.is_err());
+
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["item1"]);
+    }
+
+    #[tokio::test]
+    async fn test_abort_operation() {
+        let sink = TestSink::new("abort_test");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Get a writer to test abort
+        let (_locked_stream, writer) = stream.get_writer().unwrap();
+
+        // Send some items
+        writer.write("item1".to_string()).await.unwrap();
+        writer.write("item2".to_string()).await.unwrap();
+
+        // Abort with reason
+        writer
+            .abort(Some("Test abort reason".to_string()))
+            .await
+            .unwrap();
+
+        // Verify abort was called on sink
+        let log = sink.get_operation_log();
+        assert!(
+            log.iter()
+                .any(|entry| entry.contains("abort called with reason: Test abort reason"))
+        );
+        assert!(log.iter().any(|entry| entry.contains("abort completed")));
+
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["item1", "item2"]);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_close_calls() {
+        let sink = TestSink::new("multi_close");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        sink_handle.send("item1".to_string()).await.unwrap();
+
+        // Multiple close calls should all succeed
+        sink_handle.close().await.unwrap();
+        sink_handle.close().await.unwrap();
+        sink_handle.close().await.unwrap();
+
+        // Should only see one close in the log
+        let log = sink.get_operation_log();
+        let close_count = log
+            .iter()
+            .filter(|entry| entry.contains("close called"))
+            .count();
+        assert_eq!(close_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_behavior() {
+        let sink = TestSink::new("flush_test").with_write_delay(Duration::from_millis(50));
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // Start several writes without awaiting
+        sink_handle.start_send_unpin("item1".to_string()).unwrap();
+        sink_handle.start_send_unpin("item2".to_string()).unwrap();
+        sink_handle.start_send_unpin("item3".to_string()).unwrap();
+
+        // At this point, items are queued but may not be written yet
+        let _received_before_flush = sink.get_received_items();
+        // May be empty or partially filled depending on timing
+
+        // Flush should wait for all writes to complete
+        let start = std::time::Instant::now();
+        sink_handle.flush().await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Should have taken at least some time due to write delays
+        assert!(elapsed >= Duration::from_millis(30)); // Some buffer for timing
+
+        // All items should now be written
+        let received_after_flush = sink.get_received_items();
+        assert_eq!(received_after_flush, vec!["item1", "item2", "item3"]);
+
+        sink_handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stream_integration() {
+        let sink = TestSink::new("stream_integration");
+        let strategy = Box::new(TestQueuingStrategy::new(3));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // Create a stream of items to send
+        let mut items = stream::iter(vec!["a", "b", "c", "d", "e"])
+            .map(|s| Ok::<String, StreamError>(s.to_string()));
+
+        // Use send_all to send the entire stream
+        sink_handle.send_all(&mut items).await.unwrap();
+
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_behavior() {
+        let sink = TestSink::new("timeout_test").with_write_delay(Duration::from_secs(2));
+        let strategy = Box::new(TestQueuingStrategy::new(1));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let mut sink_handle = stream;
+
+        // This should timeout because write takes 2 seconds
+        let result = timeout(
+            Duration::from_millis(500),
+            sink_handle.send("slow_item".to_string()),
+        )
+        .await;
+        assert!(result.is_err()); // Should timeout
+
+        // Give it time to complete in background
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Item should eventually be received
+        let received = sink.get_received_items();
+        assert_eq!(received, vec!["slow_item"]);
+    }
+
+    // Stress test for robustness
+    #[tokio::test]
+    async fn test_high_volume_writes() {
+        use tokio::sync::Mutex;
+
+        let sink = TestSink::new("high_volume");
+        let strategy = Box::new(TestQueuingStrategy::new(10));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        //let mut sink_handle = stream;
+        let sink_handle = Arc::new(Mutex::new(stream));
+
+        let item_count = 1000;
+        let mut send_futures = Vec::new();
+
+        /*for i in 0..item_count {
+            let future = sink_handle.send(format!("item_{}", i));
+            send_futures.push(future);
+        }*/
+        for i in 0..item_count {
+            let sink_clone = Arc::clone(&sink_handle);
+            let item = format!("item_{}", i);
+            send_futures.push(tokio::spawn(async move {
+                let mut sink = sink_clone.lock().await;
+                sink.send(item).await
+            }));
+        }
+
+        // Wait for all to complete
+        /*let results: Result<Vec<_>, _> = futures::future::join_all(send_futures)
+            .await
+            .into_iter()
+            .collect();
+        results.unwrap();*/
+        let results = futures::future::join_all(send_futures).await;
+        for r in results {
+            r.unwrap().unwrap();
+        }
+
+        //sink_handle.close().await.unwrap();
+        sink_handle.lock().await.close().await.unwrap();
+
+        let received = sink.get_received_items();
+        assert_eq!(received.len(), item_count);
+
+        // Verify all items are present
+        for i in 0..item_count {
+            let expected = format!("item_{}", i);
+            assert!(received.contains(&expected), "Missing item: {}", expected);
+        }
     }
 }
