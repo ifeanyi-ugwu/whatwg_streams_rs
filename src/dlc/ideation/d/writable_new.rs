@@ -4,11 +4,12 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
 use futures::future::FutureExt;
 use futures::future::poll_fn;
-use futures::{SinkExt, StreamExt, future};
+use futures::{AsyncWrite, SinkExt, StreamExt, future};
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::io::{Error as IoError, ErrorKind};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -113,6 +114,9 @@ struct PendingWrite<T> {
 pub enum StreamCommand<T> {
     Write {
         chunk: T,
+        completion: oneshot::Sender<StreamResult<()>>,
+    },
+    Flush {
         completion: oneshot::Sender<StreamResult<()>>,
     },
     Close {
@@ -310,6 +314,8 @@ where
             stored_error: Arc::clone(&stored_error),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
+            flush_completions: Vec::new(),
+            pending_flush_commands: Vec::new(),
         };
 
         let backpressure = Arc::new(AtomicBool::new(false));
@@ -376,6 +382,8 @@ where
             stored_error: Arc::clone(&stored_error),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
+            flush_completions: Vec::new(),
+            pending_flush_commands: Vec::new(),
         };
 
         let backpressure = Arc::new(AtomicBool::new(false));
@@ -662,6 +670,238 @@ where
     }
 }
 
+impl<T, Sink> AsyncWrite for WritableStream<T, Sink, Unlocked>
+where
+    T: for<'a> From<&'a [u8]> + Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, IoError>> {
+        // Early return for empty writes
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Check if the stream is errored
+        if self.errored.load(Ordering::SeqCst) {
+            let error_msg = self
+                .stored_error
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Stream is errored".into());
+            return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
+        }
+
+        if self.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(IoError::new(ErrorKind::BrokenPipe, "Stream is closed")));
+        }
+
+        // Check backpressure before attempting write
+        if self.backpressure.load(Ordering::SeqCst) {
+            // Register current task waker to be notified when ready
+            let waker = cx.waker().clone();
+            let _ = self
+                .command_tx
+                .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+            // Double-check backpressure after registering waker to avoid race
+            if self.backpressure.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
+
+        // Convert the byte slice into your chunk type T
+        /*let chunk: T = T::from(buf);
+
+        // Create a oneshot channel to receive the completion result
+        let (tx, rx) = oneshot::channel();
+
+        // Send the write command
+        if let Err(_) = self.command_tx.unbounded_send(StreamCommand::Write {
+            chunk,
+            completion: tx,
+        }) {
+            return Poll::Ready(Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "Stream task dropped",
+            )));
+        }
+
+        // Poll for write completion asynchronously
+        futures::pin_mut!(rx);
+        match rx.poll(cx) {
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Ok(Err(e))) => {
+                Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e))))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
+                ErrorKind::Other,
+                "Write completion channel canceled",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }*/
+        let chunk: T = T::from(buf);
+        let buf_len = buf.len(); // Capture length before moving buf
+
+        // Create a oneshot channel to receive the completion result
+        let (tx, rx) = oneshot::channel();
+
+        // Send the write command
+        if self
+            .command_tx
+            .unbounded_send(StreamCommand::Write {
+                chunk,
+                completion: tx,
+            })
+            .is_err()
+        {
+            return Poll::Ready(Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "Stream task dropped",
+            )));
+        }
+
+        // Create a pinned future for the completion
+        let mut rx_future = Box::pin(rx);
+
+        // Poll for write completion asynchronously
+        match rx_future.as_mut().poll(cx) {
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(buf_len)),
+            Poll::Ready(Ok(Err(stream_err))) => {
+                // Map StreamError to appropriate IoError kinds
+                let io_err = match stream_err {
+                    StreamError::Canceled => IoError::new(ErrorKind::Interrupted, "Write canceled"),
+                    StreamError::Aborted(_) => {
+                        IoError::new(ErrorKind::Interrupted, stream_err.to_string())
+                    }
+                    StreamError::Closing => {
+                        IoError::new(ErrorKind::BrokenPipe, "Stream is closing")
+                    }
+                    StreamError::Closed => IoError::new(ErrorKind::BrokenPipe, "Stream is closed"),
+                    StreamError::Custom(_) => {
+                        IoError::new(ErrorKind::Other, stream_err.to_string())
+                    }
+                };
+                Poll::Ready(Err(io_err))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
+                ErrorKind::Interrupted,
+                "Write completion channel canceled",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        // Check error state first
+        if self.errored.load(Ordering::SeqCst) {
+            let error_msg = self
+                .stored_error
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Stream is errored".into());
+            return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
+        }
+
+        let (tx, mut rx) = oneshot::channel();
+        if self
+            .command_tx
+            .unbounded_send(StreamCommand::Flush { completion: tx })
+            .is_err()
+        {
+            return Poll::Ready(Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "Stream task dropped",
+            )));
+        }
+
+        // Poll the completion receiver
+        match Pin::new(&mut rx).poll(cx) {
+            Poll::Ready(Ok(result)) => match result {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(e) => Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e)))),
+            },
+            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
+                ErrorKind::Other,
+                "Flush operation canceled",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        // If already closed, return success
+        if self.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+
+        // If errored, return the error
+        if self.errored.load(Ordering::SeqCst) {
+            let error_msg = self
+                .stored_error
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "Stream is errored".into());
+            return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
+        }
+
+        let (tx, mut rx) = oneshot::channel();
+        if self
+            .command_tx
+            .unbounded_send(StreamCommand::Close { completion: tx })
+            .is_err()
+        {
+            return Poll::Ready(Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "Stream task dropped",
+            )));
+        }
+
+        // Poll the completion receiver
+        match Pin::new(&mut rx).poll(cx) {
+            Poll::Ready(Ok(result)) => match result {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(e) => Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e)))),
+            },
+            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
+                ErrorKind::Other,
+                "Close operation canceled",
+            ))),
+            Poll::Pending => {
+                // Register waker for state changes as backup
+                let waker = cx.waker().clone();
+                let _ = self
+                    .command_tx
+                    .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
+
+                // Double-check state after registering waker
+                if self.closed.load(Ordering::SeqCst) {
+                    Poll::Ready(Ok(()))
+                } else if self.errored.load(Ordering::SeqCst) {
+                    let error_msg = self
+                        .stored_error
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().cloned())
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Stream is errored".into());
+                    Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
 pub trait WritableSink<T: Send + 'static>: Sized {
     /// Start the sink
     fn start(
@@ -837,6 +1077,48 @@ fn process_command<T, Sink>(
             update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
             update_flags(&inner, backpressure, closed, errored);
         }
+        StreamCommand::Flush { completion } => {
+            if inner.state == StreamState::Errored {
+                let error = {
+                    let opt_err = match inner.stored_error.read() {
+                        Ok(err_guard) => err_guard.clone(),
+                        Err(poisoned) => poisoned.into_inner().clone(),
+                    };
+                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                };
+                let _ = completion.send(Err(error));
+                return;
+            }
+
+            inner.pending_flush_commands.push(completion);
+
+            // Count writes that exist RIGHT NOW
+            /*let writes_to_wait_for = inner.queue.len() + if inner.in_flight_size > 0 { 1 } else { 0 };
+
+            if writes_to_wait_for == 0 {
+                // No writes - flush immediately
+                let _ = completion.send(Ok(()));
+            } else {
+                // Store this flush to wait for write completions
+                inner
+                    .flush_completions
+                    .push((completion, writes_to_wait_for));
+            }*/
+            // Count writes that exist RIGHT NOW (when flush is called)
+            /*let current_inflight_count = if inflight.is_some() { 1 } else { 0 };
+            let writes_to_wait_for = inner.queue.len() + current_inflight_count;
+
+            if writes_to_wait_for == 0 {
+                // No writes to wait for - flush immediately
+                let _ = completion.send(Ok(()));
+            } else {
+                // Store this flush to wait for exactly this many write completions
+                inner
+                    .flush_completions
+                    .push((completion, writes_to_wait_for));
+            }*/
+        }
+
         /*StreamCommand::GetDesiredSize { completion } => {
             let high_water_mark = inner.strategy.high_water_mark();
             let total = inner.queue_total_size + inner.in_flight_size;
@@ -949,6 +1231,33 @@ async fn stream_task<T, Sink>(
                         matches!(cmd, StreamCommand::RegisterClosedWaker { .. });
                     let should_wake_ready = matches!(cmd, StreamCommand::RegisterReadyWaker { .. });*/
 
+                     /*match cmd {
+                StreamCommand::Flush { completion } => {
+                    if inner.state == StreamState::Errored {
+                        let error = {
+                            let opt_err = match inner.stored_error.read() {
+                                Ok(err_guard) => err_guard.clone(),
+                                Err(poisoned) => poisoned.into_inner().clone(),
+                            };
+                            opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                        };
+                        let _ = completion.send(Err(error));
+                        continue; // Continue to next command
+                    }
+
+                    // Here we have access to inflight!
+                    let current_inflight_count = if matches!(inflight, Some(InFlight::Write { .. })) { 1 } else { 0 };
+                    let writes_to_wait_for = inner.queue.len() + current_inflight_count;
+                    if writes_to_wait_for == 0 {
+                        // No writes to wait for - flush immediately
+                        let _ = completion.send(Ok(()));
+                    } else {
+                        // Store this flush to wait for exactly this many write completions
+                        inner.flush_completions.push((completion, writes_to_wait_for));
+                    }
+                }
+                // Handle all other commands through process_command
+                other_cmd => {*/
                     process_command(
                         cmd,
                         &mut inner,
@@ -959,6 +1268,11 @@ async fn stream_task<T, Sink>(
                         &in_flight_size,
                         cx,
                     );
+                    while let Some(completion) = inner.pending_flush_commands.pop() {
+                        process_flush_command(completion, &mut inner, &inflight);
+                    }
+                //}
+            //}
 
                     // Immediately check wake conditions for waker registration commands
                     // to prevent race conditions where the condition is already met.
@@ -1106,6 +1420,8 @@ async fn stream_task<T, Sink>(
                     match fut.as_mut().poll(cx) {
                         Poll::Ready((sink, result)) => {
                             inner.in_flight_size -= *chunk_size;
+
+                            decrement_flush_counters(&mut inner);
 
                             // Check for error first, before any flag updates
                             if result.is_err() {
@@ -1293,6 +1609,8 @@ async fn stream_task<T, Sink>(
                 },
             }
         }
+
+        //inner.notify_write_completed();
 
         Poll::Pending
     })
@@ -1615,6 +1933,10 @@ struct WritableStreamInner<T, Sink> {
 
     ready_wakers: WakerSet,
     closed_wakers: WakerSet,
+
+    /// Track flush operations waiting for specific write counts
+    flush_completions: Vec<(oneshot::Sender<StreamResult<()>>, usize)>,
+    pending_flush_commands: Vec<oneshot::Sender<StreamResult<()>>>,
 }
 
 impl<T, Sink> WritableStreamInner<T, Sink>
@@ -1630,6 +1952,144 @@ where
         if prev && !self.backpressure {
             // Backpressure just cleared: wake all pending ready futures!
             self.ready_wakers.wake_all();
+        }
+    }
+
+    /*fn process_flush_command(
+        &mut self,
+        completion: oneshot::Sender<StreamResult<()>>,
+        has_inflight_write: bool,
+    ) {
+        if self.is_errored() {
+            completion.send(Err(self.get_stored_error())).ok();
+            return;
+        }
+
+        let pending_writes = self.queue.len() + has_inflight_write as usize;
+
+        if pending_writes == 0 {
+            completion.send(Ok(())).ok();
+        } else {
+            self.flush_completions.push((completion, pending_writes));
+        }
+    }
+
+    fn flush_ready(&mut self) {
+        let mut i = 0;
+        while i < self.flush_completions.len() {
+            let (_, count) = &mut self.flush_completions[i];
+            *count -= 1;
+
+            if *count == 0 {
+                let (sender, _) = self.flush_completions.swap_remove(i);
+                let _ = sender.send(Ok(()));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn notify_write_completed(&mut self) {
+        // Collect completed flushes
+        let mut completed = Vec::new();
+
+        for i in (0..self.flush_completions.len()).rev() {
+            let (_sender, count) = &mut self.flush_completions[i];
+
+            *count = count.saturating_sub(1);
+
+            if *count == 0 {
+                // Take ownership by removing the entry
+                let (sender, _) = self.flush_completions.swap_remove(i);
+                completed.push(sender);
+            }
+        }
+
+        // Notify completed flushes
+        for sender in completed {
+            let _ = sender.send(Ok(()));
+        }
+    }
+
+    fn is_errored(&self) -> bool {
+        self.state == StreamState::Errored
+    }*/
+
+    fn get_stored_error(&self) -> StreamError {
+        self.stored_error
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+    }
+}
+
+// Stream task processing for flush - count writes at this moment!
+fn process_flush_command<T, Sink>(
+    completion: oneshot::Sender<StreamResult<()>>,
+    inner: &mut WritableStreamInner<T, Sink>,
+    inflight: &Option<InFlight<Sink>>,
+) {
+    if inner.state == StreamState::Errored {
+        let error = {
+            let opt_err = match inner.stored_error.read() {
+                Ok(err_guard) => err_guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+        };
+        let _ = completion.send(Err(error));
+        return;
+    }
+
+    // Count writes that exist RIGHT NOW when flush is called
+    //let writes_to_wait_for = inner.queue.len() + if inflight.is_some() { 1 } else { 0 };
+    let inflight_writes = match inflight {
+        Some(InFlight::Write { .. }) => 1,
+        _ => 0,
+    };
+    let writes_to_wait_for = inner.queue.len() + inflight_writes;
+
+    println!(
+        "Flush: queue={}, inflight_writes={}, total_to_wait={}",
+        inner.queue.len(),
+        inflight_writes,
+        writes_to_wait_for
+    );
+
+    if writes_to_wait_for == 0 {
+        // No writes to wait for - flush complete immediately!
+        let _ = completion.send(Ok(()));
+        println!("Flush completed immediately");
+    } else {
+        // Queue this flush to wait for exactly this many write completions
+        inner
+            .flush_completions
+            .push((completion, writes_to_wait_for));
+        println!("Flush queued, waiting for {} writes", writes_to_wait_for);
+    }
+}
+
+// When ANY write completes, decrement ALL pending flush counters
+fn decrement_flush_counters<T, Sink>(inner: &mut WritableStreamInner<T, Sink>) {
+    let mut i = 0;
+    eprintln!(
+        "Decrementing flush counters, {} flushes waiting",
+        inner.flush_completions.len()
+    );
+    while i < inner.flush_completions.len() {
+        let (_, count) = &mut inner.flush_completions[i];
+        *count -= 1;
+        eprintln!("Flush {} now waiting for {} more writes", i, count);
+
+        if *count == 0 {
+            // This flush is complete!
+            let (sender, _) = inner.flush_completions.swap_remove(i);
+            let _ = sender.send(Ok(()));
+            eprintln!("Flush {} completed!", i);
+            // Don't increment i since we removed an element
+        } else {
+            i += 1;
         }
     }
 }
