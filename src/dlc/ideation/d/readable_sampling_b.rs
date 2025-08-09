@@ -216,8 +216,9 @@ where
     }
 }
 
-impl<Source, LockState> AsyncRead for ReadableStream<Vec<u8>, Source, ByteStream, LockState>
+impl<T, Source, LockState> AsyncRead for ReadableStream<T, Source, ByteStream, LockState>
 where
+    T: for<'a> From<&'a [u8]> + Send + 'static,
     Source: Send + 'static,
     LockState: Send + 'static,
 {
@@ -226,9 +227,6 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<IoResult<usize>> {
-        // TODO: Implement polling logic to fill `buf` from internal stream chunks,
-        // manage buffering partially consumed chunks, handle EOF and errors.
-
         todo!();
     }
 }
