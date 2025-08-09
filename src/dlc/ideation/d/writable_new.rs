@@ -854,101 +854,91 @@ where
         if self.backpressure.load(Ordering::SeqCst) {
             // Register current task waker to be notified when ready
             let waker = cx.waker().clone();
-            let _ = self
+            let _ = this
                 .command_tx
                 .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
-            // Double-check backpressure after registering waker to avoid race
-            if self.backpressure.load(Ordering::SeqCst) {
+
+            if this.backpressure.load(Ordering::SeqCst) {
                 return Poll::Pending;
             }
         }
 
-        // Convert the byte slice into your chunk type T
-        /*let chunk: T = T::from(buf);
+        // If no write in progress, start one
+        if this.write_receiver.is_none() {
+            let chunk: T = T::from(buf);
+            let (tx, rx) = oneshot::channel();
 
-        // Create a oneshot channel to receive the completion result
-        let (tx, rx) = oneshot::channel();
+            if this
+                .command_tx
+                .unbounded_send(StreamCommand::Write {
+                    chunk,
+                    completion: tx,
+                })
+                .is_err()
+            {
+                return Poll::Ready(Err(IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "Stream task dropped",
+                )));
+            }
 
-        // Send the write command
-        if let Err(_) = self.command_tx.unbounded_send(StreamCommand::Write {
-            chunk,
-            completion: tx,
-        }) {
-            return Poll::Ready(Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                "Stream task dropped",
-            )));
+            this.write_receiver.set(Some(rx));
+            *this.pending_write_len = Some(buf.len());
         }
 
-        // Poll for write completion asynchronously
-        futures::pin_mut!(rx);
-        match rx.poll(cx) {
-            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Ok(Err(e))) => {
-                Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e))))
+        // Poll the stored write receiver
+        if let Some(rx) = this.write_receiver.as_mut().as_pin_mut() {
+            match rx.poll(cx) {
+                Poll::Ready(Ok(Ok(()))) => {
+                    let written = this.pending_write_len.take().unwrap_or(0);
+                    this.write_receiver.set(None);
+                    Poll::Ready(Ok(written))
+                }
+                Poll::Ready(Ok(Err(stream_err))) => {
+                    this.write_receiver.set(None);
+                    this.pending_write_len.take();
+                    let io_err = match stream_err {
+                        StreamError::Canceled => {
+                            IoError::new(ErrorKind::Interrupted, "Write canceled")
+                        }
+                        StreamError::Aborted(_) => {
+                            IoError::new(ErrorKind::Interrupted, stream_err.to_string())
+                        }
+                        StreamError::Closing => {
+                            IoError::new(ErrorKind::BrokenPipe, "Stream is closing")
+                        }
+                        StreamError::Closed => {
+                            IoError::new(ErrorKind::BrokenPipe, "Stream is closed")
+                        }
+                        StreamError::Custom(_) => {
+                            IoError::new(ErrorKind::Other, stream_err.to_string())
+                        }
+                    };
+                    Poll::Ready(Err(io_err))
+                }
+                Poll::Ready(Err(_)) => {
+                    this.write_receiver.set(None);
+                    this.pending_write_len.take();
+                    Poll::Ready(Err(IoError::new(
+                        ErrorKind::Interrupted,
+                        "Write completion channel canceled",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
+        } else {
+            Poll::Ready(Err(IoError::new(
                 ErrorKind::Other,
-                "Write completion channel canceled",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }*/
-        let chunk: T = T::from(buf);
-        let buf_len = buf.len(); // Capture length before moving buf
-
-        // Create a oneshot channel to receive the completion result
-        let (tx, rx) = oneshot::channel();
-
-        // Send the write command
-        if self
-            .command_tx
-            .unbounded_send(StreamCommand::Write {
-                chunk,
-                completion: tx,
-            })
-            .is_err()
-        {
-            return Poll::Ready(Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                "Stream task dropped",
-            )));
-        }
-
-        // Create a pinned future for the completion
-        let mut rx_future = Box::pin(rx);
-
-        // Poll for write completion asynchronously
-        match rx_future.as_mut().poll(cx) {
-            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(buf_len)),
-            Poll::Ready(Ok(Err(stream_err))) => {
-                // Map StreamError to appropriate IoError kinds
-                let io_err = match stream_err {
-                    StreamError::Canceled => IoError::new(ErrorKind::Interrupted, "Write canceled"),
-                    StreamError::Aborted(_) => {
-                        IoError::new(ErrorKind::Interrupted, stream_err.to_string())
-                    }
-                    StreamError::Closing => {
-                        IoError::new(ErrorKind::BrokenPipe, "Stream is closing")
-                    }
-                    StreamError::Closed => IoError::new(ErrorKind::BrokenPipe, "Stream is closed"),
-                    StreamError::Custom(_) => {
-                        IoError::new(ErrorKind::Other, stream_err.to_string())
-                    }
-                };
-                Poll::Ready(Err(io_err))
-            }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
-                ErrorKind::Interrupted,
-                "Write completion channel canceled",
-            ))),
-            Poll::Pending => Poll::Pending,
+                "Write receiver missing",
+            )))
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
-        // Check error state first
-        if self.errored.load(Ordering::SeqCst) {
-            let error_msg = self
+        let mut this = self.project();
+
+        if this.errored.load(Ordering::SeqCst) {
+            let error_msg = this
                 .stored_error
                 .read()
                 .ok()
@@ -958,41 +948,62 @@ where
             return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
         }
 
-        let (tx, mut rx) = oneshot::channel();
-        if self
-            .command_tx
-            .unbounded_send(StreamCommand::Flush { completion: tx })
-            .is_err()
-        {
-            return Poll::Ready(Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                "Stream task dropped",
-            )));
+        // Create flush future if needed
+        if this.flush_receiver.is_none() {
+            let (tx, rx) = oneshot::channel();
+            if this
+                .command_tx
+                .unbounded_send(StreamCommand::Flush { completion: tx })
+                .is_err()
+            {
+                return Poll::Ready(Err(IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "Stream task dropped",
+                )));
+            }
+            *this.flush_receiver = Some(rx);
         }
 
-        // Poll the completion receiver
-        match Pin::new(&mut rx).poll(cx) {
-            Poll::Ready(Ok(result)) => match result {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(e) => Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e)))),
-            },
-            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
+        // Poll the stored flush receiver
+        if let Some(rx) = this.flush_receiver.as_mut().as_pin_mut() {
+            match rx.poll(cx) {
+                Poll::Ready(Ok(result)) => {
+                    this.flush_receiver.set(None); // clear the receiver
+                    match result {
+                        Ok(()) => Poll::Ready(Ok(())),
+                        Err(e) => {
+                            Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e))))
+                        }
+                    }
+                }
+                Poll::Ready(Err(_)) => {
+                    this.flush_receiver.set(None);
+                    Poll::Ready(Err(IoError::new(
+                        ErrorKind::Other,
+                        "Flush operation canceled",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            Poll::Ready(Err(IoError::new(
                 ErrorKind::Other,
-                "Flush operation canceled",
-            ))),
-            Poll::Pending => Poll::Pending,
+                "Flush receiver missing",
+            )))
         }
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        let mut this = self.project();
+
         // If already closed, return success
-        if self.closed.load(Ordering::SeqCst) {
+        if this.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
         }
 
         // If errored, return the error
-        if self.errored.load(Ordering::SeqCst) {
-            let error_msg = self
+        if this.errored.load(Ordering::SeqCst) {
+            let error_msg = this
                 .stored_error
                 .read()
                 .ok()
@@ -1002,51 +1013,49 @@ where
             return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
         }
 
-        let (tx, mut rx) = oneshot::channel();
-        if self
-            .command_tx
-            .unbounded_send(StreamCommand::Close { completion: tx })
-            .is_err()
-        {
-            return Poll::Ready(Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                "Stream task dropped",
-            )));
+        // Create the close receiver if not already created
+        if this.close_receiver.is_none() {
+            let (tx, rx) = oneshot::channel();
+            if this
+                .command_tx
+                .unbounded_send(StreamCommand::Close { completion: tx })
+                .is_err()
+            {
+                return Poll::Ready(Err(IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "Stream task dropped",
+                )));
+            }
+            this.close_receiver.set(Some(rx));
         }
 
-        // Poll the completion receiver
-        match Pin::new(&mut rx).poll(cx) {
-            Poll::Ready(Ok(result)) => match result {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(e) => Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e)))),
-            },
-            Poll::Ready(Err(_)) => Poll::Ready(Err(IoError::new(
-                ErrorKind::Other,
-                "Close operation canceled",
-            ))),
-            Poll::Pending => {
-                // Register waker for state changes as backup
-                let waker = cx.waker().clone();
-                let _ = self
-                    .command_tx
-                    .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
-
-                // Double-check state after registering waker
-                if self.closed.load(Ordering::SeqCst) {
-                    Poll::Ready(Ok(()))
-                } else if self.errored.load(Ordering::SeqCst) {
-                    let error_msg = self
-                        .stored_error
-                        .read()
-                        .ok()
-                        .and_then(|guard| guard.as_ref().cloned())
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "Stream is errored".into());
-                    Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)))
-                } else {
-                    Poll::Pending
+        // Poll the stored close receiver
+        if let Some(rx) = this.close_receiver.as_mut().as_pin_mut() {
+            match rx.poll(cx) {
+                Poll::Ready(Ok(result)) => {
+                    this.close_receiver.set(None);
+                    match result {
+                        Ok(()) => Poll::Ready(Ok(())),
+                        Err(e) => {
+                            Poll::Ready(Err(IoError::new(ErrorKind::Other, format!("{}", e))))
+                        }
+                    }
                 }
+                Poll::Ready(Err(_)) => {
+                    this.close_receiver.set(None);
+                    Poll::Ready(Err(IoError::new(
+                        ErrorKind::Other,
+                        "Close operation canceled",
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
             }
+        } else {
+            // Should never happen
+            Poll::Ready(Err(IoError::new(
+                ErrorKind::Other,
+                "Close receiver missing",
+            )))
         }
     }
 }
@@ -4145,6 +4154,610 @@ mod sink_integration_tests {
         for i in 0..item_count {
             let expected = format!("item_{}", i);
             assert!(received.contains(&expected), "Missing item: {}", expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_write_integration_tests {
+    use super::*;
+    use futures::io::AsyncWriteExt;
+    use std::io::ErrorKind;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Test sink that converts bytes to strings for easier verification
+    #[derive(Debug, Clone)]
+    struct BytesSink {
+        id: String,
+        received_data: Arc<Mutex<Vec<u8>>>,
+        write_delay: Option<Duration>,
+        fail_on_write: Option<usize>,
+        fail_on_close: bool,
+        operation_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BytesSink {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                received_data: Arc::new(Mutex::new(Vec::new())),
+                write_delay: None,
+                fail_on_write: None,
+                fail_on_close: false,
+                operation_log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn with_write_delay(mut self, delay: Duration) -> Self {
+            self.write_delay = Some(delay);
+            self
+        }
+
+        fn with_write_failure(mut self, fail_on_nth: usize) -> Self {
+            self.fail_on_write = Some(fail_on_nth);
+            self
+        }
+
+        fn with_close_failure(mut self) -> Self {
+            self.fail_on_close = true;
+            self
+        }
+
+        fn get_received_data(&self) -> Vec<u8> {
+            self.received_data.lock().unwrap().clone()
+        }
+
+        fn get_received_string(&self) -> String {
+            String::from_utf8_lossy(&self.get_received_data()).to_string()
+        }
+
+        fn get_operation_log(&self) -> Vec<String> {
+            self.operation_log.lock().unwrap().clone()
+        }
+
+        fn log_operation(&self, op: &str) {
+            self.operation_log
+                .lock()
+                .unwrap()
+                .push(format!("{}: {}", self.id, op));
+        }
+    }
+
+    // Implement conversion from &[u8] to Vec<u8> for our test
+    /*impl From<&[u8]> for Vec<u8> {
+        fn from(bytes: &[u8]) -> Self {
+            bytes.to_vec()
+        }
+    }*/
+
+    impl WritableSink<Vec<u8>> for BytesSink {
+        async fn start(
+            &mut self,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.log_operation("start called");
+            Ok(())
+        }
+
+        async fn write(
+            &mut self,
+            chunk: Vec<u8>,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.log_operation(&format!("write called with {} bytes", chunk.len()));
+
+            // Simulate write delay if configured
+            if let Some(delay) = self.write_delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            // Check if we should fail on this write
+            let current_writes = self
+                .operation_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.contains("write called"))
+                .count();
+
+            if let Some(fail_on) = self.fail_on_write {
+                if current_writes > fail_on {
+                    self.log_operation("write failed");
+                    return Err(StreamError::Custom(ArcError::from(format!(
+                        "Intentional write failure on write {}",
+                        current_writes
+                    ))));
+                }
+            }
+
+            // Store the data
+            self.received_data.lock().unwrap().extend_from_slice(&chunk);
+            self.log_operation(&format!("write completed: {} bytes", chunk.len()));
+            Ok(())
+        }
+
+        async fn close(self) -> StreamResult<()> {
+            self.log_operation("close called");
+            if self.fail_on_close {
+                self.log_operation("close failed");
+                return Err(StreamError::Custom(ArcError::from(
+                    "Intentional close failure",
+                )));
+            }
+            self.log_operation("close completed");
+            Ok(())
+        }
+
+        async fn abort(self, reason: Option<String>) -> StreamResult<()> {
+            let reason_str = reason.as_deref().unwrap_or("no reason");
+            self.log_operation(&format!("abort called with reason: {}", reason_str));
+            self.log_operation("abort completed");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_basic_async_write_operations() {
+        let sink = BytesSink::new("basic");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Test writing some data
+        let data1 = b"Hello, ";
+        let data2 = b"World!";
+
+        stream.write_all(data1).await.unwrap();
+        stream.write_all(data2).await.unwrap();
+        //stream.flush().await.unwrap();
+        AsyncWriteExt::flush(&mut stream).await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "Hello, World!");
+
+        stream.close().await.unwrap();
+
+        let log = sink.get_operation_log();
+        assert!(log.iter().any(|entry| entry.contains("start called")));
+        assert!(log.iter().any(|entry| entry.contains("close completed")));
+    }
+
+    #[tokio::test]
+    async fn test_empty_writes() {
+        let sink = BytesSink::new("empty");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Empty write should return Ok(0) immediately
+        let result = stream.write(&[]).await.unwrap();
+        assert_eq!(result, 0);
+
+        // Regular write after empty write
+        stream.write_all(b"test").await.unwrap();
+        stream.close().await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "test");
+    }
+
+    #[tokio::test]
+    async fn test_large_writes() {
+        let sink = BytesSink::new("large");
+        let strategy = Box::new(TestQueuingStrategy::new(10));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Write large data
+        let large_data = vec![b'X'; 10000];
+        stream.write_all(&large_data).await.unwrap();
+        //stream.flush().await.unwrap();
+        AsyncWriteExt::flush(&mut stream).await.unwrap();
+
+        let received = sink.get_received_data();
+        assert_eq!(received.len(), 10000);
+        assert!(received.iter().all(|&b| b == b'X'));
+
+        stream.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multiple_small_writes() {
+        let sink = BytesSink::new("multi");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Write multiple small chunks
+        for i in 0..10 {
+            let data = format!("{}", i);
+            stream.write_all(data.as_bytes()).await.unwrap();
+        }
+        //stream.flush().await.unwrap();
+        AsyncWriteExt::flush(&mut stream).await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "0123456789");
+
+        stream.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_error_handling() {
+        let sink = BytesSink::new("error").with_write_failure(2);
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // First two writes should succeed
+        stream.write_all(b"write1").await.unwrap();
+        stream.write_all(b"write2").await.unwrap();
+
+        // Third write should fail
+        let result = stream.write_all(b"write3").await;
+        assert!(result.is_err());
+
+        // Subsequent operations should also fail due to error state
+        let result = stream.write_all(b"write4").await;
+        assert!(result.is_err());
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "write1write2");
+    }
+
+    #[tokio::test]
+    async fn test_write_after_close() {
+        let sink = BytesSink::new("closed");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Write some data and close
+        stream.write_all(b"before_close").await.unwrap();
+        stream.close().await.unwrap();
+
+        // Attempt to write after close should fail
+        let result = stream.write_all(b"after_close").await;
+        assert!(result.is_err());
+
+        if let Err(e) = result {
+            assert_eq!(e.kind(), ErrorKind::BrokenPipe);
+        }
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "before_close");
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_with_async_write() {
+        let sink = BytesSink::new("backpressure").with_write_delay(Duration::from_millis(50));
+        let strategy = Box::new(TestQueuingStrategy::new(2)); // Small buffer
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let start = std::time::Instant::now();
+
+        // Write several chunks - should experience backpressure
+        for i in 0..5 {
+            let data = format!("chunk{}", i);
+            stream.write_all(data.as_bytes()).await.unwrap();
+        }
+
+        let elapsed = start.elapsed();
+        // Should take some time due to write delays and backpressure
+        assert!(elapsed >= Duration::from_millis(100));
+
+        stream.close().await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "chunk0chunk1chunk2chunk3chunk4");
+    }
+
+    #[tokio::test]
+    async fn test_partial_writes() {
+        let sink = BytesSink::new("partial");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let data = b"Hello, World!";
+
+        // Write in chunks manually (simulating partial writes)
+        let mut written = 0;
+        while written < data.len() {
+            let chunk_size = std::cmp::min(5, data.len() - written);
+            let n = stream
+                .write(&data[written..written + chunk_size])
+                .await
+                .unwrap();
+            written += n;
+            assert!(n > 0, "Should make progress");
+        }
+
+        //stream.flush().await.unwrap();
+        AsyncWriteExt::flush(&mut stream).await.unwrap();
+        stream.close().await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "Hello, World!");
+    }
+
+    #[tokio::test]
+    async fn test_flush_waits_for_queued_writes() {
+        use futures::io::AsyncWriteExt;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        use tokio::sync::Mutex as AsyncMutex;
+
+        // Simple sink with write delay to test flush timing
+        #[derive(Debug, Clone)]
+        struct FlushTestSink {
+            received_data: Arc<Mutex<Vec<u8>>>,
+            write_delay: Duration,
+        }
+
+        impl FlushTestSink {
+            fn new(delay: Duration) -> Self {
+                Self {
+                    received_data: Arc::new(Mutex::new(Vec::new())),
+                    write_delay: delay,
+                }
+            }
+
+            fn get_received_string(&self) -> String {
+                String::from_utf8_lossy(&self.received_data.lock().unwrap()).to_string()
+            }
+        }
+
+        impl WritableSink<Vec<u8>> for FlushTestSink {
+            async fn start(&mut self, _: &mut WritableStreamDefaultController) -> StreamResult<()> {
+                Ok(())
+            }
+
+            async fn write(
+                &mut self,
+                chunk: Vec<u8>,
+                _: &mut WritableStreamDefaultController,
+            ) -> StreamResult<()> {
+                // Simulate slow write
+                tokio::time::sleep(self.write_delay).await;
+                self.received_data.lock().unwrap().extend_from_slice(&chunk);
+                Ok(())
+            }
+
+            async fn close(self) -> StreamResult<()> {
+                Ok(())
+            }
+            async fn abort(self, _: Option<String>) -> StreamResult<()> {
+                Ok(())
+            }
+        }
+
+        let sink = FlushTestSink::new(Duration::from_millis(100));
+        let strategy = Box::new(TestQueuingStrategy::new(10));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Wrap in Arc<AsyncMutex<>> so multiple tasks can use it without borrow checker conflicts
+        let stream = Arc::new(AsyncMutex::new(stream));
+
+        // Spawn concurrent writes
+        let s1 = Arc::clone(&stream);
+        let s2 = Arc::clone(&stream);
+        let s3 = Arc::clone(&stream);
+
+        tokio::spawn(async move {
+            s1.lock().await.write_all(b"first").await.unwrap();
+        });
+        tokio::spawn(async move {
+            s2.lock().await.write_all(b"second").await.unwrap();
+        });
+        tokio::spawn(async move {
+            s3.lock().await.write_all(b"third").await.unwrap();
+        });
+
+        // Give writes a moment to start but not complete
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Now flush should wait for all pending writes to complete
+        let start = Instant::now();
+        AsyncWriteExt::flush(&mut *stream.lock().await)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // Flush should have taken at least the write delay time
+        assert!(
+            elapsed >= Duration::from_millis(80),
+            "Flush should wait for writes to complete, took {:?}",
+            elapsed
+        );
+
+        // Close the stream
+        stream.lock().await.close().await.unwrap();
+
+        // All data should be received
+        assert_eq!(sink.get_received_string(), "firstsecondthird");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_async_writes() {
+        use tokio::sync::Mutex;
+
+        let sink = BytesSink::new("concurrent");
+        let strategy = Box::new(TestQueuingStrategy::new(10));
+        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let stream = Arc::new(Mutex::new(stream));
+        let mut handles = Vec::new();
+
+        // Spawn multiple concurrent write tasks
+        for i in 0..5 {
+            let stream_clone = Arc::clone(&stream);
+            let data = format!("task{}_data ", i);
+
+            handles.push(tokio::spawn(async move {
+                let mut stream = stream_clone.lock().await;
+                stream.write_all(data.as_bytes()).await.unwrap();
+            }));
+        }
+
+        // Wait for all writes to complete
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        //stream.lock().await.flush().await.unwrap();
+        AsyncWriteExt::flush(&mut *stream.lock().await)
+            .await
+            .unwrap();
+        stream.lock().await.close().await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received.len(), 5 * "task0_data ".len());
+
+        // Verify all task data is present
+        for i in 0..5 {
+            let expected = format!("task{}_data ", i);
+            assert!(received.contains(&expected), "Missing data for task {}", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_behavior() {
+        let sink = BytesSink::new("timeout").with_write_delay(Duration::from_secs(2));
+        let strategy = Box::new(TestQueuingStrategy::new(1));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // This should timeout because write takes 2 seconds
+        let result = timeout(Duration::from_millis(500), stream.write_all(b"slow_data")).await;
+
+        assert!(result.is_err()); // Should timeout
+
+        // Give it time to complete in background
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Data should eventually be received
+        let received = sink.get_received_string();
+        assert_eq!(received, "slow_data");
+    }
+
+    #[tokio::test]
+    async fn test_io_error_kinds() {
+        // Test different error conditions produce appropriate IoError kinds
+
+        // Test closed stream error
+        {
+            let sink = BytesSink::new("closed_error");
+            let strategy = Box::new(TestQueuingStrategy::new(5));
+            let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+                tokio::spawn(fut);
+            });
+
+            stream.close().await.unwrap();
+
+            let result = stream.write_all(b"data").await;
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert_eq!(e.kind(), ErrorKind::BrokenPipe);
+            }
+        }
+
+        // Test error state
+        {
+            let sink = BytesSink::new("error_state").with_write_failure(0);
+            let strategy = Box::new(TestQueuingStrategy::new(5));
+            let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+                tokio::spawn(fut);
+            });
+
+            // First write should fail and put stream in error state
+            let _ = stream.write_all(b"data").await;
+
+            let result = stream.write_all(b"more_data").await;
+            assert!(result.is_err());
+            if let Err(e) = result {
+                assert_eq!(e.kind(), ErrorKind::Other);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_binary_data() {
+        let sink = BytesSink::new("binary");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        // Write binary data with null bytes and high values
+        let binary_data = vec![0u8, 1, 255, 128, 0, 42, 255];
+        stream.write_all(&binary_data).await.unwrap();
+        stream.close().await.unwrap();
+
+        let received = sink.get_received_data();
+        assert_eq!(received, binary_data);
+    }
+
+    #[tokio::test]
+    async fn test_write_all_vs_write() {
+        let sink = BytesSink::new("write_comparison");
+        let strategy = Box::new(TestQueuingStrategy::new(5));
+        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
+            tokio::spawn(fut);
+        });
+
+        let data = b"Hello, World!";
+
+        // Test individual write calls
+        let mut pos = 0;
+        while pos < data.len() {
+            let n = stream.write(&data[pos..]).await.unwrap();
+            assert!(n > 0);
+            pos += n;
+        }
+
+        // Add some more data with write_all
+        stream.write_all(b" Extra data").await.unwrap();
+        stream.close().await.unwrap();
+
+        let received = sink.get_received_string();
+        assert_eq!(received, "Hello, World! Extra data");
+    }
+
+    // Helper struct for testing (reusing from sink tests)
+    struct TestQueuingStrategy {
+        high_water_mark: usize,
+    }
+
+    impl TestQueuingStrategy {
+        fn new(high_water_mark: usize) -> Self {
+            Self { high_water_mark }
+        }
+    }
+
+    impl<T> QueuingStrategy<T> for TestQueuingStrategy {
+        fn size(&self, _chunk: &T) -> usize {
+            1
+        }
+
+        fn high_water_mark(&self) -> usize {
+            self.high_water_mark
         }
     }
 }
