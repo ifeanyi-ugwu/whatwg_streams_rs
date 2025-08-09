@@ -208,18 +208,17 @@ where
 {
     type Item = StreamResult<T>;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         todo!()
     }
 }
 
-impl<T, Source, LockState> AsyncRead for ReadableStream<T, Source, ByteStream, LockState>
+impl<T, Source, StreamType, LockState> AsyncRead
+    for ReadableStream<T, Source, StreamType, LockState>
 where
     T: for<'a> From<&'a [u8]> + Send + 'static,
     Source: Send + 'static,
+    StreamType: StreamTypeMarker<Item = T>,
     LockState: Send + 'static,
 {
     fn poll_read(
