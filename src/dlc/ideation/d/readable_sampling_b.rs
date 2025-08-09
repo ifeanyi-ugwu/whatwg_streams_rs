@@ -1,7 +1,10 @@
+use futures::io::AsyncRead;
 use futures::stream::Stream;
 use std::future::Future;
+use std::io::Result as IoResult;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 // ----------- Stream Type Markers -----------
 pub struct DefaultStream;
@@ -210,6 +213,23 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         todo!()
+    }
+}
+
+impl<Source, LockState> AsyncRead for ReadableStream<Vec<u8>, Source, ByteStream, LockState>
+where
+    Source: Send + 'static,
+    LockState: Send + 'static,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<IoResult<usize>> {
+        // TODO: Implement polling logic to fill `buf` from internal stream chunks,
+        // manage buffering partially consumed chunks, handle EOF and errors.
+
+        todo!();
     }
 }
 
