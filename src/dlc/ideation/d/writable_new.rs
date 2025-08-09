@@ -829,14 +829,16 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, IoError>> {
+        let mut this = self.project();
+
         // Early return for empty writes
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        // Check if the stream is errored
-        if self.errored.load(Ordering::SeqCst) {
-            let error_msg = self
+        // Check error state
+        if this.errored.load(Ordering::SeqCst) {
+            let error_msg = this
                 .stored_error
                 .read()
                 .ok()
@@ -846,13 +848,13 @@ where
             return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
         }
 
-        if self.closed.load(Ordering::SeqCst) {
+        // Check closed state
+        if this.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Err(IoError::new(ErrorKind::BrokenPipe, "Stream is closed")));
         }
 
-        // Check backpressure before attempting write
-        if self.backpressure.load(Ordering::SeqCst) {
-            // Register current task waker to be notified when ready
+        // Backpressure check
+        if this.backpressure.load(Ordering::SeqCst) {
             let waker = cx.waker().clone();
             let _ = this
                 .command_tx
