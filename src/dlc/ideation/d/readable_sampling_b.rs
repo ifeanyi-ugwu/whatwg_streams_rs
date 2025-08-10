@@ -291,7 +291,31 @@ pub fn usage_examples() {
 // ----------- Placeholder types for completeness -----------
 pub struct StreamResult<T>(pub Result<T, StreamError>);
 pub struct StreamError;
+
 pub struct ReadableStreamDefaultController<T>(PhantomData<T>);
+
+impl<T> ReadableStreamDefaultController<T> {
+    fn new() -> Self {
+        todo!()
+    }
+
+    pub fn desired_size(&self) -> isize {
+        todo!()
+    }
+
+    pub fn close(&self) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub fn enqueue(&self, chunk: T) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub fn error(&self, error: StreamError) -> StreamResult<()> {
+        todo!()
+    }
+}
+
 pub struct ReadableByteStreamController;
 pub struct ReadableStreamDefaultReader<T, Source, LockState>(PhantomData<(T, Source, LockState)>);
 pub struct ReadableStreamBYOBReader<Source, LockState>(PhantomData<(Source, LockState)>);
