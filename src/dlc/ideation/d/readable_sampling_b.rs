@@ -151,7 +151,7 @@ where
         self,
     ) -> (
         ReadableStream<T, Source, DefaultStream, Locked>,
-        ReadableStreamDefaultReader<T, Source, Locked>,
+        ReadableStreamDefaultReader<T, Source, DefaultStream, Locked>,
     ) {
         let locked_stream = ReadableStream {
             command_tx: self.command_tx,
@@ -172,7 +172,7 @@ where
         self,
     ) -> (
         ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
-        ReadableStreamDefaultReader<Vec<u8>, Source, Locked>,
+        ReadableStreamDefaultReader<Vec<u8>, Source, ByteStream, Locked>,
     ) {
         let locked_stream = ReadableStream {
             command_tx: self.command_tx,
@@ -340,7 +340,38 @@ impl ReadableByteStreamController {
     }
 }
 
-pub struct ReadableStreamDefaultReader<T, Source, LockState>(PhantomData<(T, Source, LockState)>);
+pub struct ReadableStreamDefaultReader<T, Source, StreamType, LockState>(
+    PhantomData<(T, Source, StreamType, LockState)>,
+);
+
+impl<T, Source, StreamType, LockState> ReadableStreamDefaultReader<T, Source, StreamType, LockState>
+where
+    T: Send + 'static,
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker<Item = T>,
+    LockState: Send + 'static,
+{
+    pub fn new(stream: ReadableStream<T, Source, StreamType, Unlocked>) -> Self {
+        todo!()
+    }
+
+    pub async fn closed(&self) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub async fn read(&self) -> StreamResult<Option<T>> {
+        todo!()
+    }
+
+    pub fn release_lock(self) -> ReadableStream<T, Source, StreamType, Unlocked> {
+        todo!()
+    }
+}
+
 pub struct ReadableStreamBYOBReader<Source, LockState>(PhantomData<(Source, LockState)>);
 pub enum StreamCommand<T> {
     Placeholder(PhantomData<T>),
@@ -350,7 +381,10 @@ pub trait StreamReader<T> {
     // Common reader methods
 }
 
-impl<T, Source, LockState> StreamReader<T> for ReadableStreamDefaultReader<T, Source, LockState> {}
+impl<T, Source, StreamType, LockState> StreamReader<T>
+    for ReadableStreamDefaultReader<T, Source, StreamType, LockState>
+{
+}
 impl<Source, LockState> StreamReader<Vec<u8>> for ReadableStreamBYOBReader<Source, LockState> {}
 
 impl<T: Send + 'static> StreamController<T> for ReadableStreamDefaultController<T> {
