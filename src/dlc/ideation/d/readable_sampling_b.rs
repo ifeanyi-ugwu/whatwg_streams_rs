@@ -373,6 +373,33 @@ where
 }
 
 pub struct ReadableStreamBYOBReader<Source, LockState>(PhantomData<(Source, LockState)>);
+
+impl<Source, LockState> ReadableStreamBYOBReader<Source, LockState>
+where
+    Source: ReadableByteSource + Send + 'static,
+    LockState: Send + 'static,
+{
+    pub fn new(stream: ReadableStream<Vec<u8>, Source, ByteStream, Locked>) -> Self {
+        todo!()
+    }
+
+    pub async fn closed(&self) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub async fn read(&self, buffer: &mut [u8]) -> StreamResult<Option<usize>> {
+        todo!()
+    }
+
+    pub fn release_lock(self) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
+        todo!()
+    }
+}
+
 pub enum StreamCommand<T> {
     Placeholder(PhantomData<T>),
 }
