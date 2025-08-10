@@ -317,6 +317,29 @@ impl<T> ReadableStreamDefaultController<T> {
 }
 
 pub struct ReadableByteStreamController;
+
+impl ReadableByteStreamController {
+    fn new() -> Self {
+        todo!()
+    }
+
+    pub fn desired_size(&self) -> isize {
+        todo!()
+    }
+
+    pub fn close(&self) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub fn enqueue(&self, chunk: Vec<u8>) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub fn error(&self, error: StreamError) -> StreamResult<()> {
+        todo!()
+    }
+}
+
 pub struct ReadableStreamDefaultReader<T, Source, LockState>(PhantomData<(T, Source, LockState)>);
 pub struct ReadableStreamBYOBReader<Source, LockState>(PhantomData<(Source, LockState)>);
 pub enum StreamCommand<T> {
