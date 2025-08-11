@@ -7,6 +7,22 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+// --placeholders start--
+pub struct WritableStream<T> {
+    _phantom: PhantomData<T>,
+}
+
+pub struct TransformStream<I, O> {
+    //readable: ReadableStream,
+    //writable: WritableStream<>,
+    _phantom: PhantomData<(I, O)>,
+}
+
+pub struct AbortSignal {
+    // Implementation details would go here
+}
+// --placeholders end--
+
 // ----------- Stream Type Markers -----------
 pub struct DefaultStream;
 pub struct ByteStream;
@@ -83,6 +99,66 @@ where
 {
     command_tx: std::sync::mpsc::Sender<StreamCommand<T>>,
     _phantom: PhantomData<(T, Source, StreamType, LockState)>,
+}
+
+impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
+where
+    T: Send + 'static,
+    Source: Send + 'static,
+{
+    pub fn locked(&self) -> bool {
+        todo!()
+    }
+}
+
+impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+where
+    T: Send + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker,
+{
+    pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub fn pipe_through<I, O, OutputStreamType>(
+        self,
+        transform: &mut TransformStream<I, O>,
+        options: Option<StreamPipeOptions>,
+    ) -> ReadableStream<O, Source, OutputStreamType, Unlocked>
+    where
+        I: Send + 'static,
+        O: Send + 'static,
+        OutputStreamType: StreamTypeMarker,
+        T: Into<I>, // Input stream data must be convertible to transform input
+    {
+        todo!()
+    }
+
+    pub async fn pipe_to<W>(
+        &self,
+        destination: &WritableStream<T>,
+        options: Option<StreamPipeOptions>,
+    ) -> StreamResult<()> {
+        todo!()
+    }
+
+    pub fn tee(
+        self,
+    ) -> (
+        ReadableStream<T, Source, S, Locked>,
+        ReadableStream<T, Source, S, Locked>,
+    ) {
+        todo!()
+    }
+}
+
+#[derive(Default)]
+pub struct StreamPipeOptions {
+    pub prevent_close: bool,
+    pub prevent_abort: bool,
+    pub prevent_cancel: bool,
+    pub signal: Option<AbortSignal>,
 }
 
 // ----------- Constructor Implementation -----------
@@ -316,6 +392,53 @@ pub fn usage_examples() {
     let byte_stream2 = ReadableStream::new_bytes(FileSource {});
     let (_locked_stream2, _byob_reader) = byte_stream2.get_byob_reader();
     // _byob_reader is ReadableStreamBYOBReader<_, Locked>
+}
+
+// ----------- Pipe Examples -----------
+pub fn pipe_examples() {
+    // Example 1: pipe_through works for UNLOCKED streams of any type
+    let unlocked_default_stream = ReadableStream::new(IteratorSource {
+        iter: vec![1, 2, 3].into_iter(),
+    });
+
+    let mut transform = TransformStream::<i32, String> {
+        _phantom: PhantomData,
+    };
+
+    // This works - unlocked stream can be piped through
+    let _transformed_stream: ReadableStream<String, _, DefaultStream, Unlocked> =
+        unlocked_default_stream.pipe_through(&mut transform, None);
+
+    // Example 2: LOCKED streams cannot use pipe_through
+    let another_stream = ReadableStream::new(IteratorSource {
+        iter: vec![4, 5, 6].into_iter(),
+    });
+    let (_locked_stream, _reader) = another_stream.get_reader();
+
+    // This would be a COMPILE ERROR:
+    // let _result = locked_stream.pipe_through(&mut transform, None); // ❌ No such method!
+
+    // Example 3: Byte streams can also be piped through
+    let byte_stream = ReadableStream::new_bytes(FileSource {});
+    let mut byte_transform = TransformStream::<Vec<u8>, String> {
+        _phantom: PhantomData,
+    };
+
+    // This works - byte streams can be piped through transforms too
+    let _transformed_byte_stream: ReadableStream<String, _, DefaultStream, Unlocked> =
+        byte_stream.pipe_through(&mut byte_transform, None);
+
+    // Example 4: tee() works for unlocked streams and produces locked streams
+    let source_stream = ReadableStream::new(IteratorSource {
+        iter: vec![7, 8, 9].into_iter(),
+    });
+
+    let (_branch1, _branch2): (
+        ReadableStream<i32, _, DefaultStream, Locked>,
+        ReadableStream<i32, _, DefaultStream, Locked>,
+    ) = source_stream.tee();
+
+    // Both branches are locked and cannot be piped further without releasing locks
 }
 
 // ----------- Placeholder types for completeness -----------
