@@ -855,18 +855,7 @@ fn process_command<T, Sink>(
     match cmd {
         StreamCommand::Write { chunk, completion } => {
             if inner.state == StreamState::Errored {
-                /*let error = inner
-                .stored_error
-                .clone()
-                .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
-                let error = {
-                    let opt_err = match inner.stored_error.read() {
-                        Ok(err_guard) => err_guard.clone(),
-                        Err(poisoned) => poisoned.into_inner().clone(),
-                    };
-                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-                };
-                let _ = completion.send(Err(error));
+                let _ = completion.send(Err(inner.get_stored_error()));
                 return;
             }
             if inner.state == StreamState::Closed {
@@ -895,18 +884,7 @@ fn process_command<T, Sink>(
         }
         StreamCommand::Close { completion } => {
             if inner.state == StreamState::Errored {
-                /*let error = inner
-                .stored_error
-                .clone()
-                .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
-                let error = {
-                    let opt_err = match inner.stored_error.read() {
-                        Ok(err_guard) => err_guard.clone(),
-                        Err(poisoned) => poisoned.into_inner().clone(),
-                    };
-                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-                };
-                let _ = completion.send(Err(error));
+                let _ = completion.send(Err(inner.get_stored_error()));
                 return;
             }
             if inner.state == StreamState::Closed {
@@ -1237,16 +1215,8 @@ async fn stream_task<T, Sink>(
 
                             // Check for error first, before any flag updates
                             if result.is_err() {
-                                //inner.stored_error = Some(result.clone().err().unwrap());
-                                /*if let Err(e) = result.clone() {
-                                    inner.stored_error = Some(e);
-                                }*/
                                 if let Err(e) = result.clone() {
-                                    let mut stored_err_guard = match inner.stored_error.write() {
-                                        Ok(guard) => guard,
-                                        Err(poisoned) => poisoned.into_inner(),
-                                    };
-                                    *stored_err_guard = Some(e);
+                                    set_stored_error(&inner.stored_error, e);
                                 }
                                 inner.state = StreamState::Errored;
                                 inner.sink = None; // Don't restore sink on error
@@ -1279,15 +1249,6 @@ async fn stream_task<T, Sink>(
                             Err(err) => {
                                 // Close failed: mark stream Errored with stored error
                                 inner.state = StreamState::Errored;
-                                //inner.stored_error = Some(err.clone());
-                                /*{
-                                    let mut stored_err_guard = match inner.stored_error.write() {
-                                        Ok(guard) => guard,
-                                        Err(poisoned) => poisoned.into_inner(), // recover from poison
-                                    };
-
-                                    *stored_err_guard = Some(err.clone());
-                                }*/
                                 set_stored_error(&inner.stored_error, err.clone());
                             }
                         }
@@ -1675,14 +1636,7 @@ fn process_flush_command<T, Sink>(
     inflight: &Option<InFlight<Sink>>,
 ) {
     if inner.state == StreamState::Errored {
-        let error = {
-            let opt_err = match inner.stored_error.read() {
-                Ok(err_guard) => err_guard.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
-            };
-            opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-        };
-        let _ = completion.send(Err(error));
+        let _ = completion.send(Err(inner.get_stored_error()));
         return;
     }
 
