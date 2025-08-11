@@ -556,13 +556,3 @@ where
 pub enum StreamCommand<T> {
     Placeholder(PhantomData<T>),
 }
-
-pub trait StreamReader<T> {
-    // Common reader methods
-}
-
-impl<T, Source, StreamType, LockState> StreamReader<T>
-    for ReadableStreamDefaultReader<T, Source, StreamType, LockState>
-{
-}
-impl<Source, LockState> StreamReader<Vec<u8>> for ReadableStreamBYOBReader<Source, LockState> {}
