@@ -20,18 +20,17 @@ where
     T: Send + 'static,
 {
     type StreamType: StreamTypeMarker;
-    type Controller: StreamController<T>;
 
     fn start(
         &mut self,
-        controller: &mut Self::Controller,
+        controller: &mut ReadableStreamDefaultController<T>,
     ) -> impl Future<Output = StreamResult<()>> + Send {
         async { StreamResult(Ok(())) }
     }
 
     fn pull(
         &mut self,
-        controller: &mut Self::Controller,
+        controller: &mut ReadableStreamDefaultController<T>,
     ) -> impl Future<Output = StreamResult<Option<T>>> + Send;
 
     fn cancel(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
@@ -41,18 +40,17 @@ where
 
 pub trait ReadableByteSource: Send + Sized + 'static {
     type StreamType: StreamTypeMarker;
-    type Controller: StreamController<Vec<u8>>;
 
     fn start(
         &mut self,
-        controller: &mut Self::Controller,
+        controller: &mut ReadableByteStreamController,
     ) -> impl Future<Output = StreamResult<()>> + Send {
         async { StreamResult(Ok(())) }
     }
 
     fn pull(
         &mut self,
-        controller: &mut Self::Controller,
+        controller: &mut ReadableByteStreamController,
         buffer: &mut [u8],
     ) -> impl Future<Output = StreamResult<usize>> + Send;
 
@@ -64,24 +62,14 @@ pub trait ReadableByteSource: Send + Sized + 'static {
 // ----------- Stream Type Marker Trait -----------
 pub trait StreamTypeMarker: Send + Sync + 'static {
     type Item: Send + 'static;
-    type Controller: StreamController<Self::Item>;
 }
 
 impl StreamTypeMarker for DefaultStream {
     type Item = ();
-    type Controller = ReadableStreamDefaultController<Self::Item>;
 }
 
 impl StreamTypeMarker for ByteStream {
     type Item = Vec<u8>;
-    type Controller = ReadableByteStreamController;
-}
-
-// ----------- Controller Trait -----------
-pub trait StreamController<T>: Send + 'static {
-    fn enqueue(&mut self, chunk: T) -> StreamResult<()>;
-    fn close(&mut self) -> StreamResult<()>;
-    fn error(&mut self, error: StreamError);
 }
 
 // ----------- Main ReadableStream with Typestate -----------
@@ -241,9 +229,11 @@ where
     T: Send + 'static,
 {
     type StreamType = DefaultStream;
-    type Controller = ReadableStreamDefaultController<T>;
 
-    async fn pull(&mut self, _controller: &mut Self::Controller) -> StreamResult<Option<T>> {
+    async fn pull(
+        &mut self,
+        _controller: &mut ReadableStreamDefaultController<T>,
+    ) -> StreamResult<Option<T>> {
         StreamResult(Ok(self.iter.next()))
     }
 }
@@ -254,11 +244,10 @@ pub struct FileSource {
 
 impl ReadableByteSource for FileSource {
     type StreamType = ByteStream;
-    type Controller = ReadableByteStreamController;
 
     async fn pull(
         &mut self,
-        _controller: &mut Self::Controller,
+        _controller: &mut ReadableByteStreamController,
         buffer: &mut [u8],
     ) -> StreamResult<usize> {
         StreamResult(Ok(0)) // Placeholder
@@ -413,31 +402,3 @@ impl<T, Source, StreamType, LockState> StreamReader<T>
 {
 }
 impl<Source, LockState> StreamReader<Vec<u8>> for ReadableStreamBYOBReader<Source, LockState> {}
-
-impl<T: Send + 'static> StreamController<T> for ReadableStreamDefaultController<T> {
-    fn enqueue(&mut self, _chunk: T) -> StreamResult<()> {
-        todo!()
-    }
-
-    fn close(&mut self) -> StreamResult<()> {
-        todo!()
-    }
-
-    fn error(&mut self, _error: StreamError) {
-        todo!()
-    }
-}
-
-impl StreamController<Vec<u8>> for ReadableByteStreamController {
-    fn enqueue(&mut self, _chunk: Vec<u8>) -> StreamResult<()> {
-        todo!()
-    }
-
-    fn close(&mut self) -> StreamResult<()> {
-        todo!()
-    }
-
-    fn error(&mut self, _error: StreamError) {
-        todo!()
-    }
-}
