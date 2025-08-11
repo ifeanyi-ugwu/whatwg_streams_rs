@@ -257,70 +257,15 @@ where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
-    /// Create new WritableStream handle and spawn stream task
+    /// Create a new WritableStream and spawn a dedicated thread for the stream task.
+    ///
+    /// For custom executor control, use [`new_with_spawn()`] instead.
     pub fn new(sink: Sink, strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>) -> Self {
-        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
-        let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let stored_error = Arc::new(RwLock::new(None));
-
-        let inner = WritableStreamInner {
-            state: StreamState::Writable,
-            queue: VecDeque::new(),
-            queue_total_size: 0,
-            in_flight_size: 0,
-            strategy,
-            sink: Some(sink),
-            backpressure: false,
-            //locked: false,
-            close_requested: false,
-            close_completions: Vec::new(),
-            abort_reason: None,
-            abort_requested: false,
-            abort_completions: Vec::new(),
-            //stored_error: None,
-            stored_error: Arc::clone(&stored_error),
-            ready_wakers: WakerSet::new(),
-            closed_wakers: WakerSet::new(),
-            flush_completions: Vec::new(),
-            pending_flush_commands: Vec::new(),
-        };
-
-        let backpressure = Arc::new(AtomicBool::new(false));
-        let closed = Arc::new(AtomicBool::new(false));
-        let errored = Arc::new(AtomicBool::new(false));
-        let locked = Arc::new(AtomicBool::new(false));
-        let queue_total_size = Arc::new(AtomicUsize::new(0));
-        let in_flight_size = Arc::new(AtomicUsize::new(0));
-        //let stored_error = Arc::new(RwLock::new(None));
-
-        // Spawn the async stream task that processes stream commands
-        spawn_stream_task(
-            command_rx,
-            inner,
-            Arc::clone(&backpressure),
-            Arc::clone(&closed),
-            Arc::clone(&errored),
-            Arc::clone(&queue_total_size),
-            Arc::clone(&in_flight_size),
-        );
-
-        Self {
-            command_tx,
-            backpressure,
-            closed,
-            errored,
-            locked,
-            queue_total_size,
-            in_flight_size,
-            high_water_mark,
-            stored_error,
-            _sink: PhantomData,
-            _state: PhantomData,
-            flush_receiver: None,
-            close_receiver: None,
-            write_receiver: None,
-            pending_write_len: None,
-        }
+        Self::new_with_spawn(sink, strategy, |fut| {
+            std::thread::spawn(move || {
+                futures::executor::block_on(fut);
+            });
+        })
     }
 
     pub fn new_with_spawn<F>(
@@ -343,13 +288,11 @@ where
             strategy,
             sink: Some(sink),
             backpressure: false,
-            //locked: false,
             close_requested: false,
             close_completions: Vec::new(),
             abort_reason: None,
             abort_requested: false,
             abort_completions: Vec::new(),
-            //stored_error: None,
             stored_error: Arc::clone(&stored_error),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
@@ -363,25 +306,16 @@ where
         let locked = Arc::new(AtomicBool::new(false));
         let queue_total_size = Arc::new(AtomicUsize::new(0));
         let in_flight_size = Arc::new(AtomicUsize::new(0));
-        //let stored_error = Arc::new(RwLock::new(None));
 
-        let backpressure_clone = backpressure.clone();
-        let closed_clone = closed.clone();
-        let errored_clone = errored.clone();
-        let queue_total_size_clone = queue_total_size.clone();
-        let in_flight_size_clone = in_flight_size.clone();
-        let fut = async move {
-            stream_task(
-                command_rx,
-                inner,
-                backpressure_clone,
-                closed_clone,
-                errored_clone,
-                queue_total_size_clone,
-                in_flight_size_clone,
-            )
-            .await;
-        };
+        let fut = stream_task(
+            command_rx,
+            inner,
+            Arc::clone(&backpressure),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&in_flight_size),
+        );
 
         spawn_fn(Box::pin(fut));
 
@@ -902,37 +836,6 @@ pub trait WritableSink<T: Send + 'static>: Sized {
     fn abort(self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
         future::ready(Ok(())) // default no-op
     }
-}
-
-/// Replace with actual spawning mechanism async executor/runtime
-///
-/// For example, with futures crate ThreadPool:
-/// pool.spawn_ok(stream_task(...)) or with async-std/tokio spawn.
-fn spawn_stream_task<T, Sink>(
-    command_rx: UnboundedReceiver<StreamCommand<T>>,
-    inner: WritableStreamInner<T, Sink>,
-    backpressure: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    errored: Arc<AtomicBool>,
-    queue_total_size: Arc<AtomicUsize>,
-    in_flight_size: Arc<AtomicUsize>,
-) where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
-    // For demonstration, spawn a thread running a futures executor.
-    // In real use replace with your runtime.
-    std::thread::spawn(move || {
-        futures::executor::block_on(stream_task(
-            command_rx,
-            inner,
-            backpressure,
-            closed,
-            errored,
-            queue_total_size,
-            in_flight_size,
-        ));
-    });
 }
 
 // Helper to process each command. Break out to keep task flat.
