@@ -1,5 +1,6 @@
+use super::QueuingStrategy;
 use futures::io::AsyncRead;
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use std::future::Future;
 use std::io::Result as IoResult;
 use std::marker::PhantomData;
@@ -128,6 +129,26 @@ where
     }
 }
 
+impl<T, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked>
+where
+    T: Send + 'static,
+    I: Iterator<Item = T> + Send + 'static,
+{
+    pub fn from_iter(iter: I, _strategy: Option<Box<dyn QueuingStrategy<T>>>) -> Self {
+        Self::new(IteratorSource { iter })
+    }
+}
+
+impl<T, S> ReadableStream<T, AsyncStreamSource<S>, DefaultStream, Unlocked>
+where
+    T: Send + 'static,
+    S: Stream<Item = T> + Unpin + Send + 'static,
+{
+    pub fn from_async_stream(stream: S, _strategy: Option<Box<dyn QueuingStrategy<T>>>) -> Self {
+        Self::new(AsyncStreamSource { stream })
+    }
+}
+
 // ----------- Reader Methods for Default Streams -----------
 impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
@@ -238,6 +259,25 @@ where
     }
 }
 
+pub struct AsyncStreamSource<S> {
+    stream: S,
+}
+
+impl<S, T> ReadableSource<T> for AsyncStreamSource<S>
+where
+    S: Stream<Item = T> + Unpin + Send + 'static,
+    T: Send + 'static,
+{
+    type StreamType = DefaultStream;
+
+    async fn pull(
+        &mut self,
+        _controller: &mut ReadableStreamDefaultController<T>,
+    ) -> StreamResult<Option<T>> {
+        StreamResult(Ok(self.stream.next().await))
+    }
+}
+
 pub struct FileSource {
     // File handle or similar
 }
@@ -257,9 +297,10 @@ impl ReadableByteSource for FileSource {
 // ----------- Usage Examples -----------
 pub fn usage_examples() {
     // Default stream - only supports default readers
-    let default_stream = ReadableStream::new(IteratorSource {
+    /*let default_stream = ReadableStream::new(IteratorSource {
         iter: vec![1, 2, 3].into_iter(),
-    });
+    });*/
+    let default_stream = ReadableStream::from_iter(vec![1, 2, 3].into_iter(), None);
     let (_locked_stream, _reader) = default_stream.get_reader();
     // _reader is ReadableStreamDefaultReader<i32, _, Locked>
 
