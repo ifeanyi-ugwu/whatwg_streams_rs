@@ -42,7 +42,7 @@ where
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
     ) -> impl Future<Output = StreamResult<()>> + Send {
-        async { StreamResult(Ok(())) }
+        async { Ok(()) }
     }
 
     fn pull(
@@ -51,7 +51,7 @@ where
     ) -> impl Future<Output = StreamResult<Option<T>>> + Send;
 
     fn cancel(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
-        async { StreamResult(Ok(())) }
+        async { Ok(()) }
     }
 }
 
@@ -62,7 +62,7 @@ pub trait ReadableByteSource: Send + Sized + 'static {
         &mut self,
         controller: &mut ReadableByteStreamController,
     ) -> impl Future<Output = StreamResult<()>> + Send {
-        async { StreamResult(Ok(())) }
+        async { Ok(()) }
     }
 
     fn pull(
@@ -72,7 +72,7 @@ pub trait ReadableByteSource: Send + Sized + 'static {
     ) -> impl Future<Output = StreamResult<usize>> + Send;
 
     fn cancel(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
-        async { StreamResult(Ok(())) }
+        async { Ok(()) }
     }
 }
 
@@ -331,7 +331,7 @@ where
         &mut self,
         _controller: &mut ReadableStreamDefaultController<T>,
     ) -> StreamResult<Option<T>> {
-        StreamResult(Ok(self.iter.next()))
+        Ok(self.iter.next())
     }
 }
 
@@ -350,7 +350,7 @@ where
         &mut self,
         _controller: &mut ReadableStreamDefaultController<T>,
     ) -> StreamResult<Option<T>> {
-        StreamResult(Ok(self.stream.next().await))
+        Ok(self.stream.next().await)
     }
 }
 
@@ -366,7 +366,7 @@ impl ReadableByteSource for FileSource {
         _controller: &mut ReadableByteStreamController,
         buffer: &mut [u8],
     ) -> StreamResult<usize> {
-        StreamResult(Ok(0)) // Placeholder
+        Ok(0)
     }
 }
 
@@ -442,7 +442,7 @@ pub fn pipe_examples() {
 }
 
 // ----------- Placeholder types for completeness -----------
-pub struct StreamResult<T>(pub Result<T, StreamError>);
+type StreamResult<T> = Result<T, StreamError>;
 pub struct StreamError;
 
 pub struct ReadableStreamDefaultController<T>(PhantomData<T>);
