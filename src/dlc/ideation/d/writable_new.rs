@@ -1275,47 +1275,16 @@ async fn stream_task<T, Sink>(
                 },
                 InFlight::Abort { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(sink_abort_result) => {
-                        match sink_abort_result {
+                        let notify_result = match sink_abort_result {
                             Ok(()) => {
-                                // Sink abort succeeded - don't error the stream
-                                // Just complete the abort operation successfully
-                                // Sink abort succeeded - close the stream (don't error it)
-                                //inner.state = StreamState::Closed; // CHANGE: Close, don't leave writable
-                                //inner.sink = None; // ADD: Remove sink
-                                //inner.state = StreamState::Errored;
-                                //inner.stored_error = Some(abort_reason.clone());
-                                //inner.state = StreamState::Errored;
-                                /*inner.stored_error = Some(StreamError::Aborted(
-                                    inner.abort_reason.clone()
-                                ));*/
-                                // Keep stored_error as is (abort reason)
-                                inner.sink = None;
-
-                                for sender in completions.drain(..) {
-                                    let _ = sender.send(Ok(()));
-                                }
+                                Ok(())
                             }
                             Err(sink_error) => {
                                 // Sink abort failed - error the stream with this error (sink error)
-                                //inner.state = StreamState::Errored;
-                                // Overwrite stored_error with sink's error
-                                //inner.stored_error = Some(sink_error.clone());
-                                /*{
-                                    let mut stored_err_guard = match inner.stored_error.write() {
-                                        Ok(guard) => guard,
-                                        Err(poisoned) => poisoned.into_inner(), // recover from poisoning if any
-                                    };
-                                    *stored_err_guard = Some(sink_error.clone());
-                                }*/
                                 set_stored_error(&inner.stored_error, sink_error.clone());
-                                inner.sink = None;
-
-                                // Abort calls should reject with the sink error
-                                for sender in completions.drain(..) {
-                                    let _ = sender.send(Err(sink_error.clone()));
-                                }
+                                Err(sink_error)
                             }
-                        }
+                        };
 
                         inner.abort_requested = false;
                         // Clear remaining state
@@ -1327,6 +1296,10 @@ async fn stream_task<T, Sink>(
 
                         update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
                         update_flags(&inner, &backpressure, &closed, &errored);
+
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(notify_result.clone());
+                        }
 
                         inflight = None;
                         cx.waker().wake_by_ref();
