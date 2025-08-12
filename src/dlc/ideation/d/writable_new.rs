@@ -1648,43 +1648,28 @@ fn process_flush_command<T, Sink>(
     };
     let writes_to_wait_for = inner.queue.len() + inflight_writes;
 
-    println!(
-        "Flush: queue={}, inflight_writes={}, total_to_wait={}",
-        inner.queue.len(),
-        inflight_writes,
-        writes_to_wait_for
-    );
-
     if writes_to_wait_for == 0 {
         // No writes to wait for - flush complete immediately!
         let _ = completion.send(Ok(()));
-        println!("Flush completed immediately");
     } else {
         // Queue this flush to wait for exactly this many write completions
         inner
             .flush_completions
             .push((completion, writes_to_wait_for));
-        println!("Flush queued, waiting for {} writes", writes_to_wait_for);
     }
 }
 
 // When ANY write completes, decrement ALL pending flush counters
 fn decrement_flush_counters<T, Sink>(inner: &mut WritableStreamInner<T, Sink>) {
     let mut i = 0;
-    eprintln!(
-        "Decrementing flush counters, {} flushes waiting",
-        inner.flush_completions.len()
-    );
     while i < inner.flush_completions.len() {
         let (_, count) = &mut inner.flush_completions[i];
         *count -= 1;
-        eprintln!("Flush {} now waiting for {} more writes", i, count);
 
         if *count == 0 {
             // This flush is complete!
             let (sender, _) = inner.flush_completions.swap_remove(i);
             let _ = sender.send(Ok(()));
-            eprintln!("Flush {} completed!", i);
             // Don't increment i since we removed an element
         } else {
             i += 1;
