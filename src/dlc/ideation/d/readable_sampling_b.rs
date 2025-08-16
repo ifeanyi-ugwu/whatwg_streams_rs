@@ -36,8 +36,6 @@ pub trait ReadableSource<T>: Send + Sized + 'static
 where
     T: Send + 'static,
 {
-    type StreamType: StreamTypeMarker;
-
     fn start(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
@@ -56,8 +54,6 @@ where
 }
 
 pub trait ReadableByteSource: Send + Sized + 'static {
-    type StreamType: StreamTypeMarker;
-
     fn start(
         &mut self,
         controller: &mut ReadableByteStreamController,
@@ -165,7 +161,7 @@ pub struct StreamPipeOptions {
 impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
     T: Send + 'static,
-    Source: ReadableSource<T, StreamType = DefaultStream> + Send + 'static,
+    Source: ReadableSource<T> + Send + 'static,
 {
     pub fn new_default(source: Source) -> Self {
         Self {
@@ -196,7 +192,7 @@ where
 {
     pub fn new(source: Source) -> Self
     where
-        Source: ReadableSource<T, StreamType = StreamType>,
+        Source: ReadableSource<T>,
     {
         Self {
             command_tx: todo!(),
@@ -325,8 +321,6 @@ where
     I: Iterator<Item = T> + Send + 'static,
     T: Send + 'static,
 {
-    type StreamType = DefaultStream;
-
     async fn pull(
         &mut self,
         _controller: &mut ReadableStreamDefaultController<T>,
@@ -344,8 +338,6 @@ where
     S: Stream<Item = T> + Unpin + Send + 'static,
     T: Send + 'static,
 {
-    type StreamType = DefaultStream;
-
     async fn pull(
         &mut self,
         _controller: &mut ReadableStreamDefaultController<T>,
@@ -359,8 +351,6 @@ pub struct FileSource {
 }
 
 impl ReadableByteSource for FileSource {
-    type StreamType = ByteStream;
-
     async fn pull(
         &mut self,
         _controller: &mut ReadableByteStreamController,
@@ -397,7 +387,7 @@ pub fn usage_examples() {
 // ----------- Pipe Examples -----------
 pub fn pipe_examples() {
     // Example 1: pipe_through works for UNLOCKED streams of any type
-    let unlocked_default_stream = ReadableStream::new(IteratorSource {
+    let unlocked_default_stream = ReadableStream::new_default(IteratorSource {
         iter: vec![1, 2, 3].into_iter(),
     });
 
