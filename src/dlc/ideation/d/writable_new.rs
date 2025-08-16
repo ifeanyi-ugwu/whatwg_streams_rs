@@ -817,6 +817,7 @@ pub trait WritableSink<T: Send + 'static>: Sized {
         &mut self,
         controller: &mut WritableStreamDefaultController,
     ) -> impl Future<Output = StreamResult<()>> + Send {
+        let _ = controller;
         future::ready(Ok(())) // default no-op
     }
 
@@ -834,6 +835,7 @@ pub trait WritableSink<T: Send + 'static>: Sized {
 
     /// Abort the sink
     fn abort(self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
+        let _ = reason;
         future::ready(Ok(())) // default no-op
     }
 }
@@ -1828,8 +1830,7 @@ impl WakerSet {
 mod tests {
     use super::*;
     use crate::dlc::ideation::d::CountQueuingStrategy;
-    use futures::executor::block_on;
-    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     struct CountingSink {
@@ -1874,7 +1875,7 @@ mod tests {
         /*let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
             tokio::spawn(fut);
         });*/
-        let (locked_stream, writer) = stream.get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Write some chunks
         writer.write(vec![1, 2, 3]).await.expect("write");
@@ -2076,7 +2077,7 @@ mod tests {
                 }
             }
 
-            fn is_closed(&self) -> bool {
+            fn _is_closed(&self) -> bool {
                 *self.closed.lock().unwrap()
             }
 
@@ -2094,7 +2095,7 @@ mod tests {
                 async { Ok(()) }
             }
 
-            fn close(mut self) -> impl std::future::Future<Output = StreamResult<()>> + Send {
+            fn close(self) -> impl std::future::Future<Output = StreamResult<()>> + Send {
                 let closed = self.closed.clone();
                 async move {
                     *closed.lock().unwrap() = true;
@@ -2103,7 +2104,7 @@ mod tests {
             }
 
             fn abort(
-                mut self,
+                self,
                 reason: Option<String>,
             ) -> impl std::future::Future<Output = StreamResult<()>> + Send {
                 let aborted = self.aborted.clone();
@@ -2168,7 +2169,6 @@ mod tests {
     #[tokio::test]
     async fn backpressure_behavior() {
         use futures::Future;
-        use std::pin::Pin;
         use std::sync::{Arc, Mutex};
 
         // Custom sink that simulates slow writes by never resolving immediately
@@ -2189,7 +2189,7 @@ mod tests {
                 )
             }
 
-            fn get_call_count(&self) -> usize {
+            fn _get_call_count(&self) -> usize {
                 *self.calls.lock().unwrap()
             }
         }
@@ -2199,7 +2199,7 @@ mod tests {
                 &mut self,
                 _chunk: Vec<u8>,
                 _controller: &mut WritableStreamDefaultController,
-            ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+            ) -> impl Future<Output = StreamResult<()>> + Send {
                 let calls_clone = self.calls.clone();
                 let notify = self.unblock_notify.clone();
 
@@ -2257,10 +2257,9 @@ mod tests {
         );
 
         // `ready()` should be pending while backpressure applies
-        let mut ready_fut = writer.ready();
+        let ready_fut = writer.ready();
         tokio::pin!(ready_fut);
         use futures::task::{Context, Poll};
-        use std::task::Waker;
 
         let waker = futures::task::noop_waker_ref();
         let mut cx = Context::from_waker(waker);
@@ -2274,7 +2273,7 @@ mod tests {
         unblock_notify.notify_one();
 
         // Await first write completion
-        write1.await.expect("write1 done");
+        let _ = write1.await.expect("write1 done");
 
         // Lower backpressure flag should clear after draining once first write completes;
         // Sink should start draining queued writes now.
@@ -2282,7 +2281,7 @@ mod tests {
         unblock_notify.notify_one();
 
         // Await second write completion
-        write2.await.expect("write2 done");
+        let _ = write2.await.expect("write2 done");
 
         // After draining queue, backpressure flag must be false
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await; // let state stabilize
@@ -2310,7 +2309,6 @@ mod tests {
     //spec compliance
     #[tokio::test]
     async fn ready_future_resolves_only_after_backpressure_clears() {
-        use futures::FutureExt;
         use std::sync::{Arc, Mutex};
 
         // Setup: sink that holds writes until notified
@@ -2332,7 +2330,7 @@ mod tests {
                 )
             }
 
-            fn count(&self) -> usize {
+            fn _count(&self) -> usize {
                 *self.write_calls.lock().unwrap()
             }
         }
@@ -2404,11 +2402,11 @@ mod tests {
         notify.notify_one();
 
         // Await completion of first write
-        write1.await.expect("first write");
+        let _ = write1.await.expect("first write");
 
         // Await completion of second write (which was queued)
         notify.notify_one();
-        write2.await.expect("second write");
+        let _ = write2.await.expect("second write");
 
         // Now backpressure should clear
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2489,7 +2487,7 @@ mod tests {
         let after_close = writer.desired_size();
         assert_eq!(after_close, None, "desired_size after close must be None");
 
-        writer.release_lock();
+        let _ = writer.release_lock();
         // Simulate errored state by calling abort
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
         writer.abort(None).await.expect("abort");
@@ -2515,7 +2513,7 @@ mod tests {
         );
 
         // Release the lock in writer1
-        writer1.release_lock();
+        let _ = writer1.release_lock();
 
         // Now new writer acquisition must succeed
         let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer after release");
@@ -2538,7 +2536,7 @@ mod tests {
             "desired_size after close must be None"
         );
 
-        writer.release_lock();
+        let _ = writer.release_lock();
         let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer");
         writer2.abort(None).await.expect("abort");
 
@@ -2684,7 +2682,7 @@ mod tests {
                 )
             }
 
-            fn get_write_count(&self) -> usize {
+            fn _get_write_count(&self) -> usize {
                 *self.write_count.lock().unwrap()
             }
         }
@@ -2747,7 +2745,7 @@ mod tests {
 
         // Get ready future: should be pending due to backpressure
         // Poll twice to simulate waker registration behavior
-        let mut ready_fut = writer.ready();
+        let ready_fut = writer.ready();
         futures::pin_mut!(ready_fut);
 
         use std::task::{Context, Poll};
@@ -3482,7 +3480,7 @@ mod async_write_integration_tests {
             self
         }
 
-        fn with_close_failure(mut self) -> Self {
+        fn _ith_close_failure(mut self) -> Self {
             self.fail_on_close = true;
             self
         }
