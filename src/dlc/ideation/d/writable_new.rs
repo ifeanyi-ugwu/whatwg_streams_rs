@@ -1369,11 +1369,12 @@ where
     ///
     /// # Important
     ///
-    /// Calling `write()` repeatedly *without* first awaiting `ready()` (or without
+    /// Calling `write()` repeatedly *without* awaiting or *without* awaiting `ready()` (i.e without
     /// respecting backpressure) can cause unbounded growth of the internal queue,
     /// leading to increased memory usage and potential performance degradation.
     ///
     /// To avoid excessive buffering, it is recommended to either:
+    /// - Await each `write()` call or
     /// - Await `ready()` before calling `write()` to respect backpressure signals, or
     /// - Use the [`enqueue_when_ready()`] helper method which does this automatically.
     ///
