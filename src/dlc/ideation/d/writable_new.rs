@@ -1577,11 +1577,7 @@ struct WritableStreamInner<T, Sink> {
     pending_flush_commands: Vec<oneshot::Sender<StreamResult<()>>>,
 }
 
-impl<T, Sink> WritableStreamInner<T, Sink>
-where
-    T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
-{
+impl<T, Sink> WritableStreamInner<T, Sink> {
     /// Update the stream's backpressure flag to reflect the current load.
     fn update_backpressure(&mut self) {
         let total = self.queue_total_size + self.in_flight_size;
