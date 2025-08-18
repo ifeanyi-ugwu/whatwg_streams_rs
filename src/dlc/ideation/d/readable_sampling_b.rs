@@ -73,17 +73,11 @@ pub trait ReadableByteSource: Send + Sized + 'static {
 }
 
 // ----------- Stream Type Marker Trait -----------
-pub trait StreamTypeMarker: Send + Sync + 'static {
-    type Item: Send + 'static;
-}
+pub trait StreamTypeMarker: Send + Sync + 'static {}
 
-impl StreamTypeMarker for DefaultStream {
-    type Item = ();
-}
+impl StreamTypeMarker for DefaultStream {}
 
-impl StreamTypeMarker for ByteStream {
-    type Item = Vec<u8>;
-}
+impl StreamTypeMarker for ByteStream {}
 
 // ----------- Main ReadableStream with Typestate -----------
 pub struct ReadableStream<T, Source, StreamType, LockState = Unlocked>
@@ -284,7 +278,7 @@ impl<T, Source, StreamType, LockState> Stream for ReadableStream<T, Source, Stre
 where
     T: Send + 'static,
     Source: Send + 'static,
-    StreamType: StreamTypeMarker<Item = T>,
+    StreamType: StreamTypeMarker,
     LockState: Send + 'static,
 {
     type Item = StreamResult<T>;
@@ -299,7 +293,7 @@ impl<T, Source, StreamType, LockState> AsyncRead
 where
     T: for<'a> From<&'a [u8]> + Send + 'static,
     Source: Send + 'static,
-    StreamType: StreamTypeMarker<Item = T>,
+    StreamType: StreamTypeMarker,
     LockState: Send + 'static,
 {
     fn poll_read(
@@ -491,7 +485,7 @@ impl<T, Source, StreamType, LockState> ReadableStreamDefaultReader<T, Source, St
 where
     T: Send + 'static,
     Source: Send + 'static,
-    StreamType: StreamTypeMarker<Item = T>,
+    StreamType: StreamTypeMarker,
     LockState: Send + 'static,
 {
     pub fn new(stream: ReadableStream<T, Source, StreamType, Unlocked>) -> Self {
