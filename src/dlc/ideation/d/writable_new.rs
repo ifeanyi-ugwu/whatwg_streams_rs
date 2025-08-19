@@ -165,6 +165,14 @@ impl<T, Sink, S> WritableStream<T, Sink, S> {
     pub fn locked(&self) -> bool {
         self.locked.load(Ordering::SeqCst)
     }
+
+    fn get_stored_error(&self) -> StreamError {
+        self.stored_error
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+    }
 }
 
 impl<T, Sink> WritableStream<T, Sink, Unlocked>
@@ -1709,19 +1717,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.writer.stream.errored.load(Ordering::SeqCst) {
-            /*let error = inner
-            .stored_error
-            .clone()
-            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));*/
-
-            let error = {
-                let opt_err = match self.writer.stream.stored_error.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-            };
-            return Poll::Ready(Err(error));
+            return Poll::Ready(Err(self.writer.stream.get_stored_error()));
         }
         if self.writer.stream.closed.load(Ordering::SeqCst) {
             //return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
@@ -1765,14 +1761,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.writer.stream.errored.load(Ordering::SeqCst) {
-            let error = {
-                let opt_err = match self.writer.stream.stored_error.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-            };
-            return Poll::Ready(Err(error));
+            return Poll::Ready(Err(self.writer.stream.get_stored_error()));
         }
         if self.writer.stream.closed.load(Ordering::SeqCst) {
             return Poll::Ready(Ok(()));
