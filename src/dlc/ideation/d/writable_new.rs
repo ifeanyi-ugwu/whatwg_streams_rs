@@ -1682,6 +1682,7 @@ fn process_controller_msgs<T, Sink>(
     }
 }
 
+#[derive(Clone)]
 pub struct WritableStreamDefaultController {
     tx: UnboundedSender<ControllerMsg>,
 }
