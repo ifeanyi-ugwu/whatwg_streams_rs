@@ -46,7 +46,7 @@ where
     fn pull(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
-    ) -> impl Future<Output = StreamResult<Option<T>>> + Send;
+    ) -> impl Future<Output = StreamResult<()>> + Send;
 
     fn cancel(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
         async { Ok(()) }
@@ -318,8 +318,9 @@ where
     async fn pull(
         &mut self,
         _controller: &mut ReadableStreamDefaultController<T>,
-    ) -> StreamResult<Option<T>> {
-        Ok(self.iter.next())
+    ) -> StreamResult<()> {
+        self.iter.next();
+        Ok(())
     }
 }
 
@@ -335,8 +336,9 @@ where
     async fn pull(
         &mut self,
         _controller: &mut ReadableStreamDefaultController<T>,
-    ) -> StreamResult<Option<T>> {
-        Ok(self.stream.next().await)
+    ) -> StreamResult<()> {
+        self.stream.next().await;
+        Ok(())
     }
 }
 
@@ -468,9 +470,9 @@ impl ReadableByteStreamController {
         todo!()
     }
 
-    pub fn enqueue(&self, chunk: Vec<u8>) -> StreamResult<()> {
+    /*pub fn enqueue(&self, chunk: Vec<u8>) -> StreamResult<()> {
         todo!()
-    }
+    }*/
 
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
         todo!()
