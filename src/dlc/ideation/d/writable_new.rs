@@ -993,7 +993,7 @@ async fn stream_task<T, Sink>(
             Err(error) => {
                 // Failed to start: mark errored state
                 inner.state = StreamState::Errored;
-                set_stored_error(&inner.stored_error, error);
+                inner.set_stored_error(error);
                 inner.sink = None; // Drop the sink on failure
                 // Optionally you may want to wake closed and ready wakers here
                 update_flags(&inner, &backpressure, &closed, &errored);
@@ -1189,7 +1189,7 @@ async fn stream_task<T, Sink>(
                             // Check for error first, before any flag updates
                             if result.is_err() {
                                 if let Err(e) = result.clone() {
-                                    set_stored_error(&inner.stored_error, e);
+                                    inner.set_stored_error( e);
                                 }
                                 inner.state = StreamState::Errored;
                                 inner.sink = None; // Don't restore sink on error
@@ -1222,7 +1222,7 @@ async fn stream_task<T, Sink>(
                             Err(err) => {
                                 // Close failed: mark stream Errored with stored error
                                 inner.state = StreamState::Errored;
-                                set_stored_error(&inner.stored_error, err.clone());
+                                inner.set_stored_error(err.clone());
                             }
                         }
 
@@ -1253,7 +1253,7 @@ async fn stream_task<T, Sink>(
                             }
                             Err(sink_error) => {
                                 // Sink abort failed - error the stream with this error (sink error)
-                                set_stored_error(&inner.stored_error, sink_error.clone());
+                                inner.set_stored_error(sink_error.clone());
                                 Err(sink_error)
                             }
                         };
@@ -1308,14 +1308,6 @@ fn update_flags<T, Sink>(
     if !inner.backpressure {
         inner.ready_wakers.wake_all();
     }
-}
-
-fn set_stored_error(stored_error: &Arc<RwLock<Option<StreamError>>>, err: StreamError) {
-    let mut guard = match stored_error.write() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *guard = Some(err);
 }
 
 pub struct WritableStreamDefaultWriter<T, Sink> {
@@ -1562,6 +1554,14 @@ impl<T, Sink> WritableStreamInner<T, Sink> {
             .ok()
             .and_then(|guard| guard.clone())
             .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+    }
+
+    fn set_stored_error(&self, err: StreamError) {
+        let mut guard = match self.stored_error.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(err);
     }
 }
 
