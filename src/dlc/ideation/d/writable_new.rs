@@ -393,14 +393,7 @@ where
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Check if stream is in an error state
         if self.errored.load(Ordering::SeqCst) {
-            let error = {
-                let opt_err = match self.stored_error.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-            };
-            return Poll::Ready(Err(error));
+            return Poll::Ready(Err(self.get_stored_error()));
         }
 
         // Check if stream is closed
@@ -430,14 +423,7 @@ where
     fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
         // Pre-flight checks before sending
         if self.errored.load(Ordering::SeqCst) {
-            let error = {
-                let opt_err = match self.stored_error.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(poisoned) => poisoned.into_inner().clone(),
-                };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-            };
-            return Err(error);
+            return Err(self.get_stored_error());
         }
 
         if self.closed.load(Ordering::SeqCst) {
@@ -934,14 +920,7 @@ fn process_command<T, Sink>(
         }
         StreamCommand::Flush { completion } => {
             if inner.state == StreamState::Errored {
-                let error = {
-                    let opt_err = match inner.stored_error.read() {
-                        Ok(err_guard) => err_guard.clone(),
-                        Err(poisoned) => poisoned.into_inner().clone(),
-                    };
-                    opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
-                };
-                let _ = completion.send(Err(error));
+                let _ = completion.send(Err(inner.get_stored_error()));
                 return;
             }
 
