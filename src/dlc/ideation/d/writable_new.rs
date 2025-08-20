@@ -147,7 +147,6 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
     errored: Arc<AtomicBool>,
     locked: Arc<AtomicBool>,
     queue_total_size: Arc<AtomicUsize>,
-    in_flight_size: Arc<AtomicUsize>,
     high_water_mark: Arc<AtomicUsize>,
     stored_error: Arc<RwLock<Option<StreamError>>>,
     _sink: PhantomData<Sink>,
@@ -245,7 +244,6 @@ where
             errored: Arc::clone(&self.errored),
             locked: Arc::clone(&self.locked),
             queue_total_size: Arc::clone(&self.queue_total_size),
-            in_flight_size: Arc::clone(&self.in_flight_size),
             high_water_mark: Arc::clone(&self.high_water_mark),
             stored_error: Arc::clone(&self.stored_error),
             _sink: PhantomData,
@@ -292,7 +290,6 @@ where
             state: StreamState::Writable,
             queue: VecDeque::new(),
             queue_total_size: 0,
-            in_flight_size: 0,
             strategy,
             sink: Some(sink),
             backpressure: false,
@@ -313,7 +310,6 @@ where
         let errored = Arc::new(AtomicBool::new(false));
         let locked = Arc::new(AtomicBool::new(false));
         let queue_total_size = Arc::new(AtomicUsize::new(0));
-        let in_flight_size = Arc::new(AtomicUsize::new(0));
 
         let fut = stream_task(
             command_rx,
@@ -322,7 +318,6 @@ where
             Arc::clone(&closed),
             Arc::clone(&errored),
             Arc::clone(&queue_total_size),
-            Arc::clone(&in_flight_size),
         );
 
         spawn_fn(Box::pin(fut));
@@ -334,7 +329,6 @@ where
             errored,
             locked,
             queue_total_size,
-            in_flight_size,
             high_water_mark,
             stored_error,
             _sink: PhantomData,
@@ -359,15 +353,12 @@ where
         }
 
         let queue_size = self.queue_total_size.load(Ordering::SeqCst);
-        let inflight_size = self.in_flight_size.load(Ordering::SeqCst);
         let hwm = self.high_water_mark.load(Ordering::SeqCst);
 
-        let total_size = queue_size + inflight_size;
-
-        if total_size >= hwm {
+        if queue_size >= hwm {
             Some(0)
         } else {
-            Some(hwm - total_size)
+            Some(hwm - queue_size)
         }
     }
 }
@@ -381,7 +372,6 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
             errored: Arc::clone(&self.errored),
             locked: Arc::clone(&self.locked),
             queue_total_size: Arc::clone(&self.queue_total_size),
-            in_flight_size: Arc::clone(&self.in_flight_size),
             high_water_mark: Arc::clone(&self.high_water_mark),
             stored_error: Arc::clone(&self.stored_error),
             _sink: PhantomData,
@@ -856,7 +846,6 @@ fn process_command<T, Sink>(
     closed: &Arc<AtomicBool>,
     errored: &Arc<AtomicBool>,
     queue_total_size: &Arc<AtomicUsize>,
-    in_flight_size: &Arc<AtomicUsize>,
     _cx: &mut Context<'_>,
 ) where
     T: Send + 'static,
@@ -889,7 +878,7 @@ fn process_command<T, Sink>(
             });
             inner.queue_total_size += chunk_size;
             inner.update_backpressure();
-            update_atomic_counters(inner, queue_total_size, in_flight_size);
+            update_atomic_counters(inner, queue_total_size);
             update_flags(&inner, backpressure, closed, errored);
         }
         StreamCommand::Close { completion } => {
@@ -908,7 +897,7 @@ fn process_command<T, Sink>(
                 inner.close_requested = true;
                 inner.close_completions.push(completion);
             }
-            update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+            update_atomic_counters(&inner, &queue_total_size);
             update_flags(&inner, backpressure, closed, errored);
         }
         StreamCommand::Abort { reason, completion } => {
@@ -940,7 +929,7 @@ fn process_command<T, Sink>(
                     let _ = pw.completion_tx.send(Err(error));
                 }
             }
-            update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+            update_atomic_counters(&inner, &queue_total_size);
             update_flags(&inner, backpressure, closed, errored);
         }
         StreamCommand::Flush { completion } => {
@@ -1001,7 +990,6 @@ async fn stream_task<T, Sink>(
     closed: Arc<AtomicBool>,
     errored: Arc<AtomicBool>,
     queue_total_size: Arc<AtomicUsize>,
-    in_flight_size: Arc<AtomicUsize>,
 ) where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
@@ -1037,7 +1025,7 @@ async fn stream_task<T, Sink>(
 
     poll_fn(|cx| {
         process_controller_msgs(&mut inner, &mut ctrl_rx);
-        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+        update_atomic_counters(&inner, &queue_total_size,);
         // Dual-layer waker management to handle race conditions in concurrent scenarios:
         //
         // 1. Immediate wake in RegisterWaker command arms (in process_command): 
@@ -1067,7 +1055,6 @@ async fn stream_task<T, Sink>(
                         &closed,
                         &errored,
                         &queue_total_size,
-                        &in_flight_size,
                         cx,
                     );
                     while let Some(completion) = inner.pending_flush_commands.pop() {
@@ -1183,9 +1170,8 @@ async fn stream_task<T, Sink>(
             if let Some(pw) = inner.queue.pop_front() {
                 let chunk_size = inner.strategy.size(&pw.chunk);
                 inner.queue_total_size -= chunk_size;
-                inner.in_flight_size += chunk_size;
                 inner.update_backpressure();
-                update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                update_atomic_counters(&inner, &queue_total_size,);
                 update_flags(&inner, &backpressure, &closed, &errored);
 
                 if let Some(mut sink) = inner.sink.take() {
@@ -1219,8 +1205,6 @@ async fn stream_task<T, Sink>(
                 } => {
                     match fut.as_mut().poll(cx) {
                         Poll::Ready((sink, result)) => {
-                            inner.in_flight_size -= *chunk_size;
-
                             decrement_flush_counters(&mut inner);
 
                             // Check for error first, before any flag updates
@@ -1235,7 +1219,7 @@ async fn stream_task<T, Sink>(
                             }
 
                             inner.update_backpressure();
-                            update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                            update_atomic_counters(&inner, &queue_total_size);
                             update_flags(&inner, &backpressure, &closed, &errored); // Single flag update
 
                             if let Some(sender) = completion.take() {
@@ -1267,10 +1251,9 @@ async fn stream_task<T, Sink>(
                         // Clear queue and reset backpressure
                         inner.queue.clear();
                         inner.queue_total_size = 0;
-                        inner.in_flight_size = 0;
                         inner.backpressure = false;
 
-                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                        update_atomic_counters(&inner, &queue_total_size);
                         update_flags(&inner, &backpressure, &closed, &errored);
 
                         // Notify all waiting close callers with the actual close result
@@ -1301,10 +1284,9 @@ async fn stream_task<T, Sink>(
                         // Queue should already be empty (it was cleared when abort was requested)
                         inner.queue.clear();
                         inner.queue_total_size = 0;
-                        inner.in_flight_size = 0;
                         inner.backpressure = false;
 
-                        update_atomic_counters(&inner, &queue_total_size, &in_flight_size);
+                        update_atomic_counters(&inner, &queue_total_size);
                         update_flags(&inner, &backpressure, &closed, &errored);
 
                         for sender in completions.drain(..) {
@@ -1524,10 +1506,8 @@ where
 fn update_atomic_counters<T, Sink>(
     inner: &WritableStreamInner<T, Sink>,
     queue_total_size: &Arc<AtomicUsize>,
-    in_flight_size: &Arc<AtomicUsize>,
 ) {
     queue_total_size.store(inner.queue_total_size, Ordering::SeqCst);
-    in_flight_size.store(inner.in_flight_size, Ordering::SeqCst);
 }
 
 impl<T, Sink> WritableStreamDefaultWriter<T, Sink>
@@ -1562,7 +1542,6 @@ struct WritableStreamInner<T, Sink> {
     state: StreamState,
     queue: VecDeque<PendingWrite<T>>,
     queue_total_size: usize,
-    in_flight_size: usize,
     strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>,
     sink: Option<Sink>,
 
@@ -1591,11 +1570,9 @@ struct WritableStreamInner<T, Sink> {
 impl<T, Sink> WritableStreamInner<T, Sink> {
     /// Update the stream's backpressure flag to reflect the current load.
     fn update_backpressure(&mut self) {
-        let total = self.queue_total_size + self.in_flight_size;
         let prev = self.backpressure;
-        self.backpressure = total >= self.strategy.high_water_mark();
+        self.backpressure = self.queue_total_size >= self.strategy.high_water_mark();
         if prev && !self.backpressure {
-            // Backpressure just cleared: wake all pending ready futures!
             self.ready_wakers.wake_all();
         }
     }
@@ -1949,107 +1926,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backpressure_trigger_and_relief() {
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        #[derive(Clone)]
-        struct DelayedSink {
-            notify: Arc<Notify>,
-            write_count: Arc<Mutex<usize>>,
-        }
-
-        impl DelayedSink {
-            fn new() -> (Self, Arc<Notify>) {
-                let notify = Arc::new(Notify::new());
-                (
-                    Self {
-                        notify: notify.clone(),
-                        write_count: Arc::new(Mutex::new(0)),
-                    },
-                    notify,
-                )
-            }
-
-            fn get_count(&self) -> usize {
-                *self.write_count.lock().unwrap()
-            }
-        }
-
-        impl WritableSink<Vec<u8>> for DelayedSink {
-            fn write(
-                &mut self,
-                _chunk: Vec<u8>,
-                _controller: &mut WritableStreamDefaultController,
-            ) -> impl std::future::Future<Output = StreamResult<()>> + Send {
-                let notify = self.notify.clone();
-                let count = self.write_count.clone();
-                async move {
-                    {
-                        let mut guard = count.lock().unwrap();
-                        *guard += 1;
-                    }
-                    // Simulate slow write that awaits notification
-                    notify.notified().await;
-                    Ok(())
-                }
-            }
-        }
-
-        let (sink, notify) = DelayedSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(1)); // low HWM forces backpressure early
-        let stream = WritableStream::new(sink.clone(), strategy);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
-        let writer = Arc::new(writer);
-
-        let writer_clone1 = writer.clone();
-        // First write triggers async sink.write, queue_total_size = 1, no backpressure yet
-        let write1 = tokio::spawn(async move { writer_clone1.write(vec![1]).await });
-
-        let writer_clone2 = writer.clone();
-        // Second write exceeds high water mark, should get queued and backpressure applied
-        //let write2_fut = writer_clone2.write(vec![2]);
-        //let write2_result = tokio::spawn(write2_fut);
-        let write2_result = tokio::spawn(async move { writer_clone2.write(vec![2]).await });
-
-        // Wait a short time - write2 should be pending because of backpressure
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // The ready() future resolves when backpressure clears
-        let ready_fut = writer.ready();
-        tokio::pin!(ready_fut);
-
-        // Poll once, should be pending due to backpressure
-        use futures::task::noop_waker_ref;
-        use std::task::{Context, Poll};
-        let waker = noop_waker_ref();
-        let mut cx = Context::from_waker(waker);
-        // Before notifying, ready() pending (expected)
-        assert!(matches!(ready_fut.as_mut().poll(&mut cx), Poll::Pending));
-
-        // Finish first write by notifying sink
-        notify.notify_one();
-
-        let _ = write1.await.expect("write1 done");
-
-        // At this point ready() likely still pending, because second write queued.
-        assert!(matches!(ready_fut.as_mut().poll(&mut cx), Poll::Pending));
-
-        // Now notify the second write completes too:
-        notify.notify_one();
-        let _ = write2_result.await.expect("write2 done");
-
-        // Now backpressure relieved; ready() should resolve
-        let ready_result = ready_fut.await;
-        assert!(ready_result.is_ok());
-
-        // Confirm both chunks written
-        assert_eq!(sink.get_count(), 2);
-    }
-
-    #[tokio::test]
     async fn close_abort_error_test() {
         use std::sync::{Arc, Mutex};
 
@@ -2209,7 +2085,7 @@ mod tests {
 
         // Use a low water mark to force backpressure quickly
         let (sink, unblock_notify) = SlowSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(2));
+        let strategy = Box::new(CountQueuingStrategy::new(1));
 
         let stream = WritableStream::new(sink, strategy);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
@@ -2341,66 +2217,72 @@ mod tests {
             }
         }
 
-        // Use low high_water_mark = 1 to trigger backpressure easily
+        // Use HWM = 1 to trigger backpressure with 2 queued writes
         let (sink, notify) = BlockSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(1usize));
         let stream = WritableStream::new(sink, strategy);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
         let writer = Arc::new(writer);
+
+        // 1st write: dequeued immediately, starts processing in sink
         let writer_clone = writer.clone();
-        // 1st write triggers sink.write and gets "stuck"
         let write1 = tokio::spawn(async move { writer_clone.write(vec![1]).await });
 
-        // Wait a brief moment to let sink.write be actively blocked
+        // Wait for first write to start processing
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // 2nd write triggers backpressure
-        //let write2_fut = writer.write(vec![2]);
+        // At this point: queue_size = 0, no backpressure yet
+        assert!(
+            !stream
+                .backpressure
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "No backpressure yet - queue is empty"
+        );
 
-        // Spawn 2nd write task but do NOT notify sink yet
-        //let write2 = tokio::spawn(write2_fut);
-
+        // 2nd write: gets queued (queue_size = 1, equals HWM)
         let writer_clone = writer.clone();
         let write2 = tokio::spawn(async move { writer_clone.write(vec![2]).await });
 
-        // At this point, backpressure should be true
+        // 3rd write: would exceed HWM, triggers backpressure
+        let writer_clone = writer.clone();
+        let write3 = tokio::spawn(async move { writer_clone.write(vec![3]).await });
+
+        // Wait for writes to be queued
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Now backpressure should be true (queue_size >= HWM)
         assert!(
             stream
                 .backpressure
                 .load(std::sync::atomic::Ordering::SeqCst),
-            "Backpressure is set while first write blocked and second queued"
+            "Backpressure should be active with 2+ items queued when HWM=1"
         );
 
         // Poll `ready()` future; should be Pending while backpressure is active
         let mut ready = writer.ready();
-
         use futures::task::noop_waker_ref;
         use futures::task::{Context, Poll};
         use std::pin::Pin;
-
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
         let mut pinned = Pin::new(&mut ready);
-
         assert!(
             matches!(pinned.as_mut().poll(&mut cx), Poll::Pending),
             "ready() must be Pending when backpressure"
         );
 
-        // Notify sink to unblock first write
-        notify.notify_one();
-
-        // Await completion of first write
+        // Notify sink to unblock and process writes
+        notify.notify_waiters(); // Unblock first write
         let _ = write1.await.expect("first write");
 
-        // Await completion of second write (which was queued)
-        notify.notify_one();
+        notify.notify_waiters(); // Unblock second write  
         let _ = write2.await.expect("second write");
+
+        notify.notify_waiters(); // Unblock third write
+        let _ = write3.await.expect("third write");
 
         // Now backpressure should clear
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
         assert!(
             !stream
                 .backpressure
@@ -2415,7 +2297,6 @@ mod tests {
             "ready() future must resolve Ok() after backpressure clears"
         );
     }
-
     #[derive(Clone, Default)]
     struct DummySink;
 
@@ -2698,7 +2579,7 @@ mod tests {
         }
 
         let (sink, notify) = SlowSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(2));
+        let strategy = Box::new(CountQueuingStrategy::new(1));
         //let stream = WritableStream::new(sink, strategy);
         let stream = WritableStream::new_with_spawn(sink, strategy, |future| {
             tokio::spawn(future);
@@ -2730,7 +2611,7 @@ mod tests {
                 panic!("Timeout waiting for backpressure to become true!");
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            println!("Atomic: {}", stream.backpressure.load(Ordering::SeqCst),);
+            //println!("Atomic: {}", stream.backpressure.load(Ordering::SeqCst),);
         }
 
         // Get ready future: should be pending due to backpressure
