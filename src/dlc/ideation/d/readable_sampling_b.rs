@@ -2625,4 +2625,60 @@ mod tests {
 
         reader.closed().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_start_method_error_puts_stream_in_errored_state() {
+        struct FailingStartSource;
+
+        impl super::ReadableSource<i32> for FailingStartSource {
+            fn start(
+                &mut self,
+                _controller: &mut super::ReadableStreamDefaultController<i32>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                async {
+                    Err(super::StreamError::Custom(super::ArcError::from(
+                        "Start initialization failed",
+                    )))
+                }
+            }
+
+            fn pull(
+                &mut self,
+                _controller: &mut super::ReadableStreamDefaultController<i32>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                async { Ok(()) } // This should never be called
+            }
+        }
+
+        let source = FailingStartSource;
+        let stream = super::ReadableStream::new_default(source, None);
+        let (_locked_stream, reader) = stream.get_reader();
+
+        // Give the stream task a moment to call start() and fail
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Reading should immediately return the start error
+        let read_result = reader.read().await;
+        assert!(read_result.is_err());
+
+        if let Err(super::StreamError::Custom(err)) = read_result {
+            assert_eq!(err.to_string(), "Start initialization failed");
+        } else {
+            panic!("Expected Custom error from start failure");
+        }
+
+        // Subsequent reads should also error
+        let read_result2 = reader.read().await;
+        assert!(read_result2.is_err());
+
+        // The closed() method should also return the error (not Ok)
+        let closed_result = reader.closed().await;
+        assert!(closed_result.is_err());
+
+        if let Err(super::StreamError::Custom(err)) = closed_result {
+            assert_eq!(err.to_string(), "Start initialization failed");
+        } else {
+            panic!("Expected Custom error from start failure");
+        }
+    }
 }
