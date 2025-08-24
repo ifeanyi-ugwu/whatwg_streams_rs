@@ -1168,6 +1168,38 @@ async fn readable_stream_task<T, Source>(
     T: Send + 'static,
     Source: ReadableSource<T> + Send + 'static,
 {
+    // Call start() first before processing any commands
+    if let Some(mut source) = inner.source.take() {
+        let mut controller = ReadableStreamDefaultController::new(
+            ctrl_tx.clone(),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+        );
+
+        match source.start(&mut controller).await {
+            Ok(()) => {
+                // Start succeeded, put source back and continue
+                inner.source = Some(source);
+            }
+            Err(err) => {
+                // Start failed, error the stream immediately
+                inner.state = StreamState::Errored;
+                errored.store(true, Ordering::SeqCst);
+                inner.stored_error = Some(err.clone());
+                if let Ok(mut guard) = stored_error.write() {
+                    *guard = Some(err.clone());
+                }
+                desired_size.store(0, Ordering::SeqCst);
+                inner.closed_wakers.wake_all();
+                inner.ready_wakers.wake_all();
+                // Don't return here - we still need to handle any pending commands
+            }
+        }
+    }
+
     let mut pull_future: Option<Pin<Box<dyn Future<Output = (Source, StreamResult<()>)> + Send>>> =
         None;
     let mut cancel_future: Option<Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>> = None;
@@ -1401,6 +1433,38 @@ async fn readable_byte_stream_task<Source>(
 ) where
     Source: ReadableByteSource + Send + 'static,
 {
+    // Call start() first before processing any commands
+    if let Some(mut source) = inner.source.take() {
+        let mut controller = ReadableByteStreamController::new(
+            ctrl_tx.clone(),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+        );
+
+        match source.start(&mut controller).await {
+            Ok(()) => {
+                // Start succeeded, put source back and continue
+                inner.source = Some(source);
+            }
+            Err(err) => {
+                // Start failed, error the stream immediately
+                inner.state = StreamState::Errored;
+                errored.store(true, Ordering::SeqCst);
+                inner.stored_error = Some(err.clone());
+                if let Ok(mut guard) = stored_error.write() {
+                    *guard = Some(err.clone());
+                }
+                desired_size.store(0, Ordering::SeqCst);
+                inner.closed_wakers.wake_all();
+                inner.ready_wakers.wake_all();
+                // Don't return here - we still need to handle any pending commands
+            }
+        }
+    }
+
     let mut pull_future: Option<
         Pin<Box<dyn Future<Output = (Source, StreamResult<usize>, Vec<u8>)> + Send>>,
     > = None;
@@ -2506,5 +2570,59 @@ mod tests {
         }
 
         assert_eq!(actual_sum, expected_sum);
+    }
+
+    #[tokio::test]
+    async fn test_push_based_stream() {
+        use std::sync::{Arc, Mutex};
+
+        struct PushStartSource {
+            data: Vec<i32>,
+            enqueued: Arc<Mutex<bool>>,
+        }
+
+        impl super::ReadableSource<i32> for PushStartSource {
+            fn start(
+                &mut self,
+                controller: &mut super::ReadableStreamDefaultController<i32>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let enqueued = self.enqueued.clone();
+                let data = self.data.clone();
+
+                async move {
+                    let mut enq_lock = enqueued.lock().unwrap();
+                    if !*enq_lock {
+                        for item in data {
+                            controller.enqueue(item)?;
+                        }
+                        controller.close()?;
+                        *enq_lock = true;
+                    }
+                    Ok(())
+                }
+            }
+
+            fn pull(
+                &mut self,
+                _controller: &mut super::ReadableStreamDefaultController<i32>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                async { Ok(()) }
+            }
+        }
+
+        let source = PushStartSource {
+            data: vec![10, 20, 30],
+            enqueued: Arc::new(Mutex::new(false)),
+        };
+
+        let stream = super::ReadableStream::new_default(source, None);
+        let (_locked_stream, reader) = stream.get_reader();
+
+        assert_eq!(reader.read().await.unwrap(), Some(10));
+        assert_eq!(reader.read().await.unwrap(), Some(20));
+        assert_eq!(reader.read().await.unwrap(), Some(30));
+        assert_eq!(reader.read().await.unwrap(), None);
+
+        reader.closed().await.unwrap();
     }
 }
