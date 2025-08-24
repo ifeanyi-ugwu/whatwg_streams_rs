@@ -1402,7 +1402,7 @@ async fn readable_byte_stream_task<Source>(
     Source: ReadableByteSource + Send + 'static,
 {
     let mut pull_future: Option<
-        Pin<Box<dyn Future<Output = (Source, StreamResult<usize>)> + Send>>,
+        Pin<Box<dyn Future<Output = (Source, StreamResult<usize>, Vec<u8>)> + Send>>,
     > = None;
     let mut cancel_future: Option<Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>> = None;
 
@@ -1639,20 +1639,20 @@ async fn readable_byte_stream_task<Source>(
         {
             if let Some(source) = inner.source.take() {
                 inner.pulling = true;
+
                 let ctrl_tx_clone = ctrl_tx.clone();
-
-                // For byte streams, we need to provide a buffer for the pull operation
-                let buffer_size = if let Some((buffer, _)) = inner.pending_read_intos.front() {
-                    buffer.len()
-                } else {
-                    8192 // Default buffer size
-                };
-
                 let queue_total_size_clone = Arc::clone(&queue_total_size);
                 let high_water_mark_clone = Arc::clone(&high_water_mark);
                 let desired_size_clone = Arc::clone(&desired_size);
                 let closed_clone = Arc::clone(&closed);
                 let errored_clone = Arc::clone(&errored);
+
+                // Use a fresh buffer inside the async block
+                let buffer_size = if let Some((buffer, _)) = inner.pending_read_intos.front() {
+                    buffer.len()
+                } else {
+                    8192
+                };
 
                 pull_future = Some(Box::pin(async move {
                     let mut source = source;
@@ -1664,9 +1664,10 @@ async fn readable_byte_stream_task<Source>(
                         closed_clone,
                         errored_clone,
                     );
+
                     let mut buffer = vec![0u8; buffer_size];
                     let result = source.pull(&mut controller, &mut buffer).await;
-                    (source, result)
+                    (source, result, buffer)
                 }));
             }
         }
@@ -1674,11 +1675,51 @@ async fn readable_byte_stream_task<Source>(
         // Poll pull future if in progress
         if let Some(ref mut fut) = pull_future {
             match fut.as_mut().poll(cx) {
-                Poll::Ready((source, result)) => {
+                Poll::Ready((source, result, buffer)) => {
                     inner.pulling = false;
+                    inner.source = Some(source);
+
                     match result {
-                        Ok(_bytes_read) => {
-                            inner.source = Some(source);
+                        Ok(bytes_read) => {
+                            if bytes_read > 0 {
+                                if let Some((mut consumer_buffer, tx)) =
+                                    inner.pending_read_intos.pop_front()
+                                {
+                                    let to_copy = std::cmp::min(bytes_read, consumer_buffer.len());
+                                    consumer_buffer[..to_copy].copy_from_slice(&buffer[..to_copy]);
+                                    let _ = tx.send(Ok(to_copy));
+
+                                    if bytes_read > to_copy {
+                                        let remaining = buffer[to_copy..bytes_read].to_vec();
+                                        let chunk_size = inner.strategy.size(&remaining);
+                                        inner.queue.push_back(remaining);
+                                        inner.queue_total_size += chunk_size;
+                                        queue_total_size
+                                            .store(inner.queue_total_size, Ordering::SeqCst);
+                                    }
+                                } else {
+                                    let mut buf = buffer;
+                                    buf.truncate(bytes_read);
+
+                                    if let Some(tx) = inner.pending_reads.pop_front() {
+                                        let _ = tx.send(Ok(Some(buf)));
+                                    } else {
+                                        let chunk_size = inner.strategy.size(&buf);
+                                        inner.queue.push_back(buf);
+                                        inner.queue_total_size += chunk_size;
+                                        queue_total_size
+                                            .store(inner.queue_total_size, Ordering::SeqCst);
+                                    }
+                                }
+                                update_desired_size(
+                                    &queue_total_size,
+                                    &high_water_mark,
+                                    &desired_size,
+                                    &closed,
+                                    &errored,
+                                );
+                                inner.ready_wakers.wake_all();
+                            }
                         }
                         Err(err) => {
                             inner.state = StreamState::Errored;
@@ -1783,11 +1824,18 @@ mod tests_old {
                     return Ok(0);
                 }
 
-                let chunk_size = std::cmp::min(buffer.len(), self.data.len() - self.pos);
+                /*let chunk_size = std::cmp::min(buffer.len(), self.data.len() - self.pos);
                 let chunk = self.data[self.pos..self.pos + chunk_size].to_vec();
                 self.pos += chunk_size;
 
                 controller.enqueue(chunk)?;
+                //Ok(chunk_size)
+                Ok(0)*/
+                let chunk_size = std::cmp::min(buffer.len(), self.data.len() - self.pos);
+                let slice = &self.data[self.pos..self.pos + chunk_size];
+                buffer[..chunk_size].copy_from_slice(slice);
+                self.pos += chunk_size;
+
                 Ok(chunk_size)
             }
         }
@@ -1801,14 +1849,20 @@ mod tests_old {
         let (_locked_stream, reader) = stream.get_reader();
 
         // Read data
-        if let Some(chunk) = reader.read().await.unwrap() {
+        /*if let Some(chunk) = reader.read().await.unwrap() {
             assert_eq!(chunk, b"hello world".to_vec());
         } else {
             panic!("Expected data chunk");
+        }*/
+        let mut result = Vec::new();
+        while let Some(chunk) = reader.read().await.unwrap() {
+            result.extend_from_slice(&chunk);
         }
 
+        assert_eq!(result, b"hello world");
+
         // Should be closed now
-        assert_eq!(reader.read().await.unwrap(), None);
+        assert_eq!(reader.read().await.unwrap(), None, "Should be closed");
     }
 
     // Test 5: BYOB reader functionality
@@ -1831,11 +1885,11 @@ mod tests_old {
                 }
 
                 /*let chunk = self.chunks[self.current].clone();
-                let len = chunk.len();
+                let _len = chunk.len();
                 self.current += 1;
 
                 controller.enqueue(chunk)?;
-                Ok(len)*/
+                Ok(0)*/
                 let chunk = &self.chunks[self.current];
                 let len = chunk.len();
                 let bytes_to_copy = std::cmp::min(len, buffer.len());
@@ -2246,7 +2300,7 @@ mod tests {
                 *self.index.borrow_mut() = idx + 1;
 
                 controller.enqueue(chunk)?;
-                Ok(len)
+                Ok(0)
             }
         }
 
@@ -2285,11 +2339,11 @@ mod tests {
                 }
 
                 let chunk = self.data.clone();
-                let len = chunk.len();
+                let _len = chunk.len();
                 *self.consumed.borrow_mut() = true;
 
                 controller.enqueue(chunk)?;
-                Ok(len)
+                Ok(0)
             }
         }
 
