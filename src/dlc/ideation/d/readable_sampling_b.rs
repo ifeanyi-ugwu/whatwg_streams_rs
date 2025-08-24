@@ -1,17 +1,19 @@
-use super::{CountQueuingStrategy, QueuingStrategy};
+use super::{
+    CountQueuingStrategy, QueuingStrategy,
+    errors::{ArcError, StreamError},
+    writable_new::{WritableSink, WritableStream},
+};
 use futures::{
     channel::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
         oneshot,
     },
-    future::poll_fn,
+    future::{AbortRegistration, Abortable, Aborted, poll_fn},
     io::AsyncRead,
     stream::{Stream, StreamExt},
 };
 use std::{
     collections::VecDeque,
-    error::Error,
-    fmt,
     future::Future,
     io::{Error as IoError, ErrorKind, Result as IoResult},
     marker::PhantomData,
@@ -23,84 +25,6 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-// ----------- Error Types -----------
-#[derive(Clone)]
-pub struct ArcError(Arc<dyn Error + Send + Sync>);
-
-impl fmt::Debug for ArcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
-    }
-}
-
-impl fmt::Display for ArcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl Error for ArcError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl From<&str> for ArcError {
-    fn from(s: &str) -> Self {
-        #[derive(Debug)]
-        struct SimpleError(String);
-        impl fmt::Display for SimpleError {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-        impl Error for SimpleError {}
-        ArcError(Arc::new(SimpleError(s.to_string())))
-    }
-}
-
-impl From<String> for ArcError {
-    fn from(s: String) -> Self {
-        ArcError::from(s.as_str())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum StreamError {
-    Canceled,
-    Aborted(Option<String>),
-    Closing,
-    Closed,
-    Custom(ArcError),
-}
-
-impl<E> From<E> for StreamError
-where
-    E: Error + Send + Sync + 'static,
-{
-    fn from(e: E) -> Self {
-        StreamError::Custom(ArcError(Arc::new(e)))
-    }
-}
-
-impl fmt::Display for StreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StreamError::Canceled => write!(f, "Stream operation was canceled"),
-            StreamError::Aborted(reason) => {
-                if let Some(reason) = reason {
-                    write!(f, "Stream was aborted: {}", reason)
-                } else {
-                    write!(f, "Stream was aborted")
-                }
-            }
-            StreamError::Closing => write!(f, "Stream is closing"),
-            StreamError::Closed => write!(f, "Stream is closed"),
-            StreamError::Custom(err) => write!(f, "{}", err),
-        }
-    }
-}
-
 type StreamResult<T> = Result<T, StreamError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,16 +35,8 @@ pub enum StreamState {
 }
 
 // ----------- Placeholder types  -----------
-pub struct WritableStream<T> {
-    _phantom: PhantomData<T>,
-}
-
 pub struct TransformStream<I, O> {
     _phantom: PhantomData<(I, O)>,
-}
-
-pub struct AbortSignal {
-    // Implementation details would go here
 }
 
 // ----------- Stream Type Markers -----------
@@ -509,12 +425,60 @@ where
         todo!("pipe_through implementation")
     }
 
-    pub async fn pipe_to<W>(
-        &self,
-        _destination: &WritableStream<T>,
-        _options: Option<StreamPipeOptions>,
-    ) -> StreamResult<()> {
-        todo!("pipe_to implementation")
+    pub async fn pipe_to<Sink>(
+        self,
+        destination: &WritableStream<T, Sink>,
+        options: Option<StreamPipeOptions>,
+    ) -> StreamResult<()>
+    where
+        Sink: WritableSink<T> + Send + 'static,
+    {
+        let options = options.unwrap_or_default();
+        let (_stream, reader) = self.get_reader();
+        let (_, writer) = destination.get_writer()?;
+
+        let pipe_loop = async {
+            loop {
+                match reader.read().await {
+                    Ok(Some(chunk)) => {
+                        writer.write(chunk).await?;
+                    }
+                    Ok(None) => return Ok(()), // source closed
+                    Err(err) => return Err(err),
+                }
+            }
+        };
+
+        // Run with abort support if provided
+        let result = if let Some(reg) = options.signal {
+            match Abortable::new(pipe_loop, reg).await {
+                Ok(inner) => inner,
+                Err(Aborted) => Err(StreamError::Aborted(Some("Pipe operation aborted".into()))),
+            }
+        } else {
+            pipe_loop.await
+        };
+
+        // Cleanup based on outcome
+        match result {
+            Ok(()) => {
+                if !options.prevent_close {
+                    if let Err(close_error) = writer.close().await {
+                        return Err(close_error);
+                    }
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if !options.prevent_abort {
+                    let _ = writer.abort(Some(err.to_string())).await;
+                }
+                if !options.prevent_cancel {
+                    let _ = reader.cancel(Some(err.to_string())).await;
+                }
+                Err(err)
+            }
+        }
     }
 
     pub fn tee(
@@ -532,7 +496,7 @@ pub struct StreamPipeOptions {
     pub prevent_close: bool,
     pub prevent_abort: bool,
     pub prevent_cancel: bool,
-    pub signal: Option<AbortSignal>,
+    pub signal: Option<AbortRegistration>,
 }
 
 // ----------- Constructor Implementation  -----------
@@ -2680,5 +2644,59 @@ mod tests {
         } else {
             panic!("Expected Custom error from start failure");
         }
+    }
+
+    #[tokio::test]
+    async fn test_basic_pipe_to() {
+        use std::sync::{Arc, Mutex};
+
+        // CountingSink will just count how many chunks are written
+        #[derive(Clone)]
+        struct CountingSink {
+            written: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+
+        impl CountingSink {
+            fn new() -> Self {
+                Self {
+                    written: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+            fn get_written(&self) -> Vec<Vec<u8>> {
+                self.written.lock().unwrap().clone()
+            }
+        }
+
+        impl super::WritableSink<Vec<u8>> for CountingSink {
+            fn write(
+                &mut self,
+                chunk: Vec<u8>,
+                _controller: &mut crate::dlc::ideation::d::writable_new::WritableStreamDefaultController,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let written = self.written.clone();
+                async move {
+                    written.lock().unwrap().push(chunk);
+                    Ok(())
+                }
+            }
+        }
+
+        // Create a readable that yields three chunks
+        let data = vec![vec![1u8, 2, 3], vec![4u8, 5], vec![6u8]];
+        let readable = super::ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        // Create a writable sink that records chunks
+        let sink = CountingSink::new();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(crate::dlc::ideation::d::CountQueuingStrategy::new(10)),
+        );
+
+        // Pipe the readable into the writable
+        readable.pipe_to(&writable, None).await.expect("pipe_to");
+
+        // Verify sink received all chunks in order
+        let written = sink.get_written();
+        assert_eq!(written, data);
     }
 }
