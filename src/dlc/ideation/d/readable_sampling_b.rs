@@ -439,26 +439,21 @@ where
 
         let pipe_loop = async {
             loop {
+                // Wait until the writer is ready before pulling from the reader
+                if let Err(write_err) = writer.ready().await {
+                    // Destination error - cancel source if allowed
+                    if !options.prevent_cancel {
+                        if let Err(cancel_err) = reader.cancel(Some(write_err.to_string())).await {
+                            return Err(cancel_err);
+                        }
+                    }
+                    return Err(write_err);
+                }
+
                 match reader.read().await {
                     Ok(Some(chunk)) => {
-                        // Try to write the chunk
-                        match writer.ready().await {
-                            Ok(()) => {
-                                writer.write(chunk);
-                                continue;
-                            }
-                            Err(write_err) => {
-                                // Destination error - cancel source if allowed
-                                if !options.prevent_cancel {
-                                    if let Err(cancel_err) =
-                                        reader.cancel(Some(write_err.to_string())).await
-                                    {
-                                        return Err(cancel_err);
-                                    };
-                                }
-                                return Err(write_err);
-                            }
-                        }
+                        // Write the chunk (we know writer is ready at this point)
+                        writer.write(chunk);
                     }
                     Ok(None) => {
                         // Source completed normally - close destination if allowed
@@ -472,7 +467,7 @@ where
                         if !options.prevent_abort {
                             if let Err(abort_err) = writer.abort(Some(read_err.to_string())).await {
                                 return Err(abort_err);
-                            };
+                            }
                         }
                         return Err(read_err);
                     }
