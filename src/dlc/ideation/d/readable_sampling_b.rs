@@ -441,47 +441,59 @@ where
             loop {
                 match reader.read().await {
                     Ok(Some(chunk)) => {
-                        writer.write(chunk).await?;
+                        // Try to write the chunk
+                        match writer.write(chunk).await {
+                            Ok(()) => continue,
+                            Err(write_err) => {
+                                // Destination error - cancel source if allowed
+                                if !options.prevent_cancel {
+                                    if let Err(cancel_err) =
+                                        reader.cancel(Some(write_err.to_string())).await
+                                    {
+                                        return Err(cancel_err);
+                                    };
+                                }
+                                return Err(write_err);
+                            }
+                        }
                     }
-                    Ok(None) => return Ok(()), // source closed
-                    Err(err) => return Err(err),
+                    Ok(None) => {
+                        // Source completed normally - close destination if allowed
+                        if !options.prevent_close {
+                            writer.close().await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(read_err) => {
+                        // Source error - abort destination if allowed
+                        if !options.prevent_abort {
+                            if let Err(abort_err) = writer.abort(Some(read_err.to_string())).await {
+                                return Err(abort_err);
+                            };
+                        }
+                        return Err(read_err);
+                    }
                 }
             }
         };
 
         // Run with abort support if provided
-        let result = if let Some(reg) = options.signal {
+        if let Some(reg) = options.signal {
             match Abortable::new(pipe_loop, reg).await {
-                Ok(inner) => inner,
-                Err(Aborted) => Err(StreamError::Aborted(Some("Pipe operation aborted".into()))),
+                Ok(result) => result,
+                Err(Aborted) => {
+                    // Handle abort signal - cancel source and abort destination
+                    if !options.prevent_cancel {
+                        let _ = reader.cancel(Some("Aborted".to_string())).await;
+                    }
+                    if !options.prevent_abort {
+                        let _ = writer.abort(Some("Aborted".to_string())).await;
+                    }
+                    Err(StreamError::Aborted(Some("Pipe operation aborted".into())))
+                }
             }
         } else {
             pipe_loop.await
-        };
-
-        // Cleanup based on outcome
-        match result {
-            Ok(()) => {
-                if !options.prevent_close {
-                    if let Err(close_error) = writer.close().await {
-                        return Err(close_error);
-                    }
-                }
-                Ok(())
-            }
-            Err(err) => {
-                if !options.prevent_abort {
-                    if let Err(abort_err) = writer.abort(Some(err.to_string())).await {
-                        return Err(abort_err);
-                    }
-                }
-                if !options.prevent_cancel {
-                    if let Err(cancel_err) = reader.cancel(Some(err.to_string())).await {
-                        return Err(cancel_err);
-                    }
-                }
-                Err(err)
-            }
         }
     }
 
