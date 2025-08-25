@@ -442,8 +442,11 @@ where
                 match reader.read().await {
                     Ok(Some(chunk)) => {
                         // Try to write the chunk
-                        match writer.write(chunk).await {
-                            Ok(()) => continue,
+                        match writer.ready().await {
+                            Ok(()) => {
+                                writer.write(chunk);
+                                continue;
+                            }
                             Err(write_err) => {
                                 // Destination error - cancel source if allowed
                                 if !options.prevent_cancel {
