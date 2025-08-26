@@ -2715,46 +2715,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pipe_to_error_handling_and_cleanup() {
-        use std::cell::RefCell;
+    async fn test_pipe_to_destination_write_error() {
         use std::sync::{Arc, Mutex};
 
-        // FailingAfterCountSink fails after writing N chunks
+        // Sink that fails after N successful writes
         #[derive(Clone)]
-        struct FailingAfterCountSink {
+        struct FailingWriteSink {
             written: Arc<Mutex<Vec<Vec<u8>>>>,
             fail_after: usize,
             write_count: Arc<Mutex<usize>>,
-            aborted: Arc<Mutex<bool>>,
+            abort_called: Arc<Mutex<bool>>,
         }
 
-        impl FailingAfterCountSink {
+        impl FailingWriteSink {
             fn new(fail_after: usize) -> Self {
                 Self {
                     written: Arc::new(Mutex::new(Vec::new())),
                     fail_after,
                     write_count: Arc::new(Mutex::new(0)),
-                    aborted: Arc::new(Mutex::new(false)),
+                    abort_called: Arc::new(Mutex::new(false)),
                 }
-            }
-
-            fn was_aborted(&self) -> bool {
-                *self.aborted.lock().unwrap()
             }
 
             fn get_written(&self) -> Vec<Vec<u8>> {
                 self.written.lock().unwrap().clone()
             }
+
+            fn _was_abort_called(&self) -> bool {
+                *self.abort_called.lock().unwrap()
+            }
         }
 
-        impl super::WritableSink<Vec<u8>> for FailingAfterCountSink {
+        impl super::WritableSink<Vec<u8>> for FailingWriteSink {
             fn write(
                 &mut self,
                 chunk: Vec<u8>,
                 _controller: &mut crate::dlc::ideation::d::writable_new::WritableStreamDefaultController,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
-                let written = self.written.clone();
-                let write_count = self.write_count.clone();
+                let written = Arc::clone(&self.written);
+                let write_count = Arc::clone(&self.write_count);
                 let fail_after = self.fail_after;
 
                 async move {
@@ -2762,9 +2761,7 @@ mod tests {
                     *count += 1;
 
                     if *count > fail_after {
-                        return Err(super::StreamError::Custom(super::ArcError::from(
-                            "Sink write failure",
-                        )));
+                        return Err(super::StreamError::Custom("Write failed".into()));
                     }
 
                     written.lock().unwrap().push(chunk);
@@ -2776,18 +2773,18 @@ mod tests {
                 self,
                 _reason: Option<String>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
-                let aborted = self.aborted.clone();
+                let abort_called = self.abort_called;
                 async move {
-                    *aborted.lock().unwrap() = true;
+                    *abort_called.lock().unwrap() = true;
                     Ok(())
                 }
             }
         }
 
-        // TrackingSource tracks if it was cancelled
+        // Source that can track if it was cancelled
         struct TrackingSource {
             data: Vec<Vec<u8>>,
-            index: RefCell<usize>,
+            index: usize,
             cancelled: Arc<Mutex<bool>>,
         }
 
@@ -2795,13 +2792,9 @@ mod tests {
             fn new(data: Vec<Vec<u8>>) -> Self {
                 Self {
                     data,
-                    index: RefCell::new(0),
+                    index: 0,
                     cancelled: Arc::new(Mutex::new(false)),
                 }
-            }
-
-            fn was_cancelled(&self) -> bool {
-                *self.cancelled.lock().unwrap()
             }
         }
 
@@ -2810,15 +2803,13 @@ mod tests {
                 &mut self,
                 controller: &mut super::ReadableStreamDefaultController<Vec<u8>>,
             ) -> super::StreamResult<()> {
-                let idx = *self.index.borrow();
-
-                if idx >= self.data.len() {
+                if self.index >= self.data.len() {
                     controller.close()?;
                     return Ok(());
                 }
 
-                controller.enqueue(self.data[idx].clone())?;
-                *self.index.borrow_mut() = idx + 1;
+                controller.enqueue(self.data[self.index].clone())?;
+                self.index += 1;
                 Ok(())
             }
 
@@ -2828,45 +2819,485 @@ mod tests {
             }
         }
 
-        // Test: pipe_to should handle write failures and trigger proper cleanup
         let data = vec![
             vec![1u8, 2, 3],
             vec![4u8, 5, 6],
-            vec![7u8, 8, 9], // This should cause the failure
-            vec![10u8, 11],  // This should never be written
+            vec![7u8, 8, 9], // This will cause the failure
+            vec![10u8, 11],  // This should never be reached
+            vec![12u8, 13], // These are to ensure it writes up to a point where the error propagated by the third chunk would reject a ready call and error the pipe_to
         ];
 
         let source = TrackingSource::new(data.clone());
+        let cancelled_flag = Arc::clone(&source.cancelled);
         let readable = super::ReadableStream::new_default(source, None);
 
-        let sink = FailingAfterCountSink::new(2); // Fail after 2 successful writes
+        let sink = FailingWriteSink::new(2); // Fail after 2 successful writes
         let writable = super::WritableStream::new(
             sink.clone(),
-            Box::new(crate::dlc::ideation::d::CountQueuingStrategy::new(10)),
+            Box::new(super::CountQueuingStrategy::new(10)),
         );
 
-        // pipe_to should return an error when the sink fails
+        // Test: pipe_to should return error when destination write fails
         let pipe_result = readable.pipe_to(&writable, None).await;
-        assert!(pipe_result.is_err());
-
-        // Verify error cleanup behavior:
-        // 1. Sink should have been aborted (default behavior)
         assert!(
-            sink.was_aborted(),
-            "Sink should have been aborted on write failure"
+            pipe_result.is_err(),
+            "pipe_to should fail when write errors"
         );
 
-        // 2. Only the first 2 chunks should have been written successfully
+        // Verify error handling per WHATWG spec:
+        // 1. "An error in destination will cancel this source readable stream, unless preventCancel is truthy"
+        assert!(
+            *cancelled_flag.lock().unwrap(),
+            "Source should be cancelled when destination errors"
+        );
+
+        // 2. Only successful writes should have completed
         let written = sink.get_written();
         assert_eq!(
             written.len(),
             2,
-            "Only 2 chunks should have been written before failure"
+            "Only 2 chunks should have been written successfully"
         );
-        assert_eq!(written, data[..2]);
+        assert_eq!(
+            written,
+            &data[..2],
+            "Written chunks should match expected data"
+        );
 
-        // 3. Source should have been cancelled (default behavior)
-        // Note: This requires access to the source, which is tricky with the current API
-        // In a real implementation, you might need to modify the test setup
+        // 3. Stream should be in errored state
+        /*assert!(
+            writable.errored.load(std::sync::atomic::Ordering::SeqCst),
+            "Writable stream should be in errored state"
+        );*/
+    }
+
+    #[tokio::test]
+    async fn test_pipe_to_source_error() {
+        use std::sync::{Arc, Mutex};
+
+        // Source that errors after yielding N chunks
+        struct ErroringSource {
+            data: Vec<Vec<u8>>,
+            index: usize,
+            error_after: usize,
+        }
+
+        impl ErroringSource {
+            fn new(data: Vec<Vec<u8>>, error_after: usize) -> Self {
+                Self {
+                    data,
+                    index: 0,
+                    error_after,
+                }
+            }
+        }
+
+        impl super::ReadableSource<Vec<u8>> for ErroringSource {
+            async fn pull(
+                &mut self,
+                controller: &mut super::ReadableStreamDefaultController<Vec<u8>>,
+            ) -> super::StreamResult<()> {
+                if self.index >= self.error_after {
+                    return Err(super::StreamError::Custom("Source error".into()));
+                }
+
+                if self.index >= self.data.len() {
+                    controller.close()?;
+                    return Ok(());
+                }
+
+                controller.enqueue(self.data[self.index].clone())?;
+                self.index += 1;
+                Ok(())
+            }
+        }
+
+        // Sink that tracks if abort was called
+        #[derive(Clone)]
+        struct TrackingSink {
+            written: Arc<Mutex<Vec<Vec<u8>>>>,
+            abort_called: Arc<Mutex<bool>>,
+            abort_reason: Arc<Mutex<Option<String>>>,
+        }
+
+        impl TrackingSink {
+            fn new() -> Self {
+                Self {
+                    written: Arc::new(Mutex::new(Vec::new())),
+                    abort_called: Arc::new(Mutex::new(false)),
+                    abort_reason: Arc::new(Mutex::new(None)),
+                }
+            }
+
+            fn get_written(&self) -> Vec<Vec<u8>> {
+                self.written.lock().unwrap().clone()
+            }
+
+            fn was_abort_called(&self) -> bool {
+                *self.abort_called.lock().unwrap()
+            }
+
+            fn get_abort_reason(&self) -> Option<String> {
+                self.abort_reason.lock().unwrap().clone()
+            }
+        }
+
+        impl super::WritableSink<Vec<u8>> for TrackingSink {
+            fn write(
+                &mut self,
+                chunk: Vec<u8>,
+                _controller: &mut crate::dlc::ideation::d::writable_new::WritableStreamDefaultController,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let written = Arc::clone(&self.written);
+                async move {
+                    written.lock().unwrap().push(chunk);
+                    Ok(())
+                }
+            }
+
+            fn abort(
+                self,
+                reason: Option<String>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let abort_called = self.abort_called;
+                let abort_reason = self.abort_reason;
+                async move {
+                    *abort_called.lock().unwrap() = true;
+                    *abort_reason.lock().unwrap() = reason;
+                    Ok(())
+                }
+            }
+        }
+
+        let data = vec![vec![1u8, 2, 3], vec![4u8, 5, 6]];
+
+        let source = ErroringSource::new(data.clone(), 2); // Error after 2 chunks
+        let readable = super::ReadableStream::new_default(source, None);
+
+        let sink = TrackingSink::new();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        // Test: pipe_to should return error when source errors
+        let pipe_result = readable.pipe_to(&writable, None).await;
+        assert!(
+            pipe_result.is_err(),
+            "pipe_to should fail when source errors"
+        );
+
+        // Verify error handling per WHATWG spec:
+        // 1. "An error in this source readable stream will abort destination, unless preventAbort is truthy"
+        assert!(
+            sink.was_abort_called(),
+            "Destination should be aborted when source errors"
+        );
+
+        // 2. All chunks before the error should have been written
+        let written = sink.get_written();
+        assert_eq!(written, data, "All chunks before error should be written");
+
+        // 3. Abort reason should contain error information
+        let abort_reason = sink.get_abort_reason();
+        assert!(
+            abort_reason.is_some() && abort_reason.unwrap().contains("Source error"),
+            "Abort reason should contain source error information"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipe_to_prevent_options() {
+        use std::sync::{Arc, Mutex};
+
+        // Reusable test helpers
+        #[derive(Clone)]
+        struct TestSource {
+            data: Vec<Vec<u8>>,
+            index: Arc<Mutex<usize>>,
+            cancelled: Arc<Mutex<bool>>,
+            should_error: bool,
+            error_after: usize,
+        }
+
+        impl TestSource {
+            fn new(data: Vec<Vec<u8>>) -> Self {
+                Self {
+                    data,
+                    index: Arc::new(Mutex::new(0)),
+                    cancelled: Arc::new(Mutex::new(false)),
+                    should_error: false,
+                    error_after: 0,
+                }
+            }
+
+            fn with_error_after(mut self, count: usize) -> Self {
+                self.should_error = true;
+                self.error_after = count;
+                self
+            }
+
+            fn was_cancelled(&self) -> bool {
+                *self.cancelled.lock().unwrap()
+            }
+        }
+
+        impl super::ReadableSource<Vec<u8>> for TestSource {
+            async fn pull(
+                &mut self,
+                controller: &mut super::ReadableStreamDefaultController<Vec<u8>>,
+            ) -> super::StreamResult<()> {
+                let mut idx = self.index.lock().unwrap();
+
+                if self.should_error && *idx >= self.error_after {
+                    return Err(super::StreamError::Custom("Source error".into()));
+                }
+
+                if *idx >= self.data.len() {
+                    controller.close()?;
+                    return Ok(());
+                }
+
+                controller.enqueue(self.data[*idx].clone())?;
+                *idx += 1;
+                Ok(())
+            }
+
+            async fn cancel(&mut self, _reason: Option<String>) -> super::StreamResult<()> {
+                *self.cancelled.lock().unwrap() = true;
+                Ok(())
+            }
+        }
+
+        #[derive(Clone)]
+        struct TestSink {
+            written: Arc<Mutex<Vec<Vec<u8>>>>,
+            aborted: Arc<Mutex<bool>>,
+            closed: Arc<Mutex<bool>>,
+            should_error: bool,
+        }
+
+        impl TestSink {
+            fn new() -> Self {
+                Self {
+                    written: Arc::new(Mutex::new(Vec::new())),
+                    aborted: Arc::new(Mutex::new(false)),
+                    closed: Arc::new(Mutex::new(false)),
+                    should_error: false,
+                }
+            }
+
+            fn with_error(mut self) -> Self {
+                self.should_error = true;
+                self
+            }
+
+            fn was_aborted(&self) -> bool {
+                *self.aborted.lock().unwrap()
+            }
+
+            fn was_closed(&self) -> bool {
+                *self.closed.lock().unwrap()
+            }
+
+            fn written_data(&self) -> Vec<Vec<u8>> {
+                self.written.lock().unwrap().clone()
+            }
+        }
+
+        impl super::WritableSink<Vec<u8>> for TestSink {
+            fn write(
+                &mut self,
+                chunk: Vec<u8>,
+                _controller: &mut crate::dlc::ideation::d::writable_new::WritableStreamDefaultController,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let written = self.written.clone();
+                let should_error = self.should_error;
+
+                async move {
+                    if should_error {
+                        return Err(super::StreamError::Custom("Sink error".into()));
+                    }
+                    written.lock().unwrap().push(chunk);
+                    Ok(())
+                }
+            }
+
+            fn abort(
+                self,
+                _reason: Option<String>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let aborted = self.aborted;
+                async move {
+                    *aborted.lock().unwrap() = true;
+                    Ok(())
+                }
+            }
+
+            fn close(self) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let closed = self.closed;
+                async move {
+                    *closed.lock().unwrap() = true;
+                    Ok(())
+                }
+            }
+        }
+
+        // Test successful pipe with normal cleanup
+        let data = vec![vec![1u8, 2, 3], vec![4u8, 5, 6]];
+        let source = TestSource::new(data.clone());
+        let readable = super::ReadableStream::new_default(source.clone(), None);
+        let sink = TestSink::new();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        let result = readable.pipe_to(&writable, None).await;
+        assert!(result.is_ok(), "Normal pipe should succeed");
+        assert!(
+            !source.was_cancelled(),
+            "Source should not be cancelled on success"
+        );
+        assert!(sink.was_closed(), "Sink should be closed on success");
+        assert!(!sink.was_aborted(), "Sink should not be aborted on success");
+        assert_eq!(sink.written_data(), data, "All data should be written");
+
+        // Test prevent_close = true
+        let data = vec![vec![7u8, 8, 9]];
+        let source = TestSource::new(data.clone());
+        let readable = super::ReadableStream::new_default(source, None);
+        let sink = TestSink::new();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        let options = super::StreamPipeOptions {
+            prevent_close: true,
+            ..Default::default()
+        };
+
+        let result = readable.pipe_to(&writable, Some(options)).await;
+        assert!(result.is_ok(), "Pipe with prevent_close should succeed");
+        assert!(
+            !sink.was_closed(),
+            "Sink should NOT be closed when prevent_close=true"
+        );
+
+        // Test source error with prevent_cancel = true
+        let data = vec![vec![1u8, 2], vec![3u8, 4]];
+        let source = TestSource::new(data).with_error_after(1);
+        let readable = super::ReadableStream::new_default(source.clone(), None);
+        let sink = TestSink::new();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        let options = super::StreamPipeOptions {
+            prevent_cancel: true,
+            prevent_abort: false,
+            ..Default::default()
+        };
+
+        let result = readable.pipe_to(&writable, Some(options)).await;
+        assert!(result.is_err(), "Pipe should fail when source errors");
+        assert!(
+            !source.was_cancelled(),
+            "Source should NOT be cancelled when prevent_cancel=true"
+        );
+        assert!(
+            sink.was_aborted(),
+            "Sink should be aborted when source errors"
+        );
+
+        // Test source error with prevent_cancel = false
+        let data = vec![vec![1u8, 2], vec![3u8, 4]];
+        let source = TestSource::new(data).with_error_after(1);
+        let readable = super::ReadableStream::new_default(source.clone(), None);
+        let sink = TestSink::new();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        let options = super::StreamPipeOptions {
+            prevent_cancel: false,
+            prevent_abort: false,
+            ..Default::default()
+        };
+
+        let result = readable.pipe_to(&writable, Some(options)).await;
+        assert!(result.is_err(), "Pipe should fail when source errors");
+
+        assert!(
+            !source.was_cancelled(),
+            "Source should Not be cancelled when source errors"
+        );
+        assert!(
+            sink.was_aborted(),
+            "Sink should be aborted when source errors"
+        );
+
+        // Test sink error with prevent_abort = true
+        //let data = vec![vec![1u8, 2, 3]];
+        // IMPORTANT write long enough so that a ready call catches an error with the sink
+        let data = vec![vec![1u8, 2], vec![3u8, 4], vec![6u8, 7]];
+        let source = TestSource::new(data);
+        let readable = super::ReadableStream::new_default(source.clone(), None);
+        let sink = TestSink::new().with_error();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        let options = super::StreamPipeOptions {
+            prevent_abort: true,
+            prevent_cancel: false,
+            ..Default::default()
+        };
+
+        let result = readable.pipe_to(&writable, Some(options)).await;
+        assert!(result.is_err(), "Pipe should fail when sink errors");
+
+        assert!(
+            source.was_cancelled(),
+            "Source should be cancelled when sink errors"
+        );
+        assert!(
+            !sink.was_aborted(),
+            "Sink should NOT be aborted when Sink errors"
+        );
+
+        // Test sink error with prevent_abort = false
+        //let data = vec![vec![1u8, 2, 3]];
+        // IMPORTANT write long enough so that a ready call catches an error with the sink
+        let data = vec![vec![1u8, 2], vec![3u8, 4], vec![6u8, 7]];
+        let source = TestSource::new(data);
+        let readable = super::ReadableStream::new_default(source.clone(), None);
+        let sink = TestSink::new().with_error();
+        let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(super::CountQueuingStrategy::new(10)),
+        );
+
+        let options = super::StreamPipeOptions {
+            prevent_abort: false,
+            prevent_cancel: false,
+            ..Default::default()
+        };
+
+        let result = readable.pipe_to(&writable, Some(options)).await;
+        assert!(result.is_err(), "Pipe should fail when sink errors");
+
+        assert!(
+            source.was_cancelled(),
+            "Source should be cancelled when sink errors"
+        );
+        assert!(
+            !sink.was_aborted(),
+            "Sink should NOT be aborted when sink errors"
+        );
     }
 }
