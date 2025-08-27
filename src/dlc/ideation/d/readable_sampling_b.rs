@@ -425,7 +425,7 @@ where
         todo!("pipe_through implementation")
     }
 
-    pub async fn pipe_to<Sink>(
+    async fn pipe_to_inner<Sink>(
         self,
         destination: &WritableStream<T, Sink>,
         options: Option<StreamPipeOptions>,
@@ -456,6 +456,7 @@ where
                         writer.write(chunk);
                     }
                     Ok(None) => {
+                        eprintln!("source completed normally");
                         // Source completed normally - close destination if allowed
                         if !options.prevent_close {
                             writer.close().await?;
@@ -480,12 +481,17 @@ where
             match Abortable::new(pipe_loop, reg).await {
                 Ok(result) => result,
                 Err(Aborted) => {
+                    eprintln!("pipe loop aborted");
                     // Handle abort signal - cancel source and abort destination
                     if !options.prevent_cancel {
+                        eprintln!("reader cancelled started");
                         let _ = reader.cancel(Some("Aborted".to_string())).await;
+                        eprintln!("reader cancelled ended");
                     }
                     if !options.prevent_abort {
+                        eprintln!("writer aborted started");
                         let _ = writer.abort(Some("Aborted".to_string())).await;
+                        eprintln!("writer aborted ended");
                     }
                     Err(StreamError::Aborted(Some("Pipe operation aborted".into())))
                 }
@@ -495,6 +501,49 @@ where
         }
     }
 
+    pub async fn pipe_to<Sink>(
+        self,
+        destination: &WritableStream<T, Sink>,
+        options: Option<StreamPipeOptions>,
+    ) -> StreamResult<()>
+    where
+        Sink: WritableSink<T> + Send + 'static,
+    {
+        self.pipe_to_inner(destination, options).await
+    }
+
+    pub fn pipe_to_threaded<Sink>(
+        self,
+        destination: WritableStream<T, Sink>,
+        options: Option<StreamPipeOptions>,
+    ) -> std::thread::JoinHandle<StreamResult<()>>
+    where
+        Sink: WritableSink<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        std::thread::spawn(move || {
+            futures::executor::block_on(
+                async move { self.pipe_to_inner(&destination, options).await },
+            )
+        })
+    }
+
+    /*pub fn pipe_to_with_spawn<Sink, SpawnFn, Fut>(
+        self,
+        destination: WritableStream<T, Sink>,
+        options: Option<StreamPipeOptions>,
+        spawn: SpawnFn,
+    ) -> Fut
+    where
+        Sink: WritableSink<T> + Send + Sync + 'static,
+        T: Send + Sync + 'static,
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
+        Fut: Future<Output = StreamResult<()>> + 'static,
+    {
+        let fut = Box::pin(async move { self.pipe_to_inner(&destination, options).await });
+        spawn(fut)
+    }*/
+
     pub fn tee(
         self,
     ) -> (
@@ -502,6 +551,45 @@ where
         ReadableStream<T, Source, S, Locked>,
     ) {
         todo!("tee implementation")
+    }
+}
+
+impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+where
+    T: Send + Sync + 'static,
+    Source: Send + Sync + 'static,
+    S: StreamTypeMarker + Sync,
+{
+    pub fn _pipe_to_with_spawn<Sink, SpawnFn, Fut>(
+        self,
+        destination: WritableStream<T, Sink>,
+        options: Option<StreamPipeOptions>,
+        spawn: SpawnFn,
+    ) -> Fut
+    where
+        Sink: WritableSink<T> + Send + Sync + 'static,
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
+        Fut: Future<Output = StreamResult<()>> + 'static,
+    {
+        let fut: Pin<Box<dyn Future<Output = StreamResult<()>> + Send>> =
+            Box::pin(async move { self.pipe_to_inner(&destination, options).await });
+
+        spawn(fut)
+    }
+
+    pub fn pipe_to_with_spawn<Sink, SpawnFn, Fut>(
+        self,
+        destination: WritableStream<T, Sink>,
+        options: Option<StreamPipeOptions>,
+        spawn: SpawnFn,
+    ) -> Fut
+    where
+        Sink: WritableSink<T> + Send + Sync + 'static,
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
+        Fut: Future + 'static,
+    {
+        let fut = Box::pin(async move { self.pipe_to_inner(&destination, options).await });
+        spawn(fut)
     }
 }
 
@@ -2770,10 +2858,10 @@ mod tests {
             }
 
             fn abort(
-                self,
+                &mut self,
                 _reason: Option<String>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
-                let abort_called = self.abort_called;
+                let abort_called = self.abort_called.clone();
                 async move {
                     *abort_called.lock().unwrap() = true;
                     Ok(())
@@ -2956,11 +3044,11 @@ mod tests {
             }
 
             fn abort(
-                self,
+                &mut self,
                 reason: Option<String>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
-                let abort_called = self.abort_called;
-                let abort_reason = self.abort_reason;
+                let abort_called = self.abort_called.clone();
+                let abort_reason = self.abort_reason.clone();
                 async move {
                     *abort_called.lock().unwrap() = true;
                     *abort_reason.lock().unwrap() = reason;
@@ -3124,10 +3212,10 @@ mod tests {
             }
 
             fn abort(
-                self,
+                &mut self,
                 _reason: Option<String>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
-                let aborted = self.aborted;
+                let aborted = self.aborted.clone();
                 async move {
                     *aborted.lock().unwrap() = true;
                     Ok(())
@@ -3299,5 +3387,180 @@ mod tests {
             !sink.was_aborted(),
             "Sink should NOT be aborted when sink errors"
         );
+    }
+
+    #[tokio::test]
+    //#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pipe_to_abort_signal() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::time::sleep;
+
+        // SlowSink introduces delays to simulate long-running operations
+        #[derive(Clone)]
+        struct SlowSink {
+            written: Arc<Mutex<Vec<Vec<u8>>>>,
+            aborted: Arc<Mutex<bool>>,
+            delay_ms: u64,
+        }
+
+        impl SlowSink {
+            fn new(delay_ms: u64) -> Self {
+                Self {
+                    written: Arc::new(Mutex::new(Vec::new())),
+                    aborted: Arc::new(Mutex::new(false)),
+                    delay_ms,
+                }
+            }
+
+            fn was_aborted(&self) -> bool {
+                *self.aborted.lock().unwrap()
+            }
+
+            fn get_written(&self) -> Vec<Vec<u8>> {
+                self.written.lock().unwrap().clone()
+            }
+        }
+
+        impl super::WritableSink<Vec<u8>> for SlowSink {
+            /*fn write(
+                &mut self,
+                chunk: Vec<u8>,
+                _controller: &mut crate::dlc::ideation::d::writable_new::WritableStreamDefaultController,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                let written = self.written.clone();
+                let delay = self.delay_ms;
+
+                async move {
+                    // Simulate slow write operation
+                    sleep(Duration::from_millis(delay)).await;
+                    written.lock().unwrap().push(chunk);
+                    Ok(())
+                }
+            }*/
+            fn write(
+                &mut self,
+                chunk: Vec<u8>,
+                controller: &mut crate::dlc::ideation::d::writable_new::WritableStreamDefaultController,
+            ) -> impl Future<Output = StreamResult<()>> + Send {
+                let written = self.written.clone();
+                let delay = self.delay_ms;
+
+                let abort_fut = controller.abort_future();
+
+                async move {
+                    tokio::select! {
+                        _ = abort_fut => {
+                            eprintln!("abort happened before write finished");
+                            // Abort happened before write finished
+                            Err(StreamError::Aborted(None))
+                        }
+                        _ = sleep(Duration::from_millis(delay)) => {
+                            // Simulate completing the write
+                            written.lock().unwrap().push(chunk);
+                            Ok(())
+                        }
+                    }
+                }
+            }
+
+            fn abort(
+                &mut self,
+                _reason: Option<String>,
+            ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
+                eprintln!("abort called from within sink");
+                let aborted = self.aborted.clone();
+                async move {
+                    *aborted.lock().unwrap() = true;
+                    eprintln!("abort called from within sink is done");
+                    Ok(())
+                }
+            }
+        }
+
+        // Create test data
+        let data = vec![
+            vec![1u8, 2, 3],
+            vec![4u8, 5, 6],
+            vec![7u8, 8, 9],
+            vec![10u8, 11, 12],
+            vec![13u8, 14, 15],
+        ];
+
+        let readable = super::ReadableStream::from_iter(data.clone().into_iter(), None);
+        let sink = SlowSink::new(100); // 100ms delay per write
+
+        /*let writable = super::WritableStream::new(
+            sink.clone(),
+            Box::new(crate::dlc::ideation::d::CountQueuingStrategy::new(10)),
+        );*/
+        let writable = super::WritableStream::new_with_spawn(
+            sink.clone(),
+            Box::new(crate::dlc::ideation::d::CountQueuingStrategy::new(10)),
+            |fut| {
+                tokio::spawn(fut);
+            },
+        );
+
+        // Create abort controller and signal
+        let (abort_handle, abort_registration) = futures_util::stream::AbortHandle::new_pair();
+
+        // Start the pipe operation with abort signal
+        let pipe_options = super::StreamPipeOptions {
+            signal: Some(abort_registration),
+            prevent_close: false,
+            prevent_abort: false,
+            prevent_cancel: false,
+        };
+
+        // Start pipe_to in a separate task
+        /*let pipe_handle =
+        tokio::spawn(async move { readable.pipe_to(&writable, Some(pipe_options)).await });*/
+        //let handle = readable.pipe_to_threaded(writable, Some(pipe_options));
+        //let handle = readable.pipe_to_with_spawn(writable, Some(pipe_options), tokio::spawn);
+        let handle = readable
+            .pipe_to_with_spawn(writable, Some(pipe_options), |fut| tokio::task::spawn(fut));
+
+        // Let it start processing, then abort after a short delay
+        sleep(Duration::from_millis(150)).await; // Allow 2-3 chunks to be written
+        //abort_handle.abort(Some("Test abortion".into()));
+        abort_handle.abort();
+
+        // Wait for the pipe operation to complete
+        //let pipe_result = pipe_handle.await.unwrap();
+        //let pipe_result = handle.join().unwrap();
+        let pipe_result = handle.await.unwrap();
+
+        // Verify the pipe operation was aborted
+        assert!(pipe_result.is_err());
+        assert!(matches!(pipe_result, Err(super::StreamError::Aborted(_))));
+
+        // Verify cleanup behavior
+        assert!(
+            sink.was_aborted(),
+            "Sink should have been aborted when pipe operation was aborted"
+        );
+
+        // Should have written some but not all chunks (due to slow operation + early abort)
+        let written = sink.get_written();
+        assert!(
+            written.len() < data.len(),
+            "Should not have written all chunks due to abortion. Written: {}, Total: {}",
+            written.len(),
+            data.len()
+        );
+        assert!(
+            written.len() > 0,
+            "Should have written at least some chunks before abortion"
+        );
+
+        // Verify the written chunks are correct (partial data)
+        for (i, chunk) in written.iter().enumerate() {
+            assert_eq!(
+                chunk, &data[i],
+                "Written chunk {} should match source data",
+                i
+            );
+        }
     }
 }
