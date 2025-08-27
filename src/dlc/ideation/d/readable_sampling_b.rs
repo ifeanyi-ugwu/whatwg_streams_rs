@@ -721,16 +721,57 @@ where
     where
         Source: ReadableSource<T>,
     {
-        let (command_tx, _command_rx) = unbounded();
+        Self::new_with_strategy(source, CountQueuingStrategy::new(1))
+    }
+
+    pub fn new_with_strategy<Strategy>(source: Source, strategy: Strategy) -> Self
+    where
+        Source: ReadableSource<T>,
+        Strategy: QueuingStrategy<T> + Send + Sync + 'static,
+    {
+        let (command_tx, command_rx) = unbounded();
+        let (ctrl_tx, ctrl_rx) = unbounded();
+        let queue_total_size = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let errored = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        let stored_error = Arc::new(RwLock::new(None));
+
+        /*let strategy: Box<dyn QueuingStrategy<T> + Send + Sync> =
+        strategy.unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));*/
+
+        let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
+        let desired_size = Arc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
+
+        let inner = ReadableStreamInner::new(source, Box::new(strategy));
+
+        // Spawn the stream task
+        let task_fut = readable_stream_task(
+            command_rx,
+            ctrl_rx,
+            inner,
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+            Arc::clone(&stored_error),
+            ctrl_tx,
+        );
+
+        std::thread::spawn(move || {
+            futures::executor::block_on(task_fut);
+        });
+
         Self {
             command_tx,
-            queue_total_size: Arc::new(AtomicUsize::new(0)),
-            high_water_mark: Arc::new(AtomicUsize::new(0)),
-            desired_size: Arc::new(AtomicIsize::new(0)),
-            closed: Arc::new(AtomicBool::new(false)),
-            errored: Arc::new(AtomicBool::new(false)),
-            locked: Arc::new(AtomicBool::new(false)),
-            stored_error: Arc::new(RwLock::new(None)),
+            queue_total_size,
+            high_water_mark,
+            desired_size,
+            closed,
+            errored,
+            locked,
+            stored_error,
             _phantom: PhantomData,
         }
     }
