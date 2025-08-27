@@ -46,17 +46,17 @@ impl<O: Send + 'static> TransformStreamDefaultController<O> {
         Ok(())
     }
 
-    /// Error both sides
+    /// Errors both the readable and writable side of the transform stream.
     pub fn error(&mut self, _error: StreamError) {
         // Implementation
     }
 
-    /// Terminate both sides
+    /// Closes the readable side and errors the writable side of the stream
     pub fn terminate(&mut self) {
         // Implementation
     }
 
-    /// Get desired size
+    /// Get desired size to fill the readable side of the stream's internal queue
     pub fn desired_size(&self) -> Option<usize> {
         Some(1)
     }
