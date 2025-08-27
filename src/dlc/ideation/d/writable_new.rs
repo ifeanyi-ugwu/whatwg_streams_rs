@@ -2,12 +2,18 @@ use super::{
     QueuingStrategy,
     errors::{ArcError, StreamError},
 };
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
-use futures::future::FutureExt;
 use futures::future::poll_fn;
 use futures::{AsyncWrite, SinkExt, StreamExt, future};
+use futures::{
+    channel::mpsc::UnboundedReceiver,
+    future::{Either, select},
+    pin_mut,
+    task::AtomicWaker,
+};
+use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use pin_project::pin_project;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -739,7 +745,7 @@ pub trait WritableSink<T: Send + 'static>: Sized {
     }
 
     /// Abort the sink
-    fn abort(self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
+    fn abort(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
         let _ = reason;
         future::ready(Ok(())) // default no-op
     }
@@ -872,6 +878,7 @@ enum InFlight<Sink> {
         fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)> + Send>>,
         completion: Option<oneshot::Sender<StreamResult<()>>>,
         chunk_size: usize,
+        abort_handle: Option<AbortHandle>,
     },
     Close {
         fut: Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>,
@@ -899,9 +906,13 @@ async fn stream_task<T, Sink>(
         UnboundedSender<ControllerMsg>,
         UnboundedReceiver<ControllerMsg>,
     ) = unbounded();
+    //let (abort_handle, abort_reg) = AbortHandle::new_pair();
+    //let abort_reg = Arc::new(abort_reg);
+    //let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone(), abort_reg.clone());
+    let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
 
     if let Some(mut sink) = inner.sink.take() {
-        let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
+        //let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
 
         // Await start on sink
         let start_result = sink.start(&mut controller).await;
@@ -924,6 +935,62 @@ async fn stream_task<T, Sink>(
     }
 
     poll_fn(|cx| {
+        // 🔑 Check abort as early as possible
+        /*if inner.abort_requested {
+            if let Some(sink) = inner.sink.take() {
+                let reason = inner.abort_reason.take();
+                let fut = async move { sink.abort(reason).await }.boxed();
+                let completions = std::mem::take(&mut inner.abort_completions);
+                inflight = Some(InFlight::Abort { fut, completions });
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }*/
+        //with this, do i still need to race writes against an abortable manually? i doubt as this will probably cut the loop
+        // ---- EARLY ABORT CHECK ----
+        /*if inner.abort_requested {
+             controller.request_abort();
+            // nuke any inflight op before doing anything else
+            if let Some(inflight_op) =  inflight.take() {
+                match inflight_op {
+                    InFlight::Write { completion,abort_handle, .. } => {
+                        /*if let Some(handle) = abort_handle.take() {
+                            handle.abort(); // immediately wakes the write future
+                        }*/
+                        if let Some(sender) = completion {
+                            let _ = sender.send(Err(StreamError::Aborted(None)));
+                        }
+                    }
+                    InFlight::Close { mut completions, .. } => {
+                        for sender in completions.drain(..) {
+                            let _ = sender.send(Err(StreamError::Aborted(None)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            inflight = None;
+
+            // Also immediately clear queue (optional, but usually expected)
+            inner.queue.clear();
+            inner.queue_total_size = 0;
+
+            // Now schedule an InFlight::Abort if we still own the sink
+            if let Some(mut sink) = inner.sink.take() {
+                let reason = inner.abort_reason.take();
+                let fut = async move { sink.abort(reason).await }.boxed();
+                let completions = std::mem::take(&mut inner.abort_completions);
+                inflight = Some(InFlight::Abort { fut, completions });
+            }
+
+            // Make sure external observers see updated state
+            update_atomic_counters(&inner, &queue_total_size);
+            update_flags(&inner, &backpressure, &closed, &errored);
+            // Force another poll so abort future starts immediately
+            cx.waker().wake_by_ref();
+            //return Poll::Pending;
+        }*/
+
         process_controller_msgs(&mut inner, &mut ctrl_rx);
         update_atomic_counters(&inner, &queue_total_size,);
         // Dual-layer waker management to handle race conditions in concurrent scenarios:
@@ -992,23 +1059,71 @@ async fn stream_task<T, Sink>(
 
         // cancel inflight writes/closes if abort requested but not yet started
         if inner.abort_requested {
+            eprintln!("Stream task: abort requested, processing...");
+            controller.request_abort(); // Signal to any running writes
             // Cancel inflight write or close operations immediately
             if let Some(inflight_op) = &mut inflight {
+                eprintln!("Stream task: cancelling inflight operation");
                 match inflight_op {
-                    InFlight::Write { completion, .. } => {
+                    InFlight::Write { completion,abort_handle, .. } => {
+                        /*if let Some(handle) = abort_handle.take() {
+                            handle.abort(); // immediately trigger abort
+                        }*/
+                        // The next poll cycle will poll the future:
+                        //  - Either it finishes normally
+                        //  - Or it returns Err, giving back the sink so we can do sink.abort()
                         if let Some(sender) = completion.take() {
-                            let _ = sender.send(Err(StreamError::Custom("Stream aborted".into())));
+                            //let _ = sender.send(Err(StreamError::Custom("Stream aborted".into())));
+                            let _ = sender.send(Err(StreamError::Aborted(None)));
                         }
+                         // DO NOT send completion and DO NOT clear inflight here.
+                        // Let the write future resolve so we can recover the sink.
                     }
                     InFlight::Close { completions, .. } => {
                         for sender in completions.drain(..) {
-                            let _ = sender.send(Err(StreamError::Custom("Stream aborted".into())));
+                            //let _ = sender.send(Err(StreamError::Custom("Stream aborted".into())));
+                            let _ = sender.send(Err(StreamError::Aborted(None)));
                         }
                     }
                     _ => {}
                 }
             }
-            inflight = None;
+            // Now start the actual sink.abort() call
+            /*if let Some(mut sink) = inner.sink.take() {
+                let reason = inner.abort_reason.take();
+                let fut = async move { sink.abort(reason).await }.boxed();
+                let completions = std::mem::take(&mut inner.abort_completions);
+                inflight = Some(InFlight::Abort { fut, completions });
+            }*/
+            // Clear queue
+            /*inner.queue.clear();
+            inner.queue_total_size = 0;
+
+            // Start sink abort if we have the sink
+            if let Some(mut sink) = inner.sink.take() {
+                eprintln!("Stream task: calling sink.abort()");
+                let reason = inner.abort_reason.take();
+                //let fut = async move { sink.abort(reason).await }.boxed();
+                let fut = async move {
+                    let result = sink.abort(reason).await;
+                    eprintln!("Stream task: sink.abort() completed");
+                    result
+                }.boxed();
+                let completions = std::mem::take(&mut inner.abort_completions);
+                inflight = Some(InFlight::Abort { fut, completions });
+            } else {
+                eprintln!("Stream task: no sink available for abort");
+                // No sink - just complete the abort
+                inner.abort_requested = false;
+                for c in inner.abort_completions.drain(..) {
+                    let _ = c.send(Ok(()));
+                }
+            }
+
+            update_atomic_counters(&inner, &queue_total_size);
+            update_flags(&inner, &backpressure, &closed, &errored);
+            cx.waker().wake_by_ref();
+            return Poll::Pending;*/
         }
 
         // 2. ---- If not currently working, handle one "work" command ----
@@ -1046,7 +1161,7 @@ async fn stream_task<T, Sink>(
                     }
                 }
             } else if inner.abort_requested {
-                if let Some(sink) = inner.sink.take() {
+                if let Some(mut sink) = inner.sink.take() {
                     let reason = inner.abort_reason.take();
                     let fut = async move { sink.abort(reason).await }.boxed();
                     let completions = std::mem::take(&mut inner.abort_completions);
@@ -1075,9 +1190,56 @@ async fn stream_task<T, Sink>(
                 update_flags(&inner, &backpressure, &closed, &errored);
 
                 if let Some(mut sink) = inner.sink.take() {
-                    let mut ctrl = WritableStreamDefaultController::new(ctrl_tx.clone());
+                    //let mut ctrl = WritableStreamDefaultController::new(ctrl_tx.clone());
+                    let mut ctrl = controller.clone();
                     let chunk = pw.chunk;
                     let completion = pw.completion_tx;
+                    //let (abort_handle, abort_reg) = AbortHandle::new_pair();
+                    /*inflight = Some(InFlight::Write {
+                        fut: Box::pin(async move {
+                            let result = sink.write(chunk, &mut ctrl).await;
+                            (sink, result)
+                        }),
+                        completion: Some(completion),
+                        chunk_size,
+                        abort_handle: Some(abort_handle),
+                    });*/
+                    // write future that RETURNS the sink on completion
+                    /*let write_fut = async move {
+                        // NOTE: &mut ctrl is local to the future; no aliasing issues
+                        let res = sink.write(chunk, &mut ctrl).await;
+                        (sink, res)
+                    }.fuse();
+
+                     // a synthetic "abort signal" future that resolves only when aborted
+                    let abort_sig = Abortable::new(future::pending::<()>(),  abort_reg)
+                        .map(|_| ()) // map Err(Aborted) -> (), Ok(()) never happens
+                        .fuse();
+
+
+                    // race them
+                    let fut = async move {
+                        pin_mut!(write_fut, abort_sig);
+                        match select(write_fut, abort_sig).await {
+                            // write completed first
+                            Either::Left(((sink, res), _abort_sig)) => (sink, res),
+
+                            // abort fired first
+                            Either::Right((_unit, write_fut)) => {
+                                // IMPORTANT: complete the write future to recover the sink
+                                let (sink, _ignored_res) = write_fut.await;
+                                (sink, Err(StreamError::Aborted(None)))
+                            }
+                        }
+                    };
+
+                    inflight = Some(InFlight::Write {
+                        fut: Box::pin(fut),
+                        completion: Some(completion),
+                        chunk_size,
+                        abort_handle: Some(abort_handle),
+                    });*/
+
                     inflight = Some(InFlight::Write {
                         fut: Box::pin(async move {
                             let result = sink.write(chunk, &mut ctrl).await;
@@ -1085,6 +1247,7 @@ async fn stream_task<T, Sink>(
                         }),
                         completion: Some(completion),
                         chunk_size,
+                        abort_handle: None, // Remove this entirely
                     });
                 } else {
                     let _ = pw
@@ -1098,22 +1261,57 @@ async fn stream_task<T, Sink>(
         // 4. ---- Poll the in-flight future if present ----
         if let Some(inflight_op) = &mut inflight {
             match inflight_op {
-                InFlight::Write {
-                    fut,
-                    completion,
-                    chunk_size,
-                } => {
+                /*InFlight::Write { mut fut, mut completion, chunk_size,abort_handle} => {
                     match fut.as_mut().poll(cx) {
-                        Poll::Ready((sink, result)) => {
+                        Poll::Ready((mut sink, result)) => {
                             decrement_flush_counters(&mut inner);
+                            // Got the sink back - check if we need to abort
+                            if inner.abort_requested {
+                                eprintln!("Stream task: using recovered sink for abort");
+                                let reason = inner.abort_reason.take();
+                                let fut = async move {
+                                    sink.abort(reason).await
+                                }.boxed();
+                                let completions = std::mem::take(&mut inner.abort_completions);
+                                inflight = Some(InFlight::Abort { fut, completions });
+                            } else {
+                                // Normal completion
+                                inner.sink = Some(sink);
+                                inflight = None;
+                            }
 
+                            // we ALWAYS get the sink back here
+                            /*let was_aborted = matches!(result, Err(StreamError::Aborted(_)));
+
+                            // store sink back (temporarily) so flags/backpressure logic can see it
+                            inner.sink = Some(sink);
+
+                            // If we were aborted, immediately transition to InFlight::Abort
+                            if was_aborted {
+                                if let Some(mut sink) = inner.sink.take() {
+                                    let reason = inner.abort_reason.take();
+                                    let fut = async move { sink.abort(reason).await }.boxed();
+                                    let completions = std::mem::take(&mut inner.abort_completions);
+                                    inflight = Some(InFlight::Abort { fut, completions });
+                                    cx.waker().wake_by_ref();
+                                } else {
+                                    // no sink? just resolve abort completions
+                                    inner.abort_requested = false;
+                                    for c in inner.abort_completions.drain(..) {
+                                        let _ = c.send(Ok(()));
+                                    }
+                                }
+                            } else {
+                                // normal path
+                                cx.waker().wake_by_ref();
+                            }*/
                             // Check for error first, before any flag updates
                             if result.is_err() {
                                 if let Err(e) = result.clone() {
                                     inner.set_stored_error( e);
                                 }
                                 inner.state = StreamState::Errored;
-                                inner.sink = None; // Don't restore sink on error
+                                //inner.sink = None; // Don't restore sink on error
                             } else {
                                 inner.sink = Some(sink); // Only restore sink on success
                             }
@@ -1128,11 +1326,100 @@ async fn stream_task<T, Sink>(
 
                             inflight = None;
                             cx.waker().wake_by_ref();
+                            None
+                        }
+                        //Poll::Pending => {}
+                        Poll::Pending => {
+                            Some(InFlight::Write { fut, completion, chunk_size, abort_handle })
+                        }
+                    }
+                }*/
+                /*InFlight::Write { mut fut, mut completion, .. } => {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready((mut sink, result)) => {
+                            decrement_flush_counters(&mut inner);
+                            // ALWAYS get the sink back first
+                            // Now decide what to do based on abort state
+                            if inner.abort_requested {
+                                // Use the recovered sink for abort instead of restoring it
+                                let reason = inner.abort_reason.take();
+                                let fut = async move { sink.abort(reason).await }.boxed();
+                                let completions = std::mem::take(&mut inner.abort_completions);
+                                inflight = Some(InFlight::Abort { fut, completions });
+
+                                // Notify the write completion
+                                if let Some(sender) = completion.take() {
+                                    let _ = sender.send(Err(StreamError::Aborted(None)));
+                                }
+                            } else {
+                                // Normal path - restore sink and complete
+                                inner.sink = Some(sink);
+                                if let Some(sender) = completion.take() {
+                                    let _ = sender.send(result);
+                                }
+                                inflight = None;
+                            }
+
+                            inner.update_backpressure();
+                            update_atomic_counters(&inner, &queue_total_size);
+                            update_flags(&inner, &backpressure, &closed, &errored);
+                            cx.waker().wake_by_ref();
                         }
                         Poll::Pending => {}
                     }
+                }*/
+                InFlight::Write {  fut, completion, chunk_size, abort_handle } => {
+                match fut.as_mut().poll(cx) {
+                    Poll::Ready((mut sink, result)) => {
+                        decrement_flush_counters(&mut inner);
+
+                        if inner.abort_requested {
+                            // Transition to abort with recovered sink
+                            let reason = inner.abort_reason.take();
+                            let abort_fut = async move {
+                                sink.abort(reason).await
+                            }.boxed();
+                            let completions = std::mem::take(&mut inner.abort_completions);
+                            //Some(InFlight::Abort { fut, completions })
+                            //inflight = Some(InFlight::Abort { fut: abort_fut, completions });
+
+                            // Notify write completion with abort error
+                            if let Some(sender) = completion.take() {
+                                let _ = sender.send(Err(StreamError::Aborted(None)));
+                            }
+
+                            inflight = Some(InFlight::Abort { fut: abort_fut, completions });
+                        } else {
+                            // Normal case: restore sink
+                            if result.is_err() {
+                                if let Err(e) = result.clone() {
+                                    inner.set_stored_error(e);
+                                }
+                                inner.state = StreamState::Errored;
+                                // don’t restore sink on error
+                            } else {
+                                inner.sink = Some(sink);
+                            }
+
+                            inner.update_backpressure();
+                            update_atomic_counters(&inner, &queue_total_size);
+                            update_flags(&inner, &backpressure, &closed, &errored);
+
+                            if let Some(sender) = completion.take() {
+                                let _ = sender.send(result);
+                            }
+
+                            inflight = None;
+                            cx.waker().wake_by_ref();
+                        }
+                    }
+                    Poll::Pending => {
+                        // Put the original variant back unchanged
+                        //Some(InFlight::Write { fut, completion, chunk_size, abort_handle })
+                    }
                 }
-                InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
+            }
+                InFlight::Close {   fut,   completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
                         // Update state and flags based on result of sink.close()
                         match &res {
@@ -1163,10 +1450,13 @@ async fn stream_task<T, Sink>(
 
                         inflight = None;
                         cx.waker().wake_by_ref();
+
+                        //None
                     }
                     Poll::Pending => {}
+                    //Poll::Pending => Some(InFlight::Close { fut, completions }),
                 },
-                InFlight::Abort { fut, completions } => match fut.as_mut().poll(cx) {
+                InFlight::Abort { fut,   completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(sink_abort_result) => {
                         let notify_result = match sink_abort_result {
                             Ok(()) => {
@@ -1195,8 +1485,11 @@ async fn stream_task<T, Sink>(
 
                         inflight = None;
                         cx.waker().wake_by_ref();
+
+                        //None
                     }
                     Poll::Pending => {}
+                    //Poll::Pending => Some(InFlight::Abort { fut, completions }),
                 },
             }
         }
@@ -1562,17 +1855,73 @@ fn process_controller_msgs<T, Sink>(
 #[derive(Clone)]
 pub struct WritableStreamDefaultController {
     tx: UnboundedSender<ControllerMsg>,
+    //abort_reg: Arc<AbortRegistration>,
+    abort_requested: Arc<AtomicBool>,
+    abort_waker: Arc<AtomicWaker>,
 }
 
 impl WritableStreamDefaultController {
+    /*pub fn new(sender: UnboundedSender<ControllerMsg>, abort_reg: Arc<AbortRegistration>) -> Self {
+        Self { tx: sender,abort_reg }
+    }*/
     pub fn new(sender: UnboundedSender<ControllerMsg>) -> Self {
-        Self { tx: sender }
+        Self {
+            tx: sender,
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_waker: Arc::new(AtomicWaker::new()),
+        }
     }
 
     /// Signal an error on the stream
     pub fn error(&self, error: StreamError) {
         // ignore send failure if receiver is dropped
         let _ = self.tx.unbounded_send(ControllerMsg::Error(error));
+    }
+
+    /// Expose a reference to the abort registration so sinks can use it
+    /*pub fn abort_registration(&self) -> &AbortRegistration {
+        &self.abort_reg
+    }*/
+
+    pub fn is_aborted(&self) -> bool {
+        self.abort_requested.load(Ordering::SeqCst)
+    }
+
+    fn request_abort(&self) {
+        self.abort_requested.store(true, Ordering::SeqCst);
+        self.abort_waker.wake();
+        //let _ = self.tx.unbounded_send(ControllerMsg::AbortRequested);
+    }
+
+    pub fn abort_future(&self) -> impl std::future::Future<Output = ()> {
+        let waker = self.abort_waker.clone();
+        let flag = self.abort_requested.clone();
+        poll_fn(move |cx| {
+            if flag.load(Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                // register waker so it will be woken when request_abort() calls wake()
+                waker.register(cx.waker());
+                Poll::Pending
+            }
+        })
+    }
+
+    pub fn with_abort<F, T>(&self, fut: F) -> impl Future<Output = Result<T, StreamError>> + Send
+    where
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let abort_fut = self.abort_future();
+
+        // Box::pin makes it Unpin
+        let fut = Box::pin(fut);
+        let abort_fut = Box::pin(abort_fut);
+
+        futures::future::select(fut, abort_fut).map(|either| match either {
+            futures::future::Either::Left((value, _)) => Ok(value),
+            futures::future::Either::Right((_unit, _)) => Err(StreamError::Aborted(None)),
+        })
     }
 }
 
@@ -1870,7 +2219,7 @@ mod tests {
             }
 
             fn abort(
-                self,
+                &mut self,
                 reason: Option<String>,
             ) -> impl std::future::Future<Output = StreamResult<()>> + Send {
                 let aborted = self.aborted.clone();
@@ -2390,7 +2739,7 @@ mod tests {
             }
 
             fn abort(
-                self,
+                &mut self,
                 _reason: Option<String>,
             ) -> impl std::future::Future<Output = StreamResult<()>> + Send {
                 let flag = self.error_flag.clone();
@@ -2774,7 +3123,7 @@ mod sink_integration_tests {
             Ok(())
         }
 
-        async fn abort(self, reason: Option<String>) -> StreamResult<()> {
+        async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
             let reason_str = reason.as_deref().unwrap_or("no reason");
             self.log_operation(&format!("abort called with reason: {}", reason_str));
 
@@ -3341,7 +3690,7 @@ mod async_write_integration_tests {
             Ok(())
         }
 
-        async fn abort(self, reason: Option<String>) -> StreamResult<()> {
+        async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
             let reason_str = reason.as_deref().unwrap_or("no reason");
             self.log_operation(&format!("abort called with reason: {}", reason_str));
             self.log_operation("abort completed");
@@ -3571,10 +3920,6 @@ mod async_write_integration_tests {
         }
 
         impl WritableSink<Vec<u8>> for FlushTestSink {
-            async fn start(&mut self, _: &mut WritableStreamDefaultController) -> StreamResult<()> {
-                Ok(())
-            }
-
             async fn write(
                 &mut self,
                 chunk: Vec<u8>,
@@ -3583,13 +3928,6 @@ mod async_write_integration_tests {
                 // Simulate slow write
                 tokio::time::sleep(self.write_delay).await;
                 self.received_data.lock().unwrap().extend_from_slice(&chunk);
-                Ok(())
-            }
-
-            async fn close(self) -> StreamResult<()> {
-                Ok(())
-            }
-            async fn abort(self, _: Option<String>) -> StreamResult<()> {
                 Ok(())
             }
         }
