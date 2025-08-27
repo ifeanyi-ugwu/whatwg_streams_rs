@@ -1,5 +1,5 @@
 use super::{
-    CountQueuingStrategy, QueuingStrategy,
+    CountQueuingStrategy, Locked, QueuingStrategy, Unlocked,
     errors::{ArcError, StreamError},
     writable_new::{WritableSink, WritableStream},
 };
@@ -42,10 +42,6 @@ pub struct TransformStream<I, O> {
 // ----------- Stream Type Markers -----------
 pub struct DefaultStream;
 pub struct ByteStream;
-
-// ----------- Lock State Markers -----------
-pub struct Unlocked;
-pub struct Locked;
 
 // ----------- Stream Type Marker Trait -----------
 pub trait StreamTypeMarker: Send + Sync + 'static {}

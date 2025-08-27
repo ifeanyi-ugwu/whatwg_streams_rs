@@ -1,5 +1,5 @@
 use super::{
-    QueuingStrategy,
+    Locked, QueuingStrategy, Unlocked,
     errors::{ArcError, StreamError},
 };
 use futures::FutureExt;
@@ -61,9 +61,6 @@ pub enum StreamCommand<T> {
         waker: Waker,
     },
 }
-
-pub struct Unlocked;
-pub struct Locked;
 
 /// Public handle, clonable, holds task command sender and atomic flags
 #[pin_project]
