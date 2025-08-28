@@ -14,10 +14,7 @@ use futures::{
     future::{self, Future},
     stream::StreamExt,
 };
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 pub type StreamResult<T> = Result<T, StreamError>;
 
@@ -66,44 +63,25 @@ impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
         RS: QueuingStrategy<O> + Send + Sync + 'static,
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
-        let (controller_tx, controller_rx) = unbounded::<O>();
 
-        // Simple shared state - just for coordination, no queuing
-        let errored = Arc::new(AtomicBool::new(false));
-        let closed = Arc::new(AtomicBool::new(false));
-
-        // Create the readable source that receives transformed data
-        let readable_source =
-            TransformReadableSource::new(controller_rx, Arc::clone(&errored), Arc::clone(&closed));
+        // Create the readable source (minimal, just needs to exist)
+        let readable_source = TransformReadableSource::new();
 
         // Create the writable sink that sends data to be transformed
         let writable_sink = TransformWritableSink::new(transform_tx);
 
-        // Create the streams - let them handle their own queuing
+        // Create the streams - they handle their own queuing
         let readable = ReadableStream::new_with_strategy(readable_source, readable_strategy);
         let writable = WritableStream::new(writable_sink, Box::new(writable_strategy));
 
         // Spawn the transform task
-        let task_errored = Arc::clone(&errored);
-        let task_closed = Arc::clone(&closed);
-
-        let controller = TransformStreamDefaultController::new(
-            controller_tx.clone(),
-            Arc::clone(&errored),
-            Arc::clone(&closed),
-            readable.controller.clone(),
-            writable.controller.clone(),
-        );
+        let readable_controller = readable.controller.clone();
+        let writable_controller = writable.controller.clone();
+        let controller =
+            TransformStreamDefaultController::new(readable_controller, writable_controller);
 
         std::thread::spawn(move || {
-            futures::executor::block_on(transform_task(
-                transformer,
-                transform_rx,
-                controller_tx,
-                task_errored,
-                task_closed,
-                controller,
-            ));
+            futures::executor::block_on(transform_task(transformer, transform_rx, controller));
         });
 
         TransformStream { readable, writable }
@@ -134,73 +112,44 @@ impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
 
 /// Controller for transform operations
 pub struct TransformStreamDefaultController<O> {
-    controller_tx: UnboundedSender<O>,
-    errored: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
-    readable_controller: Arc<Mutex<ReadableStreamDefaultController<O>>>,
-    writable_controller: Arc<Mutex<WritableStreamDefaultController>>,
+    readable_controller: Arc<ReadableStreamDefaultController<O>>,
+    writable_controller: Arc<WritableStreamDefaultController>,
 }
 
 impl<O: Send + 'static> TransformStreamDefaultController<O> {
     fn new(
-        controller_tx: UnboundedSender<O>,
-        errored: Arc<AtomicBool>,
-        closed: Arc<AtomicBool>,
         readable_controller: Arc<ReadableStreamDefaultController<O>>,
         writable_controller: Arc<WritableStreamDefaultController>,
     ) -> Self {
         Self {
-            controller_tx,
-            errored,
-            closed,
-            //readable_controller: Mutex::new(readable_controller),
-            //writable_controller: Mutex::new(writable_controller),
-            readable_controller: Arc::new(Mutex::new((*readable_controller).clone())),
-            writable_controller: Arc::new(Mutex::new((*writable_controller).clone())),
+            readable_controller,
+            writable_controller,
         }
     }
 
     /// Enqueue to readable side
-    pub fn enqueue(&mut self, chunk: O) -> StreamResult<()> {
-        if self.errored.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Transform stream is errored".into()));
-        }
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Transform stream is closed".into()));
-        }
-
-        self.readable_controller.lock().unwrap().enqueue(chunk)
+    pub fn enqueue(&self, chunk: O) -> StreamResult<()> {
+        self.readable_controller.enqueue(chunk)
     }
 
     /// Errors both the readable and writable side of the transform stream
-    pub fn error(&mut self, error: StreamError) -> StreamResult<()> {
-        self.errored.store(true, Ordering::SeqCst);
-        self.readable_controller
-            .lock()
-            .unwrap()
-            .error(error.clone())?;
-        self.writable_controller.lock().unwrap().error(error);
+    pub fn error(&self, error: StreamError) -> StreamResult<()> {
+        self.readable_controller.error(error.clone())?;
+        self.writable_controller.error(error);
         Ok(())
     }
 
     /// Closes the readable side and errors the writable side of the stream
-    pub fn terminate(&mut self) -> StreamResult<()> {
-        self.errored.store(true, Ordering::SeqCst);
-        self.readable_controller.lock().unwrap().close()?;
+    pub fn terminate(&self) -> StreamResult<()> {
+        self.readable_controller.close()?;
         self.writable_controller
-            .lock()
-            .unwrap()
             .error(StreamError::Custom("Terminated".into()));
         Ok(())
     }
 
     /// Get desired size to fill the readable side of the stream's internal queue
     pub fn desired_size(&self) -> Option<isize> {
-        if self.errored.load(Ordering::SeqCst) || self.closed.load(Ordering::SeqCst) {
-            return None;
-        }
-
-        self.readable_controller.lock().unwrap().desired_size()
+        self.readable_controller.desired_size()
     }
 }
 
@@ -234,21 +183,13 @@ pub trait Transformer<I: Send + 'static, O: Send + 'static>: Send + 'static {
 
 /// Readable source for the transform stream
 pub struct TransformReadableSource<O> {
-    controller_rx: UnboundedReceiver<O>,
-    errored: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
+    _phantom: std::marker::PhantomData<O>,
 }
 
 impl<O> TransformReadableSource<O> {
-    fn new(
-        controller_rx: UnboundedReceiver<O>,
-        errored: Arc<AtomicBool>,
-        closed: Arc<AtomicBool>,
-    ) -> Self {
+    fn new() -> Self {
         Self {
-            controller_rx,
-            errored,
-            closed,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -318,13 +259,10 @@ impl<I: Send + 'static> WritableSink<I> for TransformWritableSink<I> {
     }
 }
 
-/// Simplified transform task
+/// Simple transform task
 async fn transform_task<I, O, T>(
     mut transformer: T,
     mut transform_rx: UnboundedReceiver<TransformCommand<I>>,
-    controller_tx: UnboundedSender<O>,
-    errored: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
     mut controller: TransformStreamDefaultController<O>,
 ) where
     I: Send + 'static,
@@ -333,7 +271,6 @@ async fn transform_task<I, O, T>(
 {
     // Call start
     if let Err(error) = transformer.start(&mut controller).await {
-        errored.store(true, Ordering::SeqCst);
         let _ = controller.error(error);
         return;
     }
@@ -341,10 +278,6 @@ async fn transform_task<I, O, T>(
     // Process commands
     while let Some(cmd) = transform_rx.next().await {
         match cmd {
-            /*TransformCommand::Write { chunk, completion } => {
-                let result = transformer.transform(chunk, &mut controller).await;
-                let _ = completion.send(result);
-            }*/
             TransformCommand::Write { chunk, completion } => {
                 let result = transformer.transform(chunk, &mut controller).await;
                 match result {
@@ -352,7 +285,6 @@ async fn transform_task<I, O, T>(
                         let _ = completion.send(Ok(()));
                     }
                     Err(error) => {
-                        errored.store(true, Ordering::SeqCst);
                         let _ = controller.error(error.clone());
                         let _ = completion.send(Err(error));
                         break; // stop processing further writes
@@ -363,11 +295,9 @@ async fn transform_task<I, O, T>(
             TransformCommand::Close { completion } => {
                 let flush_result = transformer.flush(&mut controller).await;
                 if let Err(error) = flush_result {
-                    errored.store(true, Ordering::SeqCst);
                     let _ = controller.error(error.clone());
                     let _ = completion.send(Err(error));
                 } else {
-                    closed.store(true, Ordering::SeqCst);
                     let _ = controller.terminate();
                     let _ = completion.send(Ok(()));
                 }
@@ -378,12 +308,8 @@ async fn transform_task<I, O, T>(
                 reason: _,
                 completion,
             } => {
-                errored.store(true, Ordering::SeqCst);
                 let error = StreamError::Custom("Transform stream aborted".into());
-
-                // Propagate error to both readable and writable sides
                 let _ = controller.error(error.clone());
-
                 let _ = completion.send(Err(error));
                 break;
             }
@@ -539,7 +465,6 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    //TODO: fix, test hangs
     #[tokio::test]
     async fn test_transform_error_handling() {
         let transformer = ErrorOnThreeTransformer;
@@ -601,7 +526,6 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    //TODO: fix, test hangs
     #[tokio::test]
     async fn test_abort_stream() {
         let transformer = UppercaseTransformer;
