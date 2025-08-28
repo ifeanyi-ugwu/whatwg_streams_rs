@@ -77,6 +77,7 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
     #[pin]
     write_receiver: Option<oneshot::Receiver<Result<(), StreamError>>>,
     pending_write_len: Option<usize>,
+    pub(crate) controller: Arc<WritableStreamDefaultController>,
 }
 
 impl<T, Sink, S> WritableStream<T, Sink, S> {
@@ -171,6 +172,7 @@ where
             close_receiver: None,
             write_receiver: None,
             pending_write_len: None,
+            controller: self.controller.clone(),
         };
 
         Ok((locked.clone(), WritableStreamDefaultWriter::new(locked)))
@@ -230,6 +232,12 @@ where
         let locked = Arc::new(AtomicBool::new(false));
         let queue_total_size = Arc::new(AtomicUsize::new(0));
 
+        let (ctrl_tx, ctrl_rx): (
+            UnboundedSender<ControllerMsg>,
+            UnboundedReceiver<ControllerMsg>,
+        ) = unbounded();
+        let controller = WritableStreamDefaultController::new(ctrl_tx.clone());
+
         let fut = stream_task(
             command_rx,
             inner,
@@ -237,6 +245,8 @@ where
             Arc::clone(&closed),
             Arc::clone(&errored),
             Arc::clone(&queue_total_size),
+            controller.clone(),
+            ctrl_rx,
         );
 
         spawn_fn(Box::pin(fut));
@@ -256,6 +266,7 @@ where
             close_receiver: None,
             write_receiver: None,
             pending_write_len: None,
+            controller: controller.into(),
         }
     }
 }
@@ -299,6 +310,7 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
             close_receiver: None,
             write_receiver: None,
             pending_write_len: None,
+            controller: self.controller.clone(),
         }
     }
 }
@@ -889,16 +901,13 @@ async fn stream_task<T, Sink>(
     closed: Arc<AtomicBool>,
     errored: Arc<AtomicBool>,
     queue_total_size: Arc<AtomicUsize>,
+    mut controller: WritableStreamDefaultController,
+    mut ctrl_rx: UnboundedReceiver<ControllerMsg>,
 ) where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
     let mut inflight: Option<InFlight<Sink>> = None;
-    let (ctrl_tx, mut ctrl_rx): (
-        UnboundedSender<ControllerMsg>,
-        UnboundedReceiver<ControllerMsg>,
-    ) = unbounded();
-    let mut controller = WritableStreamDefaultController::new(ctrl_tx.clone());
 
     if let Some(mut sink) = inner.sink.take() {
         let start_result = sink.start(&mut controller).await;
@@ -1048,7 +1057,6 @@ async fn stream_task<T, Sink>(
                 update_flags(&inner, &backpressure, &closed, &errored);
 
                 if let Some(mut sink) = inner.sink.take() {
-                    //let mut ctrl = WritableStreamDefaultController::new(ctrl_tx.clone());
                     let mut ctrl = controller.clone();
                     let chunk = pw.chunk;
                     let completion = pw.completion_tx;
