@@ -44,10 +44,17 @@ pub struct DefaultStream;
 pub struct ByteStream;
 
 // ----------- Stream Type Marker Trait -----------
-pub trait StreamTypeMarker: Send + Sync + 'static {}
+pub trait StreamTypeMarker: Send + Sync + 'static {
+    type Controller<T: Send + 'static>: Send + Sync + Clone + 'static;
+}
 
-impl StreamTypeMarker for DefaultStream {}
-impl StreamTypeMarker for ByteStream {}
+impl StreamTypeMarker for DefaultStream {
+    type Controller<T: Send + 'static> = ReadableStreamDefaultController<T>;
+}
+
+impl StreamTypeMarker for ByteStream {
+    type Controller<T: Send + 'static> = ReadableByteStreamController;
+}
 
 // ----------- Source Traits -----------
 pub trait ReadableSource<T>: Send + Sized + 'static
@@ -292,6 +299,19 @@ impl ReadableByteStreamController {
     }
 }
 
+impl Clone for ReadableByteStreamController {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            queue_total_size: self.queue_total_size.clone(),
+            high_water_mark: self.high_water_mark.clone(),
+            desired_size: self.desired_size.clone(),
+            closed: self.closed.clone(),
+            errored: self.errored.clone(),
+        }
+    }
+}
+
 // ----------- Inner State -----------
 struct ReadableStreamInner<T, Source> {
     state: StreamState,
@@ -366,7 +386,27 @@ where
     locked: Arc<AtomicBool>,
     stored_error: Arc<RwLock<Option<StreamError>>>,
     desired_size: Arc<AtomicIsize>,
+    pub(crate) controller: Arc<StreamType::Controller<T>>,
     _phantom: PhantomData<(T, Source, StreamType, LockState)>,
+}
+
+impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
+where
+    T: Send + 'static,
+    Source: Send + 'static,
+{
+    pub(crate) fn controller(&self) -> &ReadableStreamDefaultController<T> {
+        self.controller.as_ref()
+    }
+}
+
+impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+where
+    Source: Send + 'static,
+{
+    pub(crate) fn controller(&self) -> &ReadableByteStreamController {
+        self.controller.as_ref()
+    }
 }
 
 impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
@@ -623,6 +663,15 @@ where
 
         let inner = ReadableStreamInner::new(source, strategy);
 
+        let controller = ReadableStreamDefaultController::new(
+            ctrl_tx.clone(),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+        );
+
         // Spawn the stream task
         let task_fut = readable_stream_task(
             command_rx,
@@ -635,6 +684,7 @@ where
             Arc::clone(&errored),
             Arc::clone(&stored_error),
             ctrl_tx,
+            controller.clone(),
         );
 
         std::thread::spawn(move || {
@@ -650,6 +700,7 @@ where
             errored,
             locked,
             stored_error,
+            controller: controller.into(),
             _phantom: PhantomData,
         }
     }
@@ -679,6 +730,15 @@ where
 
         let inner = ReadableStreamInner::new(source, strategy);
 
+        let controller = ReadableByteStreamController::new(
+            ctrl_tx.clone(),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+        );
+
         let task_fut = readable_byte_stream_task(
             command_rx,
             ctrl_rx,
@@ -690,6 +750,7 @@ where
             Arc::clone(&errored),
             Arc::clone(&stored_error),
             ctrl_tx,
+            controller.clone(),
         );
 
         std::thread::spawn(move || {
@@ -705,17 +766,17 @@ where
             errored,
             locked,
             stored_error,
+            controller: controller.into(),
             _phantom: PhantomData,
         }
     }
 }
 
 // ----------- Generic Constructor -----------
-impl<T, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
+impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
     T: Send + 'static,
     Source: Send + 'static,
-    StreamType: StreamTypeMarker,
 {
     pub fn new(source: Source) -> Self
     where
@@ -745,6 +806,15 @@ where
 
         let inner = ReadableStreamInner::new(source, Box::new(strategy));
 
+        let controller = ReadableStreamDefaultController::new(
+            ctrl_tx.clone(),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+        );
+
         // Spawn the stream task
         let task_fut = readable_stream_task(
             command_rx,
@@ -757,6 +827,7 @@ where
             Arc::clone(&errored),
             Arc::clone(&stored_error),
             ctrl_tx,
+            controller.clone(),
         );
 
         std::thread::spawn(move || {
@@ -772,6 +843,7 @@ where
             errored,
             locked,
             stored_error,
+            controller: controller.into(),
             _phantom: PhantomData,
         }
     }
@@ -800,17 +872,18 @@ where
     }
 }
 
-// ----------- Reader Methods for Default Streams -----------
-impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
+// ----------- Additional reader methods for generic streams -----------
+impl<T, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
 where
     T: Send + 'static,
     Source: Send + 'static,
+    StreamType: StreamTypeMarker,
 {
     pub fn get_reader(
         self,
     ) -> (
-        ReadableStream<T, Source, DefaultStream, Locked>,
-        ReadableStreamDefaultReader<T, Source, DefaultStream, Locked>,
+        ReadableStream<T, Source, StreamType, Locked>,
+        ReadableStreamDefaultReader<T, Source, StreamType, Locked>,
     ) {
         self.locked.store(true, Ordering::SeqCst);
 
@@ -823,6 +896,7 @@ where
             errored: Arc::clone(&self.errored),
             locked: Arc::clone(&self.locked),
             stored_error: Arc::clone(&self.stored_error),
+            controller: self.controller.clone(),
             _phantom: PhantomData,
         };
 
@@ -835,6 +909,7 @@ where
             errored: self.errored,
             locked: self.locked,
             stored_error: self.stored_error,
+            controller: self.controller,
             _phantom: PhantomData,
         });
 
@@ -847,41 +922,6 @@ impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource + Send + 'static,
 {
-    pub fn get_reader(
-        self,
-    ) -> (
-        ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
-        ReadableStreamDefaultReader<Vec<u8>, Source, ByteStream, Locked>,
-    ) {
-        self.locked.store(true, Ordering::SeqCst);
-
-        let locked_stream = ReadableStream {
-            command_tx: self.command_tx.clone(),
-            queue_total_size: Arc::clone(&self.queue_total_size),
-            high_water_mark: Arc::clone(&self.high_water_mark),
-            desired_size: Arc::clone(&self.desired_size),
-            closed: Arc::clone(&self.closed),
-            errored: Arc::clone(&self.errored),
-            locked: Arc::clone(&self.locked),
-            stored_error: Arc::clone(&self.stored_error),
-            _phantom: PhantomData,
-        };
-
-        let reader = ReadableStreamDefaultReader::new(ReadableStream {
-            command_tx: self.command_tx,
-            queue_total_size: self.queue_total_size,
-            high_water_mark: self.high_water_mark,
-            desired_size: self.desired_size,
-            closed: self.closed,
-            errored: self.errored,
-            locked: self.locked,
-            stored_error: self.stored_error,
-            _phantom: PhantomData,
-        });
-
-        (locked_stream, reader)
-    }
-
     pub fn get_byob_reader(
         self,
     ) -> (
@@ -899,6 +939,7 @@ where
             errored: Arc::clone(&self.errored),
             locked: Arc::clone(&self.locked),
             stored_error: Arc::clone(&self.stored_error),
+            controller: self.controller.clone(),
             _phantom: PhantomData,
         };
 
@@ -911,6 +952,7 @@ where
             errored: self.errored,
             locked: self.locked,
             stored_error: self.stored_error,
+            controller: self.controller,
             _phantom: PhantomData,
         });
 
@@ -1118,6 +1160,7 @@ where
             errored: self.0.errored.clone(),
             locked: self.0.locked.clone(),
             stored_error: self.0.stored_error.clone(),
+            controller: self.0.controller.clone(),
             _phantom: PhantomData,
         }
     }
@@ -1221,6 +1264,7 @@ where
             errored: self.0.errored.clone(),
             locked: self.0.locked.clone(),
             stored_error: self.0.stored_error.clone(),
+            controller: self.0.controller.clone(),
             _phantom: PhantomData,
         }
     }
@@ -1267,21 +1311,13 @@ async fn readable_stream_task<T, Source>(
     errored: Arc<AtomicBool>,
     stored_error: Arc<RwLock<Option<StreamError>>>,
     ctrl_tx: UnboundedSender<ControllerMsg<T>>,
+    mut controller: ReadableStreamDefaultController<T>,
 ) where
     T: Send + 'static,
     Source: ReadableSource<T> + Send + 'static,
 {
     // Call start() first before processing any commands
     if let Some(mut source) = inner.source.take() {
-        let mut controller = ReadableStreamDefaultController::new(
-            ctrl_tx.clone(),
-            Arc::clone(&queue_total_size),
-            Arc::clone(&high_water_mark),
-            Arc::clone(&desired_size),
-            Arc::clone(&closed),
-            Arc::clone(&errored),
-        );
-
         match source.start(&mut controller).await {
             Ok(()) => {
                 // Start succeeded, put source back and continue
@@ -1464,22 +1500,9 @@ async fn readable_stream_task<T, Source>(
         {
             if let Some(source) = inner.source.take() {
                 inner.pulling = true;
-                let ctrl_tx_clone = ctrl_tx.clone();
-                let queue_total_size_clone = Arc::clone(&queue_total_size);
-                let high_water_mark_clone = Arc::clone(&high_water_mark);
-                let desired_size_clone = Arc::clone(&desired_size);
-                let closed_clone = Arc::clone(&closed);
-                let errored_clone = Arc::clone(&errored);
+                let mut controller = controller.clone();
                 pull_future = Some(Box::pin(async move {
                     let mut source = source;
-                    let mut controller = ReadableStreamDefaultController::new(
-                        ctrl_tx_clone,
-                        queue_total_size_clone,
-                        high_water_mark_clone,
-                        desired_size_clone,
-                        closed_clone,
-                        errored_clone,
-                    );
                     let result = source.pull(&mut controller).await;
                     (source, result)
                 }));
@@ -1533,20 +1556,12 @@ async fn readable_byte_stream_task<Source>(
     errored: Arc<AtomicBool>,
     stored_error: Arc<RwLock<Option<StreamError>>>,
     ctrl_tx: UnboundedSender<ByteControllerMsg>,
+    mut controller: ReadableByteStreamController,
 ) where
     Source: ReadableByteSource + Send + 'static,
 {
     // Call start() first before processing any commands
     if let Some(mut source) = inner.source.take() {
-        let mut controller = ReadableByteStreamController::new(
-            ctrl_tx.clone(),
-            Arc::clone(&queue_total_size),
-            Arc::clone(&high_water_mark),
-            Arc::clone(&desired_size),
-            Arc::clone(&closed),
-            Arc::clone(&errored),
-        );
-
         match source.start(&mut controller).await {
             Ok(()) => {
                 // Start succeeded, put source back and continue
@@ -1983,9 +1998,10 @@ where
     }
 
     // Generic build method that works for all stream types
-    fn build_internal<TaskFn, TaskFut, CtrlMsg>(
+    fn build_internal<TaskFn, TaskFut, CtrlMsg, CtrlFactory>(
         self,
         task_creator: TaskFn,
+        controller_factory: CtrlFactory,
     ) -> ReadableStream<T, Source, StreamType, Unlocked>
     where
         TaskFn: FnOnce(
@@ -1999,9 +2015,18 @@ where
             Arc<AtomicBool>,
             Arc<RwLock<Option<StreamError>>>,
             futures::channel::mpsc::UnboundedSender<CtrlMsg>,
+            StreamType::Controller<T>,
         ) -> TaskFut,
         TaskFut: Future<Output = ()> + Send + 'static,
         CtrlMsg: Send + 'static,
+        CtrlFactory: FnOnce(
+            UnboundedSender<CtrlMsg>,
+            Arc<AtomicUsize>,
+            Arc<AtomicUsize>,
+            Arc<AtomicIsize>,
+            Arc<AtomicBool>,
+            Arc<AtomicBool>,
+        ) -> StreamType::Controller<T>,
     {
         // Common setup
         let (command_tx, command_rx) = unbounded();
@@ -2021,6 +2046,15 @@ where
 
         let inner = ReadableStreamInner::new(self.source, strategy);
 
+        let controller = controller_factory(
+            ctrl_tx.clone(),
+            Arc::clone(&queue_total_size),
+            Arc::clone(&high_water_mark),
+            Arc::clone(&desired_size),
+            Arc::clone(&closed),
+            Arc::clone(&errored),
+        );
+
         // Create task
         let task_fut = task_creator(
             command_rx,
@@ -2033,6 +2067,7 @@ where
             Arc::clone(&errored),
             Arc::clone(&stored_error),
             ctrl_tx,
+            controller.clone(),
         );
 
         // Spawn based on configuration
@@ -2057,6 +2092,7 @@ where
             errored,
             locked,
             stored_error,
+            controller: Arc::new(controller),
             _phantom: PhantomData,
         }
     }
@@ -2070,10 +2106,14 @@ where
 {
     pub fn build(self) -> ReadableStream<T, Source, DefaultStream, Unlocked> {
         self.build_internal(
-            |command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx| {
+            |command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx, controller| {
                 readable_stream_task(
                     command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx,
+                    controller,
                 )
+            },
+            |ctrl_tx, qts, hwm, ds, closed, errored| {
+                ReadableStreamDefaultController::new(ctrl_tx, qts, hwm, ds, closed, errored)
             },
         )
     }
@@ -2085,10 +2125,14 @@ where
 {
     pub fn build(self) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
         self.build_internal(
-            |command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx| {
+            |command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx, controller| {
                 readable_byte_stream_task(
                     command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx,
+                    controller,
                 )
+            },
+            |ctrl_tx, qts, hwm, ds, closed, errored| {
+                ReadableByteStreamController::new(ctrl_tx, qts, hwm, ds, closed, errored)
             },
         )
     }
