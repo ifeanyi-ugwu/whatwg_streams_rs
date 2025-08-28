@@ -1,6 +1,7 @@
 use super::{
     CountQueuingStrategy, Locked, QueuingStrategy, Unlocked,
     errors::{ArcError, StreamError},
+    transform::{TransformReadableSource, TransformStream},
     writable_new::{WritableSink, WritableStream},
 };
 use futures::{
@@ -32,11 +33,6 @@ pub enum StreamState {
     Readable,
     Closed,
     Errored,
-}
-
-// ----------- Placeholder types  -----------
-pub struct TransformStream<I, O> {
-    _phantom: PhantomData<(I, O)>,
 }
 
 // ----------- Stream Type Markers -----------
@@ -447,18 +443,26 @@ where
             .unwrap_or_else(|_| Err(StreamError::Custom("Cancel canceled".into())))
     }
 
-    pub fn pipe_through<I, O, OutputStreamType>(
+    pub fn pipe_through<O>(
         self,
-        _transform: &mut TransformStream<I, O>,
-        _options: Option<StreamPipeOptions>,
-    ) -> ReadableStream<O, Source, OutputStreamType, Unlocked>
+        transform: TransformStream<T, O>,
+        options: Option<StreamPipeOptions>,
+    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
     where
-        I: Send + 'static,
-        O: Send + 'static,
-        OutputStreamType: StreamTypeMarker,
-        T: Into<I>, // Input stream data must be convertible to transform input
+        O: Send + Sync + 'static,
     {
-        todo!("pipe_through implementation")
+        let (readable, writable) = transform.split();
+
+        std::thread::spawn(move || {
+            futures::executor::block_on(async move {
+                let result = self.pipe_to(&writable, options).await;
+                if let Err(e) = result {
+                    eprintln!("Pipe through error: {}", e);
+                }
+            });
+        });
+
+        readable
     }
 
     async fn pipe_to_inner<Sink>(
@@ -626,6 +630,45 @@ where
     {
         let fut = Box::pin(async move { self.pipe_to_inner(&destination, options).await });
         spawn(fut)
+    }
+
+    pub fn pipe_through_spawned<O, SpawnFn, Fut>(
+        self,
+        transform: TransformStream<T, O>,
+        options: Option<StreamPipeOptions>,
+        spawn: SpawnFn,
+    ) -> (
+        ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
+        Fut,
+    )
+    where
+        O: Send + 'static,
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
+        Fut: Future + 'static,
+    {
+        let (readable, writable) = transform.split();
+
+        let pipe_future = Box::pin(async move { self.pipe_to(&writable, options).await });
+
+        let spawn_result = spawn(pipe_future);
+
+        (readable, spawn_result)
+    }
+
+    pub fn pipe_through_with_spawn<O, SpawnFn, Fut>(
+        self,
+        transform: TransformStream<T, O>,
+        options: Option<StreamPipeOptions>,
+        spawn: SpawnFn,
+    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
+    where
+        O: Send + 'static,
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
+        Fut: Future + 'static,
+    {
+        let (readable, _future) = self.pipe_through_spawned(transform, options, spawn);
+
+        readable
     }
 }
 
@@ -4230,5 +4273,296 @@ mod builder_tests {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod pipe_through_tests {
+    use super::super::transform::{StreamResult, *};
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    // Simple uppercase transformer for testing
+    struct UppercaseTransformer;
+
+    impl Transformer<String, String> for UppercaseTransformer {
+        fn transform(
+            &mut self,
+            chunk: String,
+            controller: &mut TransformStreamDefaultController<String>,
+        ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+            let result = controller.enqueue(chunk.to_uppercase());
+            futures::future::ready(result)
+        }
+    }
+
+    // Double transformer for numbers
+    struct DoubleTransformer;
+
+    impl Transformer<i32, i32> for DoubleTransformer {
+        fn transform(
+            &mut self,
+            chunk: i32,
+            controller: &mut TransformStreamDefaultController<i32>,
+        ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+            let result = controller.enqueue(chunk * 2);
+            futures::future::ready(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_basic() {
+        // Create source stream
+        let data = vec!["hello".to_string(), "world".to_string()];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // Create transform
+        let transform = TransformStream::new(UppercaseTransformer);
+
+        // Pipe through
+        let result_stream = source_stream.pipe_through(transform, None);
+        let (_locked, reader) = result_stream.get_reader();
+
+        // Read results
+        let result1 = timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result1, Some("HELLO".to_string()));
+
+        let result2 = timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result2, Some("WORLD".to_string()));
+
+        let result3 = timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result3, None); // Stream closed
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_numbers() {
+        let data = vec![1, 2, 3, 4];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let transform = TransformStream::new(DoubleTransformer);
+        let result_stream = source_stream.pipe_through(transform, None);
+        let (_locked, reader) = result_stream.get_reader();
+
+        // Should get doubled values
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+        assert_eq!(reader.read().await.unwrap(), Some(4));
+        assert_eq!(reader.read().await.unwrap(), Some(6));
+        assert_eq!(reader.read().await.unwrap(), Some(8));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_empty_stream() {
+        let data: Vec<String> = vec![];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let transform = TransformStream::new(UppercaseTransformer);
+        let result_stream = source_stream.pipe_through(transform, None);
+        let (_locked, reader) = result_stream.get_reader();
+
+        // Should immediately return None
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_chained() {
+        // Test chaining multiple transforms
+        let data = vec![1, 2, 3];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // First transform: double
+        let transform1 = TransformStream::new(DoubleTransformer);
+        let intermediate_stream = source_stream.pipe_through(transform1, None);
+
+        // Second transform: double again
+        let transform2 = TransformStream::new(DoubleTransformer);
+        let result_stream = intermediate_stream.pipe_through(transform2, None);
+        let (_locked, reader) = result_stream.get_reader();
+
+        // Should get quadrupled values
+        assert_eq!(reader.read().await.unwrap(), Some(4)); // 1 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), Some(8)); // 2 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), Some(12)); // 3 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    // Test with pipe options
+    #[tokio::test]
+    async fn test_pipe_through_with_options() {
+        let data = vec!["test".to_string()];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let transform = TransformStream::new(UppercaseTransformer);
+
+        let options = StreamPipeOptions {
+            prevent_close: false,
+            prevent_abort: false,
+            prevent_cancel: false,
+            signal: None,
+        };
+
+        let result_stream = source_stream.pipe_through(transform, Some(options));
+        let (_locked, reader) = result_stream.get_reader();
+
+        assert_eq!(reader.read().await.unwrap(), Some("TEST".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    // Test error handling in pipe_through
+    #[tokio::test]
+    async fn test_pipe_through_error_handling() {
+        struct ErrorTransformer;
+
+        impl Transformer<i32, i32> for ErrorTransformer {
+            fn transform(
+                &mut self,
+                chunk: i32,
+                controller: &mut TransformStreamDefaultController<i32>,
+            ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+                if chunk == 3 {
+                    futures::future::ready(Err(StreamError::Custom("Error on 3".into())))
+                } else {
+                    let result = controller.enqueue(chunk);
+                    futures::future::ready(result)
+                }
+            }
+        }
+
+        let data = vec![1, 2, 3, 4];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let transform = TransformStream::new(ErrorTransformer);
+        let result_stream = source_stream.pipe_through(transform, None);
+        let (_locked, reader) = result_stream.get_reader();
+
+        // Should get first two values
+        assert_eq!(reader.read().await.unwrap(), Some(1));
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+
+        // Then should error
+        let read_result = reader.read().await;
+        assert!(read_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_spawned() {
+        // Create source stream
+        let data = vec![1, 2, 3];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // Create a custom spawn function using tokio::spawn
+        let my_spawn = |future| tokio::spawn(future);
+
+        // Create a transform
+        let transform = TransformStream::new(DoubleTransformer);
+
+        // Pipe through using the custom spawn function
+        let (result_stream, _join_handle) =
+            source_stream.pipe_through_spawned(transform, None, my_spawn);
+
+        let (_locked, reader) = result_stream.get_reader();
+
+        // Should get doubled values
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+        assert_eq!(reader.read().await.unwrap(), Some(4));
+        assert_eq!(reader.read().await.unwrap(), Some(6));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_spawned_chained() {
+        // Create a custom spawn function using tokio::spawn.
+        // This is a common pattern to pass to `pipe_through_spawned`.
+        let my_spawn = |future| tokio::spawn(future);
+
+        // 1. Create the initial source stream with some data.
+        let data = vec![1, 2, 3];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // We will collect the futures returned by each spawn call to await them later.
+        let mut spawn_futures = Vec::new();
+
+        // 2. Perform the first pipe operation.
+        // This doubles the values and spawns the piping task.
+        let (intermediate_stream, future_1) = source_stream.pipe_through_spawned(
+            TransformStream::new(DoubleTransformer), // The transform to apply
+            None,                                    // Optional stream pipe options
+            my_spawn,                                // The spawn function to run the pipe task
+        );
+        // Add the returned future handle to our collection.
+        spawn_futures.push(future_1);
+
+        // 3. Perform the second pipe operation, using the output of the first as the input.
+        // This will double the already-doubled values, resulting in quadrupled values.
+        let (result_stream, future_2) = intermediate_stream.pipe_through_spawned(
+            TransformStream::new(DoubleTransformer), // Another transform
+            None,                                    // Optional stream pipe options
+            my_spawn,                                // Reuse the same spawn function
+        );
+        // Add the second future handle to our collection.
+        spawn_futures.push(future_2);
+
+        // 4. Get a reader for the final stream.
+        let (_locked, reader) = result_stream.get_reader();
+
+        // 5. Read the final results. The values should be quadrupled.
+        assert_eq!(reader.read().await.unwrap(), Some(4)); // 1 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), Some(8)); // 2 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), Some(12)); // 3 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), None); // The stream should be closed now.
+
+        // 6. Await all the spawned futures to ensure the background piping tasks
+        // have completed successfully. This is good practice to prevent the test
+        // from finishing while tasks are still running.
+        let results = futures::future::join_all(spawn_futures).await;
+
+        // You could also assert that all futures completed without errors.
+        for result in results {
+            assert!(result.is_ok());
+            let inner_result = result.unwrap();
+            assert!(inner_result.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipe_through_with_spawn_chained() {
+        // 1. Create the initial source stream.
+        let data = vec![1, 2, 3];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // 2. Perform the first pipe operation using the new function.
+        // It returns a ReadableStream, which is immediately chainable.
+        let intermediate_stream = source_stream.pipe_through_with_spawn(
+            TransformStream::new(DoubleTransformer),
+            None,
+            tokio::spawn,
+        );
+
+        // 3. Perform the second pipe operation.
+        // This is a seamless continuation of the chain.
+        let result_stream = intermediate_stream.pipe_through_with_spawn(
+            TransformStream::new(DoubleTransformer),
+            None,
+            tokio::spawn,
+        );
+
+        // 4. Get a reader for the final stream.
+        let (_locked, reader) = result_stream.get_reader();
+
+        // 5. Read the final results. The values should be quadrupled.
+        assert_eq!(reader.read().await.unwrap(), Some(4)); // 1 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), Some(8)); // 2 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), Some(12)); // 3 * 2 * 2
+        assert_eq!(reader.read().await.unwrap(), None); // The stream should be closed now.
     }
 }
