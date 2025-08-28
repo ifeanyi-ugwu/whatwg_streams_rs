@@ -190,12 +190,12 @@ impl<T> ReadableStreamDefaultController<T> {
         }
     }
 
-    pub fn desired_size(&self) -> isize {
+    pub fn desired_size(&self) -> Option<isize> {
         if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
-            return 0;
+            return None;
         }
 
-        self.desired_size.load(Ordering::SeqCst)
+        Some(self.desired_size.load(Ordering::SeqCst))
     }
 
     pub fn close(&mut self) -> StreamResult<()> {
@@ -255,12 +255,12 @@ impl ReadableByteStreamController {
         }
     }
 
-    pub fn desired_size(&self) -> isize {
+    pub fn desired_size(&self) -> Option<isize> {
         if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
-            return 0;
+            return None;
         }
 
-        self.desired_size.load(Ordering::SeqCst)
+        Some(self.desired_size.load(Ordering::SeqCst))
     }
 
     pub fn close(&mut self) -> StreamResult<()> {
