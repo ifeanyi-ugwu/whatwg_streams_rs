@@ -201,14 +201,14 @@ impl<T> ReadableStreamDefaultController<T> {
         Some(self.desired_size.load(Ordering::SeqCst))
     }
 
-    pub fn close(&mut self) -> StreamResult<()> {
+    pub fn close(&self) -> StreamResult<()> {
         self.tx
             .unbounded_send(ControllerMsg::Close)
             .map_err(|_| StreamError::Custom(ArcError::from("Failed to close stream")))?;
         Ok(())
     }
 
-    pub fn enqueue(&mut self, chunk: T) -> StreamResult<()> {
+    pub fn enqueue(&self, chunk: T) -> StreamResult<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(StreamError::Custom(ArcError::from("Stream is closed")));
         }
@@ -222,7 +222,7 @@ impl<T> ReadableStreamDefaultController<T> {
         Ok(())
     }
 
-    pub fn error(&mut self, error: StreamError) -> StreamResult<()> {
+    pub fn error(&self, error: StreamError) -> StreamResult<()> {
         self.tx
             .unbounded_send(ControllerMsg::Error(error))
             .map_err(|_| StreamError::Custom(ArcError::from("Failed to error stream")))?;
