@@ -1,6 +1,6 @@
 use super::{
     CountQueuingStrategy, Locked, QueuingStrategy, Unlocked,
-    errors::{ArcError, StreamError},
+    errors::StreamError,
     transform::{TransformReadableSource, TransformStream},
     writable_new::{WritableSink, WritableStream},
 };
@@ -204,28 +204,28 @@ impl<T> ReadableStreamDefaultController<T> {
     pub fn close(&self) -> StreamResult<()> {
         self.tx
             .unbounded_send(ControllerMsg::Close)
-            .map_err(|_| StreamError::Custom(ArcError::from("Failed to close stream")))?;
+            .map_err(|_| StreamError::Custom("Failed to close stream".into()))?;
         Ok(())
     }
 
     pub fn enqueue(&self, chunk: T) -> StreamResult<()> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom(ArcError::from("Stream is closed")));
+            return Err(StreamError::Custom("Stream is closed".into()));
         }
         if self.errored.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom(ArcError::from("Stream is errored")));
+            return Err(StreamError::Custom("Stream is errored".into()));
         }
 
         self.tx
             .unbounded_send(ControllerMsg::Enqueue { chunk })
-            .map_err(|_| StreamError::Custom(ArcError::from("Failed to enqueue chunk")))?;
+            .map_err(|_| StreamError::Custom("Failed to enqueue chunk".into()))?;
         Ok(())
     }
 
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
         self.tx
             .unbounded_send(ControllerMsg::Error(error))
-            .map_err(|_| StreamError::Custom(ArcError::from("Failed to error stream")))?;
+            .map_err(|_| StreamError::Custom("Failed to error stream".into()))?;
         Ok(())
     }
 }
@@ -269,28 +269,28 @@ impl ReadableByteStreamController {
     pub fn close(&mut self) -> StreamResult<()> {
         self.tx
             .unbounded_send(ByteControllerMsg::Close)
-            .map_err(|_| StreamError::Custom(ArcError::from("Failed to close stream")))?;
+            .map_err(|_| StreamError::Custom("Failed to close stream".into()))?;
         Ok(())
     }
 
     pub fn enqueue(&mut self, chunk: Vec<u8>) -> StreamResult<()> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom(ArcError::from("Stream is closed")));
+            return Err(StreamError::Custom("Stream is closed".into()));
         }
         if self.errored.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom(ArcError::from("Stream is errored")));
+            return Err(StreamError::Custom("Stream is errored".into()));
         }
 
         self.tx
             .unbounded_send(ByteControllerMsg::Enqueue { chunk })
-            .map_err(|_| StreamError::Custom(ArcError::from("Failed to enqueue chunk")))?;
+            .map_err(|_| StreamError::Custom("Failed to enqueue chunk".into()))?;
         Ok(())
     }
 
     pub fn error(&mut self, error: StreamError) -> StreamResult<()> {
         self.tx
             .unbounded_send(ByteControllerMsg::Error(error))
-            .map_err(|_| StreamError::Custom(ArcError::from("Failed to error stream")))?;
+            .map_err(|_| StreamError::Custom("Failed to error stream".into()))?;
         Ok(())
     }
 }
@@ -3047,9 +3047,9 @@ mod tests {
                 _controller: &mut super::ReadableStreamDefaultController<i32>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
                 async {
-                    Err(super::StreamError::Custom(super::ArcError::from(
-                        "Start initialization failed",
-                    )))
+                    Err(super::StreamError::Custom(
+                        "Start initialization failed".into(),
+                    ))
                 }
             }
 

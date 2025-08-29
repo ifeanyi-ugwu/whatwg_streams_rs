@@ -1,7 +1,4 @@
-use super::{
-    Locked, QueuingStrategy, Unlocked,
-    errors::{ArcError, StreamError},
-};
+use super::{Locked, QueuingStrategy, Unlocked, errors::StreamError};
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -154,7 +151,7 @@ where
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(StreamError::Custom(ArcError::from("Stream already locked")));
+            return Err(StreamError::Custom("Stream already locked".into()));
         }
 
         let locked = WritableStream {
@@ -2800,10 +2797,9 @@ mod sink_integration_tests {
             if let Some(fail_on) = self.fail_on_write {
                 if current_count >= fail_on {
                     self.log_operation(&format!("write failed on item {}", current_count + 1));
-                    return Err(StreamError::Custom(ArcError::from(format!(
-                        "Intentional write failure on item {}",
-                        current_count + 1
-                    ))));
+                    return Err(StreamError::Custom(
+                        format!("Intentional write failure on item {}", current_count + 1).into(),
+                    ));
                 }
             }
 
@@ -2818,9 +2814,7 @@ mod sink_integration_tests {
 
             if self.fail_on_close {
                 self.log_operation("close failed");
-                return Err(StreamError::Custom(ArcError::from(
-                    "Intentional close failure",
-                )));
+                return Err(StreamError::Custom("Intentional close failure".into()));
             }
 
             self.log_operation("close completed");
@@ -2833,9 +2827,7 @@ mod sink_integration_tests {
 
             if self.fail_on_abort {
                 self.log_operation("abort failed");
-                return Err(StreamError::Custom(ArcError::from(
-                    "Intentional abort failure",
-                )));
+                return Err(StreamError::Custom("Intentional abort failure".into()));
             }
 
             self.log_operation("abort completed");
@@ -3369,10 +3361,9 @@ mod async_write_integration_tests {
             if let Some(fail_on) = self.fail_on_write {
                 if current_writes > fail_on {
                     self.log_operation("write failed");
-                    return Err(StreamError::Custom(ArcError::from(format!(
-                        "Intentional write failure on write {}",
-                        current_writes
-                    ))));
+                    return Err(StreamError::Custom(
+                        format!("Intentional write failure on write {}", current_writes).into(),
+                    ));
                 }
             }
 
@@ -3386,9 +3377,7 @@ mod async_write_integration_tests {
             self.log_operation("close called");
             if self.fail_on_close {
                 self.log_operation("close failed");
-                return Err(StreamError::Custom(ArcError::from(
-                    "Intentional close failure",
-                )));
+                return Err(StreamError::Custom("Intentional close failure".into()));
             }
             self.log_operation("close completed");
             Ok(())
