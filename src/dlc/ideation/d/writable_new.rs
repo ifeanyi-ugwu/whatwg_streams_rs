@@ -1584,16 +1584,48 @@ impl WritableStreamDefaultController {
         &self.abort_reg
     }*/
 
+    /// Returns `true` if the stream has been aborted.
+    ///
+    /// This is a synchronous check of the abort flag.
     pub fn is_aborted(&self) -> bool {
         self.abort_requested.load(Ordering::SeqCst)
     }
 
+    /// Internal: request that the stream be aborted.
+    ///
+    /// Sets the abort flag and wakes any futures created by [`abort_future()`].
     fn request_abort(&self) {
         self.abort_requested.store(true, Ordering::SeqCst);
         self.abort_waker.wake();
         //let _ = self.tx.unbounded_send(ControllerMsg::AbortRequested);
     }
 
+    /// Returns a future that resolves once the stream is aborted.
+    ///
+    /// # Usage
+    ///
+    /// Sink implementors should `select!` or `tokio::select!` on this future
+    /// alongside their actual write work, so they can stop promptly if
+    /// the stream aborts:
+    ///
+    /// ```no_run
+    /// async fn write(
+    ///     &mut self,
+    ///     chunk: Vec<u8>,
+    ///     controller: &mut WritableStreamDefaultController,
+    /// ) -> StreamResult<()> {
+    ///     tokio::select! {
+    ///         _ = controller.abort_future() => {
+    ///             Err(StreamError::Aborted(None))
+    ///         }
+    ///         _ = async {
+    ///             // do actual I/O
+    ///         } => {
+    ///             Ok(())
+    ///         }
+    ///     }
+    /// }
+    /// ```
     pub fn abort_future(&self) -> impl std::future::Future<Output = ()> {
         let waker = self.abort_waker.clone();
         let flag = self.abort_requested.clone();
@@ -1608,6 +1640,26 @@ impl WritableStreamDefaultController {
         })
     }
 
+    /// Races a future against the abort signal.
+    ///
+    /// If the abort fires first, returns `Err(StreamError::Aborted)`.
+    /// Otherwise, returns the result of the future wrapped in `Ok`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// async fn write(
+    ///     &mut self,
+    ///     chunk: Vec<u8>,
+    ///     controller: &mut WritableStreamDefaultController,
+    /// ) -> StreamResult<()> {
+    ///     controller.with_abort(async move {
+    ///         // simulate slow write
+    ///         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    ///         Ok::<_, StreamError>(())
+    ///     }).await
+    /// }
+    /// ```
     pub fn with_abort<F, T>(&self, fut: F) -> impl Future<Output = Result<T, StreamError>> + Send
     where
         F: Future<Output = T> + Send + 'static,
