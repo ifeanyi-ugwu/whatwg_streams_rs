@@ -1,10 +1,13 @@
 use super::{
     CountQueuingStrategy, Locked, QueuingStrategy, Unlocked,
+    byte_source_trait::ReadableByteSource,
+    byte_state::{ByteStreamState, ByteStreamStateInterface},
     errors::StreamError,
     transform::{TransformReadableSource, TransformStream},
     writable_new::{WritableSink, WritableStream},
 };
 use futures::{
+    FutureExt,
     channel::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
         oneshot,
@@ -74,7 +77,7 @@ where
     }
 }
 
-pub trait ReadableByteSource: Send + Sized + 'static {
+/*pub trait ReadableByteSource: Send + Sized + 'static {
     fn start(
         &mut self,
         controller: &mut ReadableByteStreamController,
@@ -91,7 +94,7 @@ pub trait ReadableByteSource: Send + Sized + 'static {
     fn cancel(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> + Send {
         async { Ok(()) }
     }
-}
+}*/
 
 // ----------- WakerSet -----------
 #[derive(Clone, Default)]
@@ -124,7 +127,7 @@ pub enum StreamCommand<T> {
     },
     ReadInto {
         buffer: Vec<u8>,
-        completion: oneshot::Sender<StreamResult<usize>>,
+        completion: oneshot::Sender<StreamResult<(Vec<u8>, usize)>>,
     },
     Cancel {
         reason: Option<String>,
@@ -231,66 +234,43 @@ impl<T> ReadableStreamDefaultController<T> {
 }
 
 pub struct ReadableByteStreamController {
-    tx: UnboundedSender<ByteControllerMsg>,
-    queue_total_size: Arc<AtomicUsize>,
-    high_water_mark: Arc<AtomicUsize>,
-    desired_size: Arc<AtomicIsize>,
-    closed: Arc<AtomicBool>,
-    errored: Arc<AtomicBool>,
+    //byte_state: Arc<ByteStreamState<Source>>,
+    byte_state: Arc<dyn ByteStreamStateInterface>,
 }
 
 impl ReadableByteStreamController {
-    fn new(
-        tx: UnboundedSender<ByteControllerMsg>,
-        queue_total_size: Arc<AtomicUsize>,
-        high_water_mark: Arc<AtomicUsize>,
-        desired_size: Arc<AtomicIsize>,
-        closed: Arc<AtomicBool>,
-        errored: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new<Source>(byte_state: Arc<ByteStreamState<Source>>) -> Self
+    where
+        Source: ReadableByteSource + Send + 'static,
+    {
         Self {
-            tx,
-            queue_total_size,
-            high_water_mark,
-            desired_size,
-            closed,
-            errored,
+            byte_state: byte_state as Arc<dyn ByteStreamStateInterface>,
         }
     }
 
     pub fn desired_size(&self) -> Option<isize> {
-        if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
-            return None;
-        }
-
-        Some(self.desired_size.load(Ordering::SeqCst))
+        self.byte_state.desired_size()
     }
 
     pub fn close(&mut self) -> StreamResult<()> {
-        self.tx
-            .unbounded_send(ByteControllerMsg::Close)
-            .map_err(|_| StreamError::Custom("Failed to close stream".into()))?;
+        self.byte_state.close();
         Ok(())
     }
 
     pub fn enqueue(&mut self, chunk: Vec<u8>) -> StreamResult<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.byte_state.is_closed() {
             return Err(StreamError::Custom("Stream is closed".into()));
         }
-        if self.errored.load(Ordering::SeqCst) {
+        if self.byte_state.is_errored() {
             return Err(StreamError::Custom("Stream is errored".into()));
         }
 
-        self.tx
-            .unbounded_send(ByteControllerMsg::Enqueue { chunk })
-            .map_err(|_| StreamError::Custom("Failed to enqueue chunk".into()))?;
+        self.byte_state.enqueue_data(&chunk);
         Ok(())
     }
 
     pub fn error(&mut self, error: StreamError) -> StreamResult<()> {
-        self.tx
-            .unbounded_send(ByteControllerMsg::Error(error))
-            .map_err(|_| StreamError::Custom("Failed to error stream".into()))?;
+        self.byte_state.error(error);
         Ok(())
     }
 }
@@ -298,12 +278,7 @@ impl ReadableByteStreamController {
 impl Clone for ReadableByteStreamController {
     fn clone(&self) -> Self {
         Self {
-            tx: self.tx.clone(),
-            queue_total_size: self.queue_total_size.clone(),
-            high_water_mark: self.high_water_mark.clone(),
-            desired_size: self.desired_size.clone(),
-            closed: self.closed.clone(),
-            errored: self.errored.clone(),
+            byte_state: self.byte_state.clone(),
         }
     }
 }
@@ -319,7 +294,7 @@ struct ReadableStreamInner<T, Source> {
     cancel_reason: Option<String>,
     cancel_completions: Vec<oneshot::Sender<StreamResult<()>>>,
     pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<T>>>>,
-    pending_read_intos: VecDeque<(Vec<u8>, oneshot::Sender<StreamResult<usize>>)>,
+    pending_read_intos: VecDeque<(Vec<u8>, oneshot::Sender<StreamResult<(Vec<u8>, usize)>>)>,
     ready_wakers: WakerSet,
     closed_wakers: WakerSet,
     stored_error: Option<StreamError>,
@@ -383,6 +358,8 @@ where
     stored_error: Arc<RwLock<Option<StreamError>>>,
     desired_size: Arc<AtomicIsize>,
     pub(crate) controller: Arc<StreamType::Controller<T>>,
+    //byte_state: Option<Arc<ByteStreamState<Source>>>,
+    pub(crate) byte_state: Option<Arc<dyn ByteStreamStateInterface + Send + Sync>>,
     _phantom: PhantomData<(T, Source, StreamType, LockState)>,
 }
 
@@ -396,14 +373,14 @@ where
     }
 }
 
-impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+/*impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
 where
     Source: Send + 'static,
 {
-    pub(crate) fn controller(&self) -> &ReadableByteStreamController {
+    pub(crate) fn controller(&self) -> &ReadableByteStreamController<Self> {
         self.controller.as_ref()
     }
-}
+}*/
 
 impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
@@ -744,6 +721,7 @@ where
             locked,
             stored_error,
             controller: controller.into(),
+            byte_state: None,
             _phantom: PhantomData,
         }
     }
@@ -758,7 +736,7 @@ where
         strategy: Option<Box<dyn QueuingStrategy<Vec<u8>> + Send + Sync + 'static>>,
     ) -> Self {
         let (command_tx, command_rx) = unbounded();
-        let (ctrl_tx, ctrl_rx) = unbounded();
+        let (ctrl_tx, ctrl_rx) = unbounded::<ByteControllerMsg>();
         let queue_total_size = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let errored = Arc::new(AtomicBool::new(false));
@@ -771,30 +749,13 @@ where
         let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
         let desired_size = Arc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
 
-        let inner = ReadableStreamInner::new(source, strategy);
+        //let inner = ReadableStreamInner::new(source, strategy);
 
-        let controller = ReadableByteStreamController::new(
-            ctrl_tx.clone(),
-            Arc::clone(&queue_total_size),
-            Arc::clone(&high_water_mark),
-            Arc::clone(&desired_size),
-            Arc::clone(&closed),
-            Arc::clone(&errored),
-        );
+        let byte_state = ByteStreamState::new(source, strategy.high_water_mark());
+        let controller = ReadableByteStreamController::new(byte_state.clone());
 
-        let task_fut = readable_byte_stream_task(
-            command_rx,
-            ctrl_rx,
-            inner,
-            Arc::clone(&queue_total_size),
-            Arc::clone(&high_water_mark),
-            Arc::clone(&desired_size),
-            Arc::clone(&closed),
-            Arc::clone(&errored),
-            Arc::clone(&stored_error),
-            ctrl_tx,
-            controller.clone(),
-        );
+        let task_state = byte_state.clone();
+        let task_fut = readable_byte_stream_task(task_state, command_rx, controller.clone());
 
         std::thread::spawn(move || {
             futures::executor::block_on(task_fut);
@@ -809,7 +770,8 @@ where
             errored,
             locked,
             stored_error,
-            controller: controller.into(),
+            controller: Arc::new(controller),
+            byte_state: Some(byte_state),
             _phantom: PhantomData,
         }
     }
@@ -887,6 +849,7 @@ where
             locked,
             stored_error,
             controller: controller.into(),
+            byte_state: None,
             _phantom: PhantomData,
         }
     }
@@ -940,6 +903,7 @@ where
             locked: Arc::clone(&self.locked),
             stored_error: Arc::clone(&self.stored_error),
             controller: self.controller.clone(),
+            byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
         };
 
@@ -953,6 +917,7 @@ where
             locked: self.locked,
             stored_error: self.stored_error,
             controller: self.controller,
+            byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
         });
 
@@ -983,6 +948,7 @@ where
             locked: Arc::clone(&self.locked),
             stored_error: Arc::clone(&self.stored_error),
             controller: self.controller.clone(),
+            byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
         };
 
@@ -996,6 +962,7 @@ where
             locked: self.locked,
             stored_error: self.stored_error,
             controller: self.controller,
+            byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
         });
 
@@ -1041,7 +1008,7 @@ impl<T, Source, StreamType, LockState> AsyncRead
     for ReadableStream<T, Source, StreamType, LockState>
 where
     T: for<'a> From<&'a [u8]> + Send + 'static,
-    Source: Send + 'static,
+    Source: ReadableByteSource + Send + 'static,
     StreamType: StreamTypeMarker,
     LockState: Send + 'static,
 {
@@ -1050,31 +1017,14 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<IoResult<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
+        match self.byte_state.as_ref().unwrap().poll_read_into(cx, buf) {
+            Poll::Ready(Ok(bytes)) => Poll::Ready(Ok(bytes)),
+            Poll::Ready(Err(stream_err)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                stream_err.to_string(),
+            ))),
+            Poll::Pending => Poll::Pending,
         }
-
-        if self.errored.load(Ordering::SeqCst) {
-            let error_msg = self
-                .stored_error
-                .read()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "Stream is errored".to_string());
-            return Poll::Ready(Err(IoError::new(ErrorKind::Other, error_msg)));
-        }
-
-        if self.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(0));
-        }
-
-        let waker = cx.waker().clone();
-        let _ = self
-            .command_tx
-            .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
-
-        Poll::Pending
     }
 }
 
@@ -1144,7 +1094,22 @@ where
         ReadableStreamDefaultReader(stream)
     }
 
+    fn is_byte_stream(&self) -> bool {
+        self.0.byte_state.is_some()
+    }
+
     pub async fn closed(&self) -> StreamResult<()> {
+        if self.is_byte_stream() {
+            return self
+                .0
+                .byte_state
+                .as_ref()
+                .unwrap()
+                .closed()
+                .await
+                .map_err(|e| e);
+        }
+
         poll_fn(|cx| {
             if self.0.errored.load(Ordering::SeqCst) {
                 let error = self
@@ -1170,6 +1135,15 @@ where
     }
 
     pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
+        if self.is_byte_stream() {
+            self.0
+                .byte_state
+                .as_ref()
+                .unwrap()
+                .cancel_source(reason.clone())
+                .await?
+        }
+
         let (tx, rx) = oneshot::channel();
         self.0
             .command_tx
@@ -1182,12 +1156,78 @@ where
             .unwrap_or_else(|_| Err(StreamError::Custom("Cancel canceled".into())))
     }
 
+    /*pub async fn read_bytes_with_hint(&self, size_hint: usize) -> StreamResult<Option<Vec<u8>>> {
+            if let Some(byte_state_arc) = &self.0.byte_state {
+                let mut buf = vec![0u8; size_hint];
+                let n = poll_fn(|cx| byte_state_arc.poll_read_into(cx, &mut buf)).await?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                buf.truncate(n);
+                Ok(Some(buf))
+            } else {
+                // optionally return Err because read_bytes only valid for byte streams
+                Err(StreamError::Custom(
+                    "read_bytes is only valid for byte streams".into(),
+                ))
+            }
+        }
+    */
+    /// Reads the next available chunk of bytes from the stream.
+    ///
+    /// Unlike `read_bytes(size_hint)`, this method allocates an internal
+    /// buffer with a default capacity (8 KB). The buffer is truncated
+    /// to the actual number of bytes read.
+    ///
+    /// Returns:
+    /// - `Ok(Some(Vec<u8>))` with data if available
+    /// - `Ok(None)` if stream is closed/EOF
+    /// - `Err(StreamError)` if errored
+    /*pub async fn read_bytes(&self) -> StreamResult<Option<Vec<u8>>> {
+        if let Some(byte_state_arc) = &self.0.byte_state {
+            // default buffer size (tunable)
+            let mut buf = vec![0u8; 8192];
+
+            let n = poll_fn(|cx| byte_state_arc.poll_read_into(cx, &mut buf)).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+
+            buf.truncate(n);
+            Ok(Some(buf))
+        } else {
+            Err(StreamError::Custom(
+                "read() is only valid for byte streams".into(),
+            ))
+        }
+    }*/
+
     pub async fn read(&self) -> StreamResult<Option<T>> {
+        /*if self.is_byte_stream() {
+            // Safe because T == Vec<u8> in byte streams
+            let mut buf = vec![0u8; 8192]; // default chunk size?
+            let n = poll_fn(|cx| {
+                self.0
+                    .byte_state
+                    .as_ref()
+                    .unwrap()
+                    .poll_read_into(cx, &mut buf)
+            })
+            .await?;
+            buf.truncate(n);
+            return Ok(if n == 0 {
+                None
+            } else {
+                Some(unsafe { std::mem::transmute::<Vec<u8>, T>(buf) })
+            });
+        }*/
+
         let (tx, rx) = oneshot::channel();
         self.0
             .command_tx
             .unbounded_send(StreamCommand::Read { completion: tx })
             .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+        eprintln!("read request sent into task");
         rx.await
             .unwrap_or_else(|_| Err(StreamError::Custom("Read canceled".into())))
     }
@@ -1204,10 +1244,20 @@ where
             locked: self.0.locked.clone(),
             stored_error: self.0.stored_error.clone(),
             controller: self.0.controller.clone(),
+            byte_state: self.0.byte_state.clone(),
             _phantom: PhantomData,
         }
     }
 }
+
+/*impl<Source, StreamType, LockState>
+    ReadableStreamDefaultReader<Vec<u8>, Source, StreamType, LockState>
+where
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker,
+    LockState: Send + 'static,
+{
+}*/
 
 impl<T, Source, StreamType, LockState> Drop
     for ReadableStreamDefaultReader<T, Source, StreamType, LockState>
@@ -1239,61 +1289,94 @@ where
         ReadableStreamBYOBReader(stream)
     }
 
-    pub async fn closed(&self) -> StreamResult<()> {
-        poll_fn(|cx| {
-            if self.0.errored.load(Ordering::SeqCst) {
-                let error = self
-                    .0
-                    .stored_error
-                    .read()
-                    .ok()
-                    .and_then(|guard| guard.clone())
-                    .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));
-                return Poll::Ready(Err(error));
-            }
-            if self.0.closed.load(Ordering::SeqCst) {
-                return Poll::Ready(Ok(()));
-            }
-            let waker = cx.waker().clone();
-            let _ = self
-                .0
-                .command_tx
-                .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
-            Poll::Pending
-        })
-        .await
+    pub async fn closed(&self) -> Result<(), StreamError> {
+        self.0.controller.byte_state.closed().await
     }
 
-    pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
-        let (tx, rx) = oneshot::channel();
-        self.0
-            .command_tx
-            .unbounded_send(StreamCommand::Cancel {
-                reason,
-                completion: tx,
-            })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Cancel canceled".into())))
+    pub async fn cancel(&self, reason: Option<String>) -> Result<(), StreamError> {
+        if let Some(byte_state_arc) = &self.0.byte_state {
+            // call the trait object's cancel_source helper
+            byte_state_arc
+                .cancel_source(reason)
+                .await
+                .map_err(|e| e.into())
+        } else {
+            // Already canceled or closed
+            Ok(())
+        }
     }
 
     // BYOB-specific read method that takes a buffer
-    pub async fn read(&self, buffer: &mut [u8]) -> StreamResult<Option<usize>> {
+    /*pub async fn read_into(&self, mut buffer: Vec<u8>) -> StreamResult<(Vec<u8>, usize)> {
         let (tx, rx) = oneshot::channel();
         self.0
             .command_tx
             .unbounded_send(StreamCommand::ReadInto {
-                buffer: buffer.to_vec(),
+                buffer,
                 completion: tx,
             })
             .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
 
-        match rx.await {
-            Ok(Ok(bytes_read)) => Ok(Some(bytes_read)),
-            Ok(Err(StreamError::Closed)) => Ok(None),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(StreamError::Custom("Read canceled".into())),
+        rx.await
+            .unwrap_or_else(|_| Err(StreamError::Custom("Read canceled".into())))
+    }
+
+    pub async fn read(&self, buffer: &mut [u8]) -> StreamResult<usize> {
+        // Convert slice to owned Vec for transfer
+        let mut owned_buffer = vec![0u8; buffer.len()];
+
+        let (filled_buffer, bytes_read) = self.read_into(owned_buffer).await?;
+
+        // Copy back to the original buffer
+        let copy_len = std::cmp::min(bytes_read, buffer.len());
+        buffer[..copy_len].copy_from_slice(&filled_buffer[..copy_len]);
+
+        Ok(bytes_read)
+    }
+
+    pub async fn read_exact_into(&self, buffer: &mut [u8]) -> StreamResult<()> {
+        let mut bytes_read = 0;
+        while bytes_read < buffer.len() {
+            let remaining = &mut buffer[bytes_read..];
+            let chunk_size = self.read(remaining).await?;
+
+            if chunk_size == 0 {
+                return Err(StreamError::Custom("Unexpected EOF".into()));
+            }
+
+            bytes_read += chunk_size;
         }
+        Ok(())
+    }*/
+
+    // Zero-copy for performance-critical code
+    // Primary zero-copy read method
+    pub async fn read(&self, buf: &mut [u8]) -> StreamResult<usize> {
+        poll_fn(|cx| self.0.byte_state.as_ref().unwrap().poll_read_into(cx, buf)).await
+    }
+
+    // Convenience method for less performance-critical code
+    // Convenience method for allocating reads
+    pub async fn read_chunk(&self, size: usize) -> StreamResult<Vec<u8>> {
+        let mut buf = vec![0u8; size];
+        let bytes_read = self.read(&mut buf).await?;
+        buf.truncate(bytes_read);
+        Ok(buf)
+    }
+
+    // For users who want to avoid allocation
+    // Read exact amount or fail
+    pub async fn read_exact(&self, buf: &mut [u8]) -> StreamResult<()> {
+        let mut total = 0;
+        while total < buf.len() {
+            let bytes = self.read(&mut buf[total..]).await?;
+            if bytes == 0 {
+                //return Err(StreamError::UnexpectedEof);
+                return Err(StreamError::Custom("UnexpectedEof".into()));
+            }
+            total += bytes;
+        }
+        Ok(())
     }
 
     pub fn release_lock(self) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
@@ -1308,6 +1391,7 @@ where
             locked: self.0.locked.clone(),
             stored_error: self.0.stored_error.clone(),
             controller: self.0.controller.clone(),
+            byte_state: self.0.byte_state.clone(),
             _phantom: PhantomData,
         }
     }
@@ -1588,7 +1672,7 @@ async fn readable_stream_task<T, Source>(
 }
 
 // ----------- Byte Stream Task Implementation -----------
-async fn readable_byte_stream_task<Source>(
+/*async fn _readable_byte_stream_task<Source>(
     mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
     mut ctrl_rx: UnboundedReceiver<ByteControllerMsg>,
     mut inner: ReadableStreamInner<Vec<u8>, Source>,
@@ -1600,6 +1684,7 @@ async fn readable_byte_stream_task<Source>(
     stored_error: Arc<RwLock<Option<StreamError>>>,
     ctrl_tx: UnboundedSender<ByteControllerMsg>,
     mut controller: ReadableByteStreamController,
+    direct_state: Arc<ByteStreamState>,
 ) where
     Source: ReadableByteSource + Send + 'static,
 {
@@ -1640,7 +1725,7 @@ async fn readable_byte_stream_task<Source>(
                     if let Some((mut buffer, tx)) = inner.pending_read_intos.pop_front() {
                         let bytes_to_copy = std::cmp::min(chunk.len(), buffer.len());
                         buffer[..bytes_to_copy].copy_from_slice(&chunk[..bytes_to_copy]);
-                        let _ = tx.send(Ok(bytes_to_copy));
+                        let _ = tx.send(Ok((buffer, bytes_to_copy)));
 
                         // If there's remaining data, put it in the queue
                         if chunk.len() > bytes_to_copy {
@@ -1651,10 +1736,10 @@ async fn readable_byte_stream_task<Source>(
                             queue_total_size.store(inner.queue_total_size, Ordering::SeqCst);
                         }
                     } else if let Some(tx) = inner.pending_reads.pop_front() {
-                        let _ = tx.send(Ok(Some(chunk)));
+                        let _ = tx.send(Ok(Some(chunk.clone())));
                     } else {
                         let chunk_size = inner.strategy.size(&chunk);
-                        inner.queue.push_back(chunk);
+                        inner.queue.push_back(chunk.clone());
                         inner.queue_total_size += chunk_size;
                         queue_total_size.store(inner.queue_total_size, Ordering::SeqCst);
                         update_desired_size(
@@ -1666,6 +1751,8 @@ async fn readable_byte_stream_task<Source>(
                         );
                         inner.ready_wakers.wake_all();
                     }
+                    // ALSO feed the direct state for zero-copy AsyncRead
+                    direct_state.enqueue_data(&chunk);
                 }
                 ByteControllerMsg::Close => {
                     if inner.state == StreamState::Readable {
@@ -1679,9 +1766,11 @@ async fn readable_byte_stream_task<Source>(
                         }
 
                         // Complete pending pull_intos with 0 bytes read (EOF)
-                        while let Some((_buffer, tx)) = inner.pending_read_intos.pop_front() {
-                            let _ = tx.send(Ok(0));
+                        while let Some((buffer, tx)) = inner.pending_read_intos.pop_front() {
+                            let _ = tx.send(Ok((buffer, 0)));
                         }
+
+                        direct_state.close();
 
                         inner.closed_wakers.wake_all();
                         inner.ready_wakers.wake_all();
@@ -1707,6 +1796,8 @@ async fn readable_byte_stream_task<Source>(
                         while let Some((_buffer, tx)) = inner.pending_read_intos.pop_front() {
                             let _ = tx.send(Err(err.clone()));
                         }
+
+                        direct_state.error(err.clone());
 
                         inner.closed_wakers.wake_all();
                         inner.ready_wakers.wake_all();
@@ -1752,7 +1843,7 @@ async fn readable_byte_stream_task<Source>(
                         continue;
                     }
                     if inner.state == StreamState::Closed && inner.queue.is_empty() {
-                        let _ = completion.send(Ok(0));
+                        let _ = completion.send(Ok((buffer, 0)));
                         continue;
                     }
 
@@ -1760,7 +1851,7 @@ async fn readable_byte_stream_task<Source>(
                     if let Some(chunk) = inner.queue.pop_front() {
                         let bytes_to_copy = std::cmp::min(chunk.len(), buffer.len());
                         buffer[..bytes_to_copy].copy_from_slice(&chunk[..bytes_to_copy]);
-                        let _ = completion.send(Ok(bytes_to_copy));
+                        //let _ = completion.send(Ok(bytes_to_copy));
 
                         // Put back any remaining data
                         if chunk.len() > bytes_to_copy {
@@ -1781,6 +1872,7 @@ async fn readable_byte_stream_task<Source>(
                             &closed,
                             &errored,
                         );
+                        let _ = completion.send(Ok((buffer, bytes_to_copy)));
                     } else {
                         // Queue the read_into request
                         inner.pending_read_intos.push_back((buffer, completion));
@@ -1912,7 +2004,7 @@ async fn readable_byte_stream_task<Source>(
                                 {
                                     let to_copy = std::cmp::min(bytes_read, consumer_buffer.len());
                                     consumer_buffer[..to_copy].copy_from_slice(&buffer[..to_copy]);
-                                    let _ = tx.send(Ok(to_copy));
+                                    let _ = tx.send(Ok((buffer.clone(), to_copy)));
 
                                     if bytes_read > to_copy {
                                         let remaining = buffer[to_copy..bytes_read].to_vec();
@@ -1977,6 +2069,1467 @@ async fn readable_byte_stream_task<Source>(
     })
     .await;
 }
+*/
+
+// Async task that handles pulling from the source
+/*async fn __readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Call start() on the source
+    if let Some(mut source) = byte_state.source.lock().take() {
+        match source.start(&mut controller).await {
+            Ok(()) => {
+                // Put source back
+                *byte_state.source.lock() = Some(source);
+            }
+            Err(err) => {
+                byte_state.error(err);
+                return;
+            }
+        }
+    }
+
+    // Main polling loop
+    poll_fn(|cx| {
+        // Check if we need to pull
+        if let Poll::Ready(()) = byte_state.poll_pull_needed(cx) {
+            // Take source for pulling
+            if let Some(mut source) = byte_state.source.lock().take() {
+                byte_state.mark_pull_started();
+
+                // Create a buffer for the pull operation
+                let mut pull_buffer = vec![0u8; 8192]; // 8KB chunks
+                let state_clone = byte_state.clone();
+                let mut controller = controller.clone();
+
+                // Spawn the pull operation
+                let pull_fut = async move {
+                    let result = source.pull(&mut controller, &mut pull_buffer).await;
+
+                    match result {
+                        Ok(bytes_read) => {
+                            if bytes_read > 0 {
+                                // Enqueue the data
+                                state_clone.enqueue_data(&pull_buffer[..bytes_read]);
+                            } /*else {
+                            // EOF from source
+                            state_clone.close();
+                            }*/
+                        }
+                        Err(err) => {
+                            state_clone.error(err);
+                        }
+                    }
+
+                    state_clone.mark_pull_completed();
+
+                    // Put source back if stream is still active
+                    if !state_clone.closed.load(Ordering::SeqCst)
+                        && !state_clone.errored.load(Ordering::SeqCst)
+                    {
+                        *state_clone.source.lock() = Some(source);
+                    }
+                };
+
+                // Spawn the pull operation in the background
+                std::thread::spawn(move || {
+                    futures::executor::block_on(pull_fut);
+                });
+            }
+        }
+
+        // Keep the task alive
+        Poll::Pending::<()>
+    })
+    .await;
+}
+*/
+
+/*fn assert_send<T: Send>() {}
+fn assert_sync<T: Sync>() {}
+
+fn check_traits() {
+    assert_send::<ReadableByteStreamController>();
+    assert_sync::<ReadableByteStreamController>();
+    // also assert for your source impl type(s)
+    // assert_send::<YourSourceType>();
+}*/
+
+/*
+pub async fn _readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // 1. Call start() on the source
+    /*if let Some(mut source) = byte_state.source.lock().take() {
+        //let mut controller = controller.clone();
+        match source.start(&mut controller).await {
+            Ok(()) => {
+                *byte_state.source.lock() = Some(source);
+            }
+            Err(err) => {
+                byte_state.error(err);
+                return;
+            }
+        }
+    }*/
+
+    // 2. Main driver loop
+    loop {
+        // Wait until a pull is requested
+        poll_fn(|cx| byte_state.poll_pull_needed(cx)).await;
+
+        // Stop if closed/errored
+        if byte_state.closed.load(Ordering::SeqCst) || byte_state.errored.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Take the source
+        let mut source = match byte_state.source.lock().take() {
+            Some(src) => src,
+            None => break, // no source left
+        };
+
+        byte_state.mark_pull_started();
+
+        // Allocate a buffer
+        let mut buffer = vec![0u8; 8192];
+        let mut controller = controller.clone();
+
+        // Perform the pull
+        match source.pull(&mut controller, &mut buffer).await {
+            Ok(bytes_read) => {
+                if bytes_read > 0 {
+                    byte_state.enqueue_data(&buffer[..bytes_read]);
+                } else {
+                    // EOF
+                    byte_state.close();
+                }
+            }
+            Err(err) => {
+                byte_state.error(err);
+            }
+        }
+
+        byte_state.mark_pull_completed();
+
+        // Return the source if still active
+        if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+            && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            *byte_state.source.lock() = Some(source);
+        } else {
+            break;
+        }
+    }
+}
+
+pub async fn __readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Track if any data was produced in this pull cycle
+    let mut any_data_produced = false;
+
+    // 2. Main driver loop
+    loop {
+        // Wait until a pull is requested
+        poll_fn(|cx| byte_state.poll_pull_needed(cx)).await;
+
+        // Stop if closed/errored
+        if byte_state.closed.load(Ordering::SeqCst) || byte_state.errored.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Take the source
+        let mut source = match byte_state.source.lock().take() {
+            Some(src) => src,
+            None => break, // no source left
+        };
+
+        byte_state.mark_pull_started();
+
+        // Allocate a buffer
+        let mut buffer = vec![0u8; 8192];
+        let mut controller = controller.clone();
+
+        // Track buffer size before pull to detect controller.enqueue() usage
+        let buffer_size_before = byte_state.buffer_size();
+
+        // Perform the pull
+        match source.pull(&mut controller, &mut buffer).await {
+            Ok(bytes_read) => {
+                any_data_produced = false;
+
+                // Check if data was written to buffer
+                if bytes_read > 0 {
+                    byte_state.enqueue_data(&buffer[..bytes_read]);
+                    any_data_produced = true;
+                }
+
+                // Check if data was enqueued via controller
+                let buffer_size_after = byte_state.buffer_size();
+                if buffer_size_after > buffer_size_before {
+                    any_data_produced = true;
+                }
+
+                // Only close if no data was produced AND source explicitly signals EOF
+                if !any_data_produced && bytes_read == 0 {
+                    // This is EOF - no data via buffer OR controller
+                    byte_state.close();
+                }
+            }
+            Err(err) => {
+                byte_state.error(err);
+            }
+        }
+
+        byte_state.mark_pull_completed();
+
+        // Return the source if still active
+        if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+            && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            *byte_state.source.lock() = Some(source);
+        } else {
+            break;
+        }
+    }
+}
+
+pub async fn ___readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    loop {
+        // 1. Pull data from the source if needed
+        poll_fn(|cx| byte_state.poll_pull_needed(cx)).await;
+
+        if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            break;
+        }
+
+        let mut source = match byte_state.source.lock().take() {
+            Some(s) => s,
+            None => break,
+        };
+
+        byte_state.mark_pull_started();
+
+        let mut buffer = vec![0u8; 8192];
+        let mut controller = controller.clone();
+
+        let size_before = byte_state.buffer_size();
+
+        match source.pull(&mut controller, &mut buffer).await {
+            Ok(bytes_read) => {
+                let mut any_data_produced = false;
+
+                if bytes_read > 0 {
+                    byte_state.enqueue_data(&buffer[..bytes_read]);
+                    any_data_produced = true;
+                }
+
+                let size_after = byte_state.buffer_size();
+                if size_after > size_before {
+                    any_data_produced = true;
+                }
+
+                if !any_data_produced && bytes_read == 0 {
+                    byte_state.close();
+                }
+            }
+            Err(err) => {
+                byte_state.error(err);
+            }
+        }
+
+        byte_state.mark_pull_completed();
+
+        if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+            && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            *byte_state.source.lock() = Some(source);
+        } else {
+            break;
+        }
+
+        // 2. Process pending Read commands
+        /*while let Some(cmd) = command_rx.next().await {
+            match cmd {
+                StreamCommand::Read { completion } => {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).await {
+                            Ok(0) => {
+                                let _ = completion.send(Ok(None)); // EOF
+                                break;
+                            }
+                            Ok(n) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                                break;
+                            }
+                            Err(err) => {
+                                let _ = completion.send(Err(err));
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }*/
+        if let Some(cmd) = command_rx.next().await {
+            if let StreamCommand::Read { completion } = cmd {
+                eprintln!("read command received");
+                let mut pending = byte_state.pending_reads.lock();
+                pending.push_back(completion);
+            }
+        }
+    }
+}
+*/
+/*pub async fn ____readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    loop {
+        // futures::select! requires futures to be fused
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        let mut any_data_produced = false;
+
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        let size_after = byte_state.buffer_size();
+                        if size_after > size_before {
+                            any_data_produced = true;
+                        }
+
+                        if !any_data_produced && bytes_read == 0 {
+                            byte_state.close();
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err);
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                } else {
+                    break;
+                }
+            }
+
+            // 2️⃣ Handle pending Read commands concurrently
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        // Attempt to read directly from buffer
+                        let mut buf = vec![0u8; 8192];
+                        loop {
+                            match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).await {
+                                Ok(0) => {
+                                    let _ = completion.send(Ok(None)); // EOF
+                                    break;
+                                }
+                                Ok(n) => {
+                                    buf.truncate(n);
+                                    let _ = completion.send(Ok(Some(buf)));
+                                    break;
+                                }
+                                Err(err) => {
+                                    let _ = completion.send(Err(err));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(_) => {} // Ignore other commands for now
+                    None => break, // channel closed
+                }
+            }
+        }
+    }
+}
+*/
+
+/*pub async fn _readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    loop {
+        // Use futures::select! to handle both pull requests and read commands
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        let mut any_data_produced = false;
+
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        let size_after = byte_state.buffer_size();
+                        if size_after > size_before {
+                            any_data_produced = true;
+                        }
+
+                        if !any_data_produced && bytes_read == 0 {
+                            byte_state.close();
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err);
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                } else {
+                    break;
+                }
+            }
+
+            // 2️⃣ Handle Read commands
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        eprintln!("Processing read command in byte stream task");
+
+                        // Check error state first
+                        if byte_state.errored.load(Ordering::SeqCst) {
+                            let error = byte_state.error.lock()
+                                .clone()
+                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                            let _ = completion.send(Err(error));
+                            continue;
+                        }
+
+                        // Try to read from buffer immediately
+                        let mut buf = vec![0u8; 8192];
+                        let result = poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).await;
+
+                        match result {
+                            Ok(0) => {
+                                // EOF
+                                let _ = completion.send(Ok(None));
+                            }
+                            Ok(n) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                            }
+                            Err(err) => {
+                                let _ = completion.send(Err(err));
+                            }
+                        }
+                    }
+                    Some(StreamCommand::Cancel { reason, completion }) => {
+                        // Handle cancel command
+                        let cancel_result = byte_state.cancel_source(reason).await;
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+                    Some(_) => {
+                        // Ignore other commands for byte streams
+                    }
+                    None => break, // Channel closed
+                }
+            }
+        }
+    }
+}
+*/
+
+/*
+pub async fn _readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Store pending read completions locally in the task
+    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
+        VecDeque::new();
+
+    loop {
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        let mut any_data_produced = false;
+
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        let size_after = byte_state.buffer_size();
+                        if size_after > size_before {
+                            any_data_produced = true;
+                        }
+
+                        // Process pending reads after data is available
+                        if any_data_produced {
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let mut read_buf = vec![0u8; 8192];
+                                match poll_fn(|cx| byte_state.poll_read_into(cx, &mut read_buf)).now_or_never() {
+                                    Some(Ok(0)) => {
+                                        let _ = completion.send(Ok(None)); // EOF
+                                    }
+                                    Some(Ok(n)) => {
+                                        read_buf.truncate(n);
+                                        let _ = completion.send(Ok(Some(read_buf)));
+                                        break; // Only fulfill one read per pull
+                                    }
+                                    Some(Err(err)) => {
+                                        let _ = completion.send(Err(err));
+                                    }
+                                    None => {
+                                        // Still pending, put the completion back
+                                        pending_reads.push_front(completion);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !any_data_produced && bytes_read == 0 {
+                            byte_state.close();
+                            // Complete all pending reads with EOF
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Ok(None));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err.clone());
+                        // Complete all pending reads with error
+                        while let Some(completion) = pending_reads.pop_front() {
+                            let _ = completion.send(Err(err.clone()));
+                        }
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                } else {
+                    break;
+                }
+            }
+
+            // 2️⃣ Handle Read commands
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        eprintln!("Processing read command in byte stream task");
+
+                        // Check error state first
+                        if byte_state.errored.load(Ordering::SeqCst) {
+                            let error = byte_state.error.lock()
+                                .clone()
+                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                            let _ = completion.send(Err(error));
+                            continue;
+                        }
+
+                        // Check if closed and no data
+                        if byte_state.closed.load(Ordering::SeqCst) && byte_state.is_buffer_empty() {
+                            let _ = completion.send(Ok(None));
+                            continue;
+                        }
+
+                        // Try to read immediately if data is available
+                        let mut buf = vec![0u8; 8192];
+                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).now_or_never() {
+                            Some(Ok(0)) => {
+                                let _ = completion.send(Ok(None)); // EOF
+                            }
+                            Some(Ok(n)) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                            }
+                            Some(Err(err)) => {
+                                let _ = completion.send(Err(err));
+                            }
+                            None => {
+                                // No data available right now, queue the read
+                                eprintln!("Queueing read request - no data available");
+                                pending_reads.push_back(completion);
+                                // Trigger a pull if needed
+                                byte_state.maybe_trigger_pull();
+                            }
+                        }
+                    }
+                    Some(StreamCommand::Cancel { reason, completion }) => {
+                        let cancel_result = byte_state.cancel_source(reason).await;
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+                    Some(_) => {
+                        // Ignore other commands for byte streams
+                    }
+                    None => break, // Channel closed
+                }
+            }
+        }
+    }
+}
+
+pub async fn __readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
+        VecDeque::new();
+
+    loop {
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        // Track if any data was actually produced
+                        let mut any_data_produced = false;
+
+                        // 1️⃣ Data written directly to buffer
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        // 2️⃣ Data enqueued via controller
+                        let size_after = byte_state.buffer_size();
+                        if size_after > size_before {
+                            any_data_produced = true;
+                        }
+
+                        // Fulfill one pending read if data appeared
+                        if any_data_produced {
+                            if let Some(completion) = pending_reads.pop_front() {
+                                let mut read_buf = vec![0u8; 8192];
+                                match poll_fn(|cx| byte_state.poll_read_into(cx, &mut read_buf)).now_or_never() {
+                                    Some(Ok(0)) => {
+                                        let _ = completion.send(Ok(None));
+                                    }
+                                    Some(Ok(n)) => {
+                                        read_buf.truncate(n);
+                                        let _ = completion.send(Ok(Some(read_buf)));
+                                    }
+                                    Some(Err(err)) => {
+                                        let _ = completion.send(Err(err));
+                                    }
+                                    None => {
+                                        pending_reads.push_front(completion);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Close if no data produced and pull returned EOF
+                        if !any_data_produced && bytes_read == 0 {
+                            byte_state.close();
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Ok(None));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err.clone());
+                        while let Some(completion) = pending_reads.pop_front() {
+                            let _ = completion.send(Err(err.clone()));
+                        }
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                } else {
+                    break;
+                }
+            }
+
+            // 2️⃣ Handle Read commands
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        eprintln!("Processing read command in byte stream task");
+
+                        // Check error state
+                        if byte_state.errored.load(Ordering::SeqCst) {
+                            let error = byte_state.error.lock()
+                                .clone()
+                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                            let _ = completion.send(Err(error));
+                            continue;
+                        }
+
+                        // Closed and no data
+                        if byte_state.closed.load(Ordering::SeqCst) && byte_state.is_buffer_empty() {
+                            let _ = completion.send(Ok(None));
+                            continue;
+                        }
+
+                        // Attempt immediate read
+                        let mut buf = vec![0u8; 8192];
+                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).now_or_never() {
+                            Some(Ok(0)) => {
+                                let _ = completion.send(Ok(None));
+                            }
+                            Some(Ok(n)) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                            }
+                            Some(Err(err)) => {
+                                let _ = completion.send(Err(err));
+                            }
+                            None => {
+                                // Queue pending read and trigger pull if needed
+                                eprintln!("Queueing read request - no data available");
+                                pending_reads.push_back(completion);
+                                byte_state.maybe_trigger_pull();
+                            }
+                        }
+                    }
+                    Some(StreamCommand::Cancel { reason, completion }) => {
+                        let cancel_result = byte_state.cancel_source(reason).await;
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+}
+*/
+
+/*pub async fn _readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Pending read requests queued while no data is available
+    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
+        VecDeque::new();
+
+    loop {
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        let mut any_data_produced = false;
+
+                        // Directly buffered data
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        // Data enqueued via controller
+                        if byte_state.buffer_size() > size_before {
+                            any_data_produced = true;
+                        }
+
+                        // Fulfill pending reads if any data appeared
+                        if any_data_produced {
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let mut read_buf = vec![0u8; 8192];
+                                match poll_fn(|cx| byte_state.poll_read_into(cx, &mut read_buf)).now_or_never() {
+                                    Some(Ok(0)) => {
+                                        let _ = completion.send(Ok(None));
+                                    }
+                                    Some(Ok(n)) => {
+                                        read_buf.truncate(n);
+                                        let _ = completion.send(Ok(Some(read_buf)));
+                                        break; // Only fulfill one read per pull
+                                    }
+                                    Some(Err(err)) => {
+                                        let _ = completion.send(Err(err));
+                                    }
+                                    None => {
+                                        pending_reads.push_front(completion);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Close stream if EOF and no data produced
+                        if !any_data_produced && bytes_read == 0 {
+                            byte_state.close();
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Ok(None));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err.clone());
+                        while let Some(completion) = pending_reads.pop_front() {
+                            let _ = completion.send(Err(err.clone()));
+                        }
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                // Return source to state if still open
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                } else {
+                    break;
+                }
+            }
+
+            // 2️⃣ Handle Read commands
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        eprintln!("Processing read command in byte stream task");
+
+                        // Error state
+                        if byte_state.errored.load(Ordering::SeqCst) {
+                            let error = byte_state.error.lock()
+                                .clone()
+                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                            let _ = completion.send(Err(error));
+                            continue;
+                        }
+
+                        // Closed and no data
+                        if byte_state.closed.load(Ordering::SeqCst) && byte_state.is_buffer_empty() {
+                            let _ = completion.send(Ok(None));
+                            continue;
+                        }
+
+                        // Attempt immediate read
+                        let mut buf = vec![0u8; 8192];
+                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).now_or_never() {
+                            Some(Ok(0)) => {
+                                let _ = completion.send(Ok(None));
+                            }
+                            Some(Ok(n)) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                            }
+                            Some(Err(err)) => {
+                                let _ = completion.send(Err(err));
+                            }
+                            None => {
+                                // No data: queue read and trigger pull immediately
+                                eprintln!("Queueing read request - no data available");
+                                pending_reads.push_back(completion);
+                                if !byte_state.closed.load(Ordering::SeqCst)
+                                    && !byte_state.errored.load(Ordering::SeqCst)
+                                {
+                                    byte_state.maybe_trigger_pull();
+                                }
+                            }
+                        }
+                    }
+                    Some(StreamCommand::Cancel { reason, completion }) => {
+                        let cancel_result = byte_state.cancel_source(reason).await;
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+}
+*/
+
+pub async fn _readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Pending read requests queued while no data is available
+    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
+        VecDeque::new();
+
+    loop {
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    // Don't break immediately - continue to process pending reads
+                    continue;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => {
+                        // No source available, but continue to handle commands
+                        continue;
+                    }
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        let mut any_data_produced = false;
+
+                        // Directly buffered data
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        // Data enqueued via controller
+                        if byte_state.buffer_size() > size_before {
+                            any_data_produced = true;
+                        }
+
+                        // Fulfill pending reads if any data appeared
+                        if any_data_produced {
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let mut read_buf = vec![0u8; 8192];
+                                match poll_fn(|cx| byte_state.poll_read_into(cx, &mut read_buf)).now_or_never() {
+                                    Some(Ok(0)) => {
+                                        let _ = completion.send(Ok(None));
+                                    }
+                                    Some(Ok(n)) => {
+                                        read_buf.truncate(n);
+                                        let _ = completion.send(Ok(Some(read_buf)));
+                                        break; // Only fulfill one read per pull
+                                    }
+                                    Some(Err(err)) => {
+                                        let _ = completion.send(Err(err));
+                                    }
+                                    None => {
+                                        pending_reads.push_front(completion);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Close stream if EOF
+                        if bytes_read == 0 {
+                            byte_state.close();
+                            // Don't break here - let pending reads be handled by command processing
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err.clone());
+                        while let Some(completion) = pending_reads.pop_front() {
+                            let _ = completion.send(Err(err.clone()));
+                        }
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                // Return source to state if still open and no error
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                }
+                // Note: Don't break here even if closed/errored - continue to handle commands
+            }
+
+            // 2️⃣ Handle Read commands
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        eprintln!("Processing read command in byte stream task");
+
+                        // Error state
+                        if byte_state.errored.load(Ordering::SeqCst) {
+                            let error = byte_state.error.lock()
+                                .clone()
+                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                            let _ = completion.send(Err(error));
+                            continue;
+                        }
+
+                        // Closed and no data
+                        if byte_state.closed.load(Ordering::SeqCst) && byte_state.is_buffer_empty() {
+                            let _ = completion.send(Ok(None));
+                            continue;
+                        }
+
+                        // Attempt immediate read
+                        let mut buf = vec![0u8; 8192];
+                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).now_or_never() {
+                            Some(Ok(0)) => {
+                                let _ = completion.send(Ok(None));
+                            }
+                            Some(Ok(n)) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                            }
+                            Some(Err(err)) => {
+                                let _ = completion.send(Err(err));
+                            }
+                            None => {
+                                // No data available
+                                if byte_state.closed.load(Ordering::SeqCst) {
+                                    // Stream is closed and no data - return EOF
+                                    let _ = completion.send(Ok(None));
+                                } else {
+                                    // Queue read and trigger pull immediately
+                                    eprintln!("Queueing read request - no data available");
+                                    pending_reads.push_back(completion);
+                                    if !byte_state.errored.load(Ordering::SeqCst) {
+                                        byte_state.maybe_trigger_pull();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(StreamCommand::Cancel { reason, completion }) => {
+                        let cancel_result = byte_state.cancel_source(reason).await;
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        // Command channel closed - exit only if no pending reads
+                        if pending_reads.is_empty() {
+                            break;
+                        }
+                        // If we have pending reads but stream is closed, fulfill them with EOF
+                        if byte_state.closed.load(Ordering::SeqCst) {
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Ok(None));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub async fn readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Pending read requests queued while no data is available
+    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
+        VecDeque::new();
+
+    loop {
+        let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let cmd_fut = command_rx.next().fuse();
+        futures::pin_mut!(pull_fut, cmd_fut);
+
+        futures::select! {
+            // 1️⃣ Pull data from source if needed
+            _ = pull_fut => {
+                if byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    || byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    // Don't break immediately - continue to process pending reads
+                    continue;
+                }
+
+                let mut source = match byte_state.source.lock().take() {
+                    Some(s) => s,
+                    None => {
+                        // No source available, but continue to handle commands
+                        continue;
+                    }
+                };
+
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let size_before = byte_state.buffer_size();
+
+                match source.pull(&mut controller, &mut buffer).await {
+                    Ok(bytes_read) => {
+                        let mut any_data_produced = false;
+
+                        // Directly buffered data
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            any_data_produced = true;
+                        }
+
+                        // Data enqueued via controller
+                        if byte_state.buffer_size() > size_before {
+                            any_data_produced = true;
+                        }
+
+                        // Fulfill pending reads if any data appeared
+                        if any_data_produced {
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let mut read_buf = vec![0u8; 8192];
+                                match poll_fn(|cx| byte_state.poll_read_into(cx, &mut read_buf)).now_or_never() {
+                                    Some(Ok(0)) => {
+                                        let _ = completion.send(Ok(None));
+                                    }
+                                    Some(Ok(n)) => {
+                                        read_buf.truncate(n);
+                                        let _ = completion.send(Ok(Some(read_buf)));
+                                        break; // Only fulfill one read per pull
+                                    }
+                                    Some(Err(err)) => {
+                                        let _ = completion.send(Err(err));
+                                    }
+                                    None => {
+                                        pending_reads.push_front(completion);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Close stream if EOF and no data was produced via controller either
+                        if bytes_read == 0 && !any_data_produced {
+                            byte_state.close();
+                            // Fulfill any remaining pending reads with EOF
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Ok(None));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err.clone());
+                        while let Some(completion) = pending_reads.pop_front() {
+                            let _ = completion.send(Err(err.clone()));
+                        }
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+
+                // Return source to state if still open and no error
+                if !byte_state.closed.load(std::sync::atomic::Ordering::SeqCst)
+                    && !byte_state.errored.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    *byte_state.source.lock() = Some(source);
+                }
+                // Note: Don't break here even if closed/errored - continue to handle commands
+            }
+
+            // 2️⃣ Handle Read commands
+            cmd = cmd_fut => {
+                match cmd {
+                    Some(StreamCommand::Read { completion }) => {
+                        eprintln!("Processing read command in byte stream task");
+
+                        // Error state
+                        if byte_state.errored.load(Ordering::SeqCst) {
+                            let error = byte_state.error.lock()
+                                .clone()
+                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                            let _ = completion.send(Err(error));
+                            continue;
+                        }
+
+                        // Closed and no data
+                        if byte_state.closed.load(Ordering::SeqCst) && byte_state.is_buffer_empty() {
+                            let _ = completion.send(Ok(None));
+                            continue;
+                        }
+
+                        // Attempt immediate read
+                        let mut buf = vec![0u8; 8192];
+                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).now_or_never() {
+                            Some(Ok(0)) => {
+                                let _ = completion.send(Ok(None));
+                            }
+                            Some(Ok(n)) => {
+                                buf.truncate(n);
+                                let _ = completion.send(Ok(Some(buf)));
+                            }
+                            Some(Err(err)) => {
+                                let _ = completion.send(Err(err));
+                            }
+                            None => {
+                                // No data available
+                                if byte_state.closed.load(Ordering::SeqCst) {
+                                    // Stream is closed and no data - return EOF
+                                    let _ = completion.send(Ok(None));
+                                } else {
+                                    // Queue read and trigger pull immediately
+                                    eprintln!("Queueing read request - no data available");
+                                    pending_reads.push_back(completion);
+                                    if !byte_state.errored.load(Ordering::SeqCst) {
+                                        byte_state.maybe_trigger_pull();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(StreamCommand::Cancel { reason, completion }) => {
+                        let cancel_result = byte_state.cancel_source(reason).await;
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        // Command channel closed - exit only if no pending reads
+                        if pending_reads.is_empty() {
+                            break;
+                        }
+                        // If we have pending reads but stream is closed, fulfill them with EOF
+                        if byte_state.closed.load(Ordering::SeqCst) {
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Ok(None));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/*async fn ___readable_byte_stream_task<Source>(
+    byte_state: Arc<ByteStreamState<Source>>,
+    controller: ReadableByteStreamController,
+) where
+    Source: ReadableByteSource + Send + 'static,
+{
+    // Don't hold locks across awaits
+    let start_result = async {
+        let source_opt = byte_state.source.lock().take();
+        if let Some(mut source) = source_opt {
+            // Create a clone of controller to avoid borrow issues
+            let mut controller_clone = controller.clone();
+            let result = source.start(&mut controller_clone).await;
+
+            match result {
+                Ok(()) => {
+                    *byte_state.source.lock() = Some(source);
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            Ok(())
+        }
+    }
+    .await;
+
+    if let Err(err) = start_result {
+        byte_state.error(err);
+        return;
+    }
+
+    // Use a simple loop instead of complex poll_fn
+    loop {
+        // Check if we should exit
+        if byte_state.closed.load(Ordering::SeqCst) || byte_state.errored.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Check if pull is needed
+        let should_pull = byte_state.queue_total_size.load(Ordering::SeqCst)
+            < byte_state.high_water_mark.load(Ordering::SeqCst);
+
+        if should_pull && !byte_state.pull_in_progress.load(Ordering::SeqCst) {
+            let source_opt = byte_state.source.lock().take();
+            if let Some(mut source) = source_opt {
+                byte_state.mark_pull_started();
+
+                let mut buffer = vec![0u8; 8192];
+                let mut controller_clone = controller.clone();
+
+                let pull_result = source.pull(&mut controller_clone, &mut buffer).await;
+
+                match pull_result {
+                    Ok(bytes_read) => {
+                        if bytes_read > 0 {
+                            byte_state.enqueue_data(&buffer[..bytes_read]);
+                            *byte_state.source.lock() = Some(source);
+                        } else {
+                            byte_state.close();
+                        }
+                    }
+                    Err(err) => {
+                        byte_state.error(err);
+                    }
+                }
+
+                byte_state.mark_pull_completed();
+            }
+        }
+
+        // Maybe a Small delay to prevent busy waiting
+    }
+}
+*/
 
 // ----------- Builder Pattern Implementation -----------
 pub struct ReadableStreamBuilder<T, Source, StreamType = DefaultStream>
@@ -2039,41 +3592,17 @@ where
         self.spawn_config = SpawnConfig::DefaultThread;
         self
     }
+}
 
-    // Generic build method that works for all stream types
-    fn build_internal<TaskFn, TaskFut, CtrlMsg, CtrlFactory>(
-        self,
-        task_creator: TaskFn,
-        controller_factory: CtrlFactory,
-    ) -> ReadableStream<T, Source, StreamType, Unlocked>
-    where
-        TaskFn: FnOnce(
-            futures::channel::mpsc::UnboundedReceiver<StreamCommand<T>>,
-            futures::channel::mpsc::UnboundedReceiver<CtrlMsg>,
-            ReadableStreamInner<T, Source>,
-            Arc<AtomicUsize>,
-            Arc<AtomicUsize>,
-            Arc<AtomicIsize>,
-            Arc<AtomicBool>,
-            Arc<AtomicBool>,
-            Arc<RwLock<Option<StreamError>>>,
-            futures::channel::mpsc::UnboundedSender<CtrlMsg>,
-            StreamType::Controller<T>,
-        ) -> TaskFut,
-        TaskFut: Future<Output = ()> + Send + 'static,
-        CtrlMsg: Send + 'static,
-        CtrlFactory: FnOnce(
-            UnboundedSender<CtrlMsg>,
-            Arc<AtomicUsize>,
-            Arc<AtomicUsize>,
-            Arc<AtomicIsize>,
-            Arc<AtomicBool>,
-            Arc<AtomicBool>,
-        ) -> StreamType::Controller<T>,
-    {
-        // Common setup
+impl<T, Source> ReadableStreamBuilder<T, Source, DefaultStream>
+where
+    T: Send + 'static,
+    Source: ReadableSource<T> + Send + 'static,
+{
+    pub fn build(self) -> ReadableStream<T, Source, DefaultStream, Unlocked> {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
+
         let queue_total_size = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let errored = Arc::new(AtomicBool::new(false));
@@ -2089,7 +3618,7 @@ where
 
         let inner = ReadableStreamInner::new(self.source, strategy);
 
-        let controller = controller_factory(
+        let controller = ReadableStreamDefaultController::new(
             ctrl_tx.clone(),
             Arc::clone(&queue_total_size),
             Arc::clone(&high_water_mark),
@@ -2098,8 +3627,7 @@ where
             Arc::clone(&errored),
         );
 
-        // Create task
-        let task_fut = task_creator(
+        let task_fut = readable_stream_task(
             command_rx,
             ctrl_rx,
             inner,
@@ -2113,7 +3641,6 @@ where
             controller.clone(),
         );
 
-        // Spawn based on configuration
         match self.spawn_config {
             SpawnConfig::DefaultThread => {
                 std::thread::spawn(move || {
@@ -2121,8 +3648,7 @@ where
                 });
             }
             SpawnConfig::CustomSpawn(spawn_fn) => {
-                let boxed_fut: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(task_fut);
-                spawn_fn(boxed_fut);
+                spawn_fn(Box::pin(task_fut));
             }
         }
 
@@ -2136,29 +3662,9 @@ where
             locked,
             stored_error,
             controller: Arc::new(controller),
+            byte_state: None,
             _phantom: PhantomData,
         }
-    }
-}
-
-// Specific build methods for each stream type
-impl<T, Source> ReadableStreamBuilder<T, Source, DefaultStream>
-where
-    T: Send + 'static,
-    Source: ReadableSource<T> + Send + 'static,
-{
-    pub fn build(self) -> ReadableStream<T, Source, DefaultStream, Unlocked> {
-        self.build_internal(
-            |command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx, controller| {
-                readable_stream_task(
-                    command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx,
-                    controller,
-                )
-            },
-            |ctrl_tx, qts, hwm, ds, closed, errored| {
-                ReadableStreamDefaultController::new(ctrl_tx, qts, hwm, ds, closed, errored)
-            },
-        )
     }
 }
 
@@ -2167,17 +3673,43 @@ where
     Source: ReadableByteSource + Send + 'static,
 {
     pub fn build(self) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
-        self.build_internal(
-            |command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx, controller| {
-                readable_byte_stream_task(
-                    command_rx, ctrl_rx, inner, qts, hwm, ds, closed, errored, se, ctrl_tx,
-                    controller,
-                )
-            },
-            |ctrl_tx, qts, hwm, ds, closed, errored| {
-                ReadableByteStreamController::new(ctrl_tx, qts, hwm, ds, closed, errored)
-            },
-        )
+        let (command_tx, command_rx) = unbounded();
+        let (_ctrl_tx, _ctrl_rx) = unbounded::<ByteControllerMsg>();
+
+        let strategy = self
+            .strategy
+            .unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));
+        let direct_state = ByteStreamState::new(self.source, strategy.high_water_mark());
+
+        let controller = ReadableByteStreamController::new(direct_state.clone());
+
+        let task_fut =
+            readable_byte_stream_task(direct_state.clone(), command_rx, controller.clone());
+
+        match self.spawn_config {
+            SpawnConfig::DefaultThread => {
+                std::thread::spawn(move || {
+                    futures::executor::block_on(task_fut);
+                });
+            }
+            SpawnConfig::CustomSpawn(spawn_fn) => {
+                spawn_fn(Box::pin(task_fut));
+            }
+        }
+
+        ReadableStream {
+            command_tx,
+            queue_total_size: Arc::new(AtomicUsize::new(0)),
+            high_water_mark: Arc::new(AtomicUsize::new(strategy.high_water_mark())),
+            desired_size: Arc::new(AtomicIsize::new(strategy.high_water_mark() as isize)),
+            closed: Arc::new(AtomicBool::new(false)),
+            errored: Arc::new(AtomicBool::new(false)),
+            locked: Arc::new(AtomicBool::new(false)),
+            stored_error: Arc::new(RwLock::new(None)),
+            controller: Arc::new(controller),
+            byte_state: Some(direct_state),
+            _phantom: PhantomData,
+        }
     }
 }
 
@@ -2387,13 +3919,12 @@ mod tests_old {
 
         // Read with BYOB reader
         match byob_reader.read(&mut buffer).await.unwrap() {
-            Some(bytes_read) => {
+            bytes_read => {
                 assert!(bytes_read > 0);
                 println!("Read {} bytes", bytes_read);
                 let read_data = &buffer[..bytes_read];
                 println!("Buffer contents: {}", String::from_utf8_lossy(read_data));
-            }
-            None => println!("Stream ended"),
+            } //None => println!("Stream ended"),
         }
     }
 
@@ -2447,11 +3978,10 @@ mod tests_old {
 
         // Read with BYOB reader
         match byob_reader.read(&mut buffer).await.unwrap() {
-            Some(bytes_read) => {
+            bytes_read => {
                 assert!(bytes_read > 0);
                 println!("Read {} bytes", bytes_read);
-            }
-            None => println!("Stream ended"),
+            } //None => println!("Stream ended"),
         }
         println!("buffer content: {:?}", buffer);
     }
@@ -2512,6 +4042,8 @@ mod tests_old {
 
 #[cfg(test)]
 mod tests {
+    use crate::dlc::ideation::d::byte_source_trait::ReadableByteSource;
+
     use super::*;
     use futures::stream;
     use std::time::Duration;
@@ -2749,6 +4281,7 @@ mod tests {
 
     // ========== Byte Stream Specific Tests ==========
 
+    // TODO: nothing here just a market used to test default reader on byte streams
     #[tokio::test]
     async fn test_byte_stream_basic_functionality() {
         struct ChunkedByteSource {
@@ -2770,12 +4303,34 @@ mod tests {
                 }
 
                 let chunk = self.chunks[idx].clone();
-                let len = chunk.len();
+                let _len = chunk.len();
                 *self.index.borrow_mut() = idx + 1;
 
                 controller.enqueue(chunk)?;
                 Ok(0)
             }
+            /*async fn pull(
+                &mut self,
+                controller: &mut ReadableByteStreamController,
+                buffer: &mut [u8], // Use this buffer instead of controller.enqueue
+            ) -> StreamResult<usize> {
+                let idx = *self.index.borrow();
+
+                if idx >= self.chunks.len() {
+                    controller.close()?;
+                    return Ok(0);
+                }
+
+                let chunk = &self.chunks[idx];
+                let bytes_to_copy = std::cmp::min(chunk.len(), buffer.len());
+
+                // Copy directly into the provided buffer
+                buffer[..bytes_to_copy].copy_from_slice(&chunk[..bytes_to_copy]);
+
+                *self.index.borrow_mut() = idx + 1;
+
+                Ok(bytes_to_copy)
+            }*/
         }
 
         let source = ChunkedByteSource {
@@ -2786,12 +4341,14 @@ mod tests {
         let stream = ReadableStream::new_bytes(source, None);
         let (_locked, reader) = stream.get_reader();
 
-        // Read first chunk
-        assert_eq!(reader.read().await.unwrap(), Some(b"hello".to_vec()));
-        // Read second chunk
-        assert_eq!(reader.read().await.unwrap(), Some(b" world".to_vec()));
-        // Stream should be closed
-        assert_eq!(reader.read().await.unwrap(), None);
+        // Collect ALL data from the stream
+        let mut all_data = Vec::new();
+        while let Some(chunk) = reader.read().await.unwrap() {
+            all_data.extend(chunk);
+        }
+
+        // Verify we got all the expected data
+        assert_eq!(all_data, b"hello world");
     }
 
     #[tokio::test]
@@ -2833,13 +4390,13 @@ mod tests {
 
         // BYOB read should return number of bytes read
         match byob_reader.read(&mut buffer).await.unwrap() {
-            Some(bytes_read) => assert!(bytes_read > 0),
-            None => panic!("Expected data from BYOB reader"),
+            bytes_read => assert!(bytes_read > 0),
+            //None => panic!("Expected data from BYOB reader"),
         }
         println!("buffer content: {:?}", buffer);
 
         // Subsequent read should indicate end of stream
-        assert_eq!(byob_reader.read(&mut buffer).await.unwrap(), Some(0));
+        assert_eq!(byob_reader.read(&mut buffer).await.unwrap(), 0);
     }
 
     // ========== Controller Behavior Tests ==========
@@ -4038,7 +5595,7 @@ mod builder_tests {
             //assert_eq!(buffer, b"Hello, World!");
             //println!("all success")
             match reader.read(&mut buffer).await.unwrap() {
-                Some(bytes_read) => {
+                bytes_read => {
                     println!("bytes_read: {}", bytes_read); // Add this
                     println!("buffer content: {:?}", buffer); // Add this
                     println!("asserting bytes read");
@@ -4047,8 +5604,7 @@ mod builder_tests {
                     //TODO: fix the byob implementation, it always returns 0's meaning the buffer is not filled
                     //assert_eq!(buffer, b"Hello, World!".to_vec());
                     println!("all success")
-                }
-                None => panic!("Expected data but stream ended"),
+                } //None => panic!("Expected data but stream ended"),
             }
         });
     }
