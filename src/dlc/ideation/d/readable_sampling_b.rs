@@ -1245,30 +1245,6 @@ where
         poll_fn(|cx| self.0.byte_state.as_ref().unwrap().poll_read_into(cx, buf)).await
     }
 
-    // Convenience method for less performance-critical code
-    // Convenience method for allocating reads
-    pub async fn read_chunk(&self, size: usize) -> StreamResult<Vec<u8>> {
-        let mut buf = vec![0u8; size];
-        let bytes_read = self.read(&mut buf).await?;
-        buf.truncate(bytes_read);
-        Ok(buf)
-    }
-
-    // For users who want to avoid allocation
-    // Read exact amount or fail
-    pub async fn read_exact(&self, buf: &mut [u8]) -> StreamResult<()> {
-        let mut total = 0;
-        while total < buf.len() {
-            let bytes = self.read(&mut buf[total..]).await?;
-            if bytes == 0 {
-                //return Err(StreamError::UnexpectedEof);
-                return Err(StreamError::Custom("UnexpectedEof".into()));
-            }
-            total += bytes;
-        }
-        Ok(())
-    }
-
     pub fn release_lock(self) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
         self.0.locked.store(false, Ordering::SeqCst);
         ReadableStream {
