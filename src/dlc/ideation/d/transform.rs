@@ -159,7 +159,7 @@ pub trait Transformer<I: Send + 'static, O: Send + 'static>: Send + 'static {
     fn start(
         &mut self,
         controller: &mut TransformStreamDefaultController<O>,
-    ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+    ) -> impl Future<Output = StreamResult<()>> + Send {
         let _ = controller;
         future::ready(Ok(()))
     }
@@ -169,13 +169,13 @@ pub trait Transformer<I: Send + 'static, O: Send + 'static>: Send + 'static {
         &mut self,
         chunk: I,
         controller: &mut TransformStreamDefaultController<O>,
-    ) -> impl Future<Output = StreamResult<()>> + Send + 'static;
+    ) -> impl Future<Output = StreamResult<()>> + Send;
 
     /// Called when the writable side is closed
     fn flush(
         &mut self,
         controller: &mut TransformStreamDefaultController<O>,
-    ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+    ) -> impl Future<Output = StreamResult<()>> + Send {
         let _ = controller;
         future::ready(Ok(()))
     }
