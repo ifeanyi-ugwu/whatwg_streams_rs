@@ -473,7 +473,6 @@ where
                         writer.write(chunk);
                     }
                     Ok(None) => {
-                        eprintln!("source completed normally");
                         // Source completed normally - close destination if allowed
                         if !options.prevent_close {
                             writer.close().await?;
@@ -498,17 +497,12 @@ where
             match Abortable::new(pipe_loop, reg).await {
                 Ok(result) => result,
                 Err(Aborted) => {
-                    eprintln!("pipe loop aborted");
                     // Handle abort signal - cancel source and abort destination
                     if !options.prevent_cancel {
-                        eprintln!("reader cancelled started");
                         let _ = reader.cancel(Some("Aborted".to_string())).await;
-                        eprintln!("reader cancelled ended");
                     }
                     if !options.prevent_abort {
-                        eprintln!("writer aborted started");
                         let _ = writer.abort(Some("Aborted".to_string())).await;
-                        eprintln!("writer aborted ended");
                     }
                     Err(StreamError::Aborted(Some("Pipe operation aborted".into())))
                 }
@@ -1162,7 +1156,6 @@ where
             .command_tx
             .unbounded_send(StreamCommand::Read { completion: tx })
             .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
-        eprintln!("read request sent into task");
         rx.await
             .unwrap_or_else(|_| Err(StreamError::Custom("Read canceled".into())))
     }
@@ -1648,8 +1641,6 @@ pub async fn readable_byte_stream_task<Source>(
             cmd = cmd_fut => {
                 match cmd {
                     Some(StreamCommand::Read { completion }) => {
-                        eprintln!("Processing read command in byte stream task");
-
                         // Error state
                         if byte_state.errored.load(Ordering::SeqCst) {
                             let error = byte_state.error.lock()
@@ -1685,7 +1676,6 @@ pub async fn readable_byte_stream_task<Source>(
                                     let _ = completion.send(Ok(None));
                                 } else {
                                     // Queue read and trigger pull immediately
-                                    eprintln!("Queueing read request - no data available");
                                     pending_reads.push_back(completion);
                                     if !byte_state.errored.load(Ordering::SeqCst) {
                                         byte_state.maybe_trigger_pull();
