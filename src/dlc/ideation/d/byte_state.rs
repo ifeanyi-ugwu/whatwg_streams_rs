@@ -37,6 +37,8 @@ pub struct ByteStreamState<Source> {
     desired_size: AtomicIsize,
     /*pub(crate) pending_reads:
     Mutex<VecDeque<oneshot::Sender<Result<Option<Vec<u8>>, StreamError>>>>,*/
+    start_completed: AtomicBool,
+    start_wakers: Mutex<Vec<Waker>>,
 }
 
 impl<Source> ByteStreamState<Source>
@@ -58,6 +60,8 @@ where
             high_water_mark: AtomicUsize::new(high_water_mark),
             desired_size: AtomicIsize::new(high_water_mark as isize),
             //pending_reads: Mutex::new(VecDeque::new()),
+            start_completed: AtomicBool::new(false),
+            start_wakers: Mutex::new(Vec::new()),
         })
     }
 
@@ -67,6 +71,16 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, StreamError>> {
+        // First, ensure start has completed
+        if !self.start_completed.load(Ordering::SeqCst) {
+            let mut wakers = self.start_wakers.lock();
+            let waker = cx.waker();
+            if !wakers.iter().any(|w| w.will_wake(waker)) {
+                wakers.push(waker.clone());
+            }
+            return Poll::Pending;
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -353,6 +367,33 @@ where
         self.queue_total_size.load(Ordering::SeqCst)
     }
 
+    pub async fn start_source(
+        &self,
+        controller: &super::readable_sampling_b::ReadableByteStreamController,
+    ) -> Result<(), StreamError> {
+        let mut source = match self.source.lock().take() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let mut controller = controller.clone();
+
+        let result = source.start(&mut controller).await;
+
+        match result {
+            Ok(()) => {
+                *self.source.lock() = Some(source);
+                self.mark_start_completed();
+                Ok(())
+            }
+            Err(err) => {
+                self.error(err.clone());
+                self.mark_start_completed();
+                Err(err)
+            }
+        }
+    }
+
     pub async fn closed(&self) -> Result<(), StreamError> {
         poll_fn(|cx| {
             if self.is_errored() {
@@ -378,6 +419,17 @@ where
             Poll::Pending
         })
         .await
+    }
+
+    pub fn mark_start_completed(&self) {
+        //self.start_completed.store(true, Ordering::SeqCst);
+        if self.start_completed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut wakers = self.start_wakers.lock();
+        for waker in wakers.drain(..) {
+            waker.wake();
+        }
     }
 }
 

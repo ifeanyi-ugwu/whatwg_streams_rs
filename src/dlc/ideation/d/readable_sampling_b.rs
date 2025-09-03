@@ -1538,6 +1538,54 @@ pub async fn readable_byte_stream_task<Source>(
 ) where
     Source: ReadableByteSource + Send + 'static,
 {
+    // Call start() on the source
+    /*if let Some(mut source) = byte_state.source.lock().take() {
+        let mut controller_clone = controller.clone();
+        match source.start(&mut controller_clone).await {
+            Ok(()) => {
+                // Put source back
+
+                *byte_state.source.lock() = Some(source);
+            }
+
+            Err(err) => {
+                byte_state.error(err);
+
+                return;
+            }
+        }
+    }*/
+    if let Err(_err) = byte_state.start_source(&controller).await {
+        // start_source already handles error state and mark_start_completed
+        //return;
+    }
+
+    /*if let Some(mut source) = byte_state.source.lock().take() {
+
+        match source.start(&mut controller).await {
+
+            Ok(()) => {
+
+                *byte_state.source.lock() = Some(source);
+
+                byte_state.mark_start_completed(); // Unblock direct reads
+
+            }
+
+            Err(err) => {
+
+                byte_state.error(err);
+
+                byte_state.mark_start_completed(); // Unblock with error state
+
+                return;
+
+            }
+
+        }
+
+    }*/
+
     // Pending read requests queued while no data is available
     let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
         VecDeque::new();
@@ -3642,6 +3690,273 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_start_called_before_pull_operations() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct StartTrackingByteSource {
+            data: Vec<u8>,
+            start_called: Arc<AtomicBool>,
+            start_call_order: Arc<AtomicUsize>,
+            pull_call_order: Arc<AtomicUsize>,
+            call_counter: Arc<AtomicUsize>,
+        }
+
+        impl ReadableByteSource for StartTrackingByteSource {
+            async fn start(
+                &mut self,
+                controller: &mut ReadableByteStreamController,
+            ) -> StreamResult<()> {
+                // Record that start was called and its order
+                self.start_called.store(true, Ordering::SeqCst);
+                let call_num = self.call_counter.fetch_add(1, Ordering::SeqCst);
+                self.start_call_order.store(call_num, Ordering::SeqCst);
+
+                // Simulate some async work in start
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            }
+
+            async fn pull(
+                &mut self,
+                controller: &mut ReadableByteStreamController,
+                _buffer: &mut [u8],
+            ) -> StreamResult<usize> {
+                // Verify start was called before any pull
+                assert!(
+                    self.start_called.load(Ordering::SeqCst),
+                    "pull() called before start()!"
+                );
+
+                // Record pull call order
+                let call_num = self.call_counter.fetch_add(1, Ordering::SeqCst);
+                self.pull_call_order.store(call_num, Ordering::SeqCst);
+
+                // Return data and close
+                if !self.data.is_empty() {
+                    let chunk = self.data.clone();
+                    self.data.clear();
+                    controller.enqueue(chunk)?;
+                } else {
+                    controller.close()?;
+                }
+                Ok(0)
+            }
+        }
+
+        let start_called = Arc::new(AtomicBool::new(false));
+        let start_order = Arc::new(AtomicUsize::new(0));
+        let pull_order = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let source = StartTrackingByteSource {
+            data: b"test data".to_vec(),
+            start_called: Arc::clone(&start_called),
+            start_call_order: Arc::clone(&start_order),
+            pull_call_order: Arc::clone(&pull_order),
+            call_counter: Arc::clone(&counter),
+        };
+
+        let stream = ReadableStream::builder(source)
+            .with_spawn(|fut| {
+                tokio::spawn(fut);
+            })
+            .build();
+        let (_locked, reader) = stream.get_reader();
+
+        // Give the stream task time to call start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify start was called
+        assert!(
+            start_called.load(Ordering::SeqCst),
+            "start() was never called"
+        );
+
+        // Now read from the stream
+        let result = reader.read().await.unwrap();
+        assert!(result.is_some(), "Expected data from stream");
+
+        // Verify ordering: start should have been called before pull
+        let start_call_num = start_order.load(Ordering::SeqCst);
+        let pull_call_num = pull_order.load(Ordering::SeqCst);
+
+        assert!(
+            start_call_num < pull_call_num,
+            "start() should be called before pull(). start: {}, pull: {}",
+            start_call_num,
+            pull_call_num
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_error_prevents_operations() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FailingStartByteSource {
+            pull_called: Arc<AtomicBool>,
+        }
+
+        impl ReadableByteSource for FailingStartByteSource {
+            async fn start(
+                &mut self,
+                _controller: &mut ReadableByteStreamController,
+            ) -> StreamResult<()> {
+                // Simulate start failure
+                Err(StreamError::Custom("Start failed".into()))
+            }
+
+            async fn pull(
+                &mut self,
+                _controller: &mut ReadableByteStreamController,
+                _buffer: &mut [u8],
+            ) -> StreamResult<usize> {
+                // This should never be called if start fails
+                self.pull_called.store(true, Ordering::SeqCst);
+                Ok(0)
+            }
+        }
+
+        let pull_called = Arc::new(AtomicBool::new(false));
+        let source = FailingStartByteSource {
+            pull_called: Arc::clone(&pull_called),
+        };
+
+        let stream = ReadableStream::new_bytes(source, None);
+        let (_locked, reader) = stream.get_reader();
+
+        // Give the stream task time to call start and fail
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Attempt to read should fail due to start error
+        /*match reader.read().await {
+            Err(StreamError::Custom(msg)) if msg.contains("Start failed") => {
+                // Expected error from start failure
+            }
+            other => panic!("Expected start failure error, got: {:?}", other),
+        }*/
+        // Attempt to read should fail due to start error
+        match reader.read().await {
+            Err(StreamError::Custom(msg)) => {
+                // Convert the ArcError into a string and check for the substring.
+                let error_message = msg.to_string();
+                if error_message.contains("Start failed") {
+                    // Expected error from start failure
+                    // Your logic here
+                } else {
+                    panic!("Expected start failure error, got: {:?}", msg);
+                }
+            }
+            other => panic!("Expected custom error from start failure, got: {:?}", other),
+        }
+
+        // Verify pull was never called
+        assert!(
+            !pull_called.load(Ordering::SeqCst),
+            "pull() should not be called when start() fails"
+        );
+
+        // Stream should be in error state
+        match reader.closed().await {
+            Err(StreamError::Custom(msg)) if msg.to_string().contains("Start failed") => {}
+            other => panic!(
+                "Expected closed() to propagate start failure, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_blocks_immediate_reads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Barrier;
+
+        struct SlowStartByteSource {
+            data: Vec<u8>,
+            start_barrier: Arc<Barrier>,
+            start_completed: Arc<AtomicBool>,
+        }
+
+        impl ReadableByteSource for SlowStartByteSource {
+            async fn start(
+                &mut self,
+                _controller: &mut ReadableByteStreamController,
+            ) -> StreamResult<()> {
+                // Wait for test to signal it's ready
+                self.start_barrier.wait().await;
+
+                // Simulate slow start
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                self.start_completed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn pull(
+                &mut self,
+                controller: &mut ReadableByteStreamController,
+                _buffer: &mut [u8],
+            ) -> StreamResult<usize> {
+                // Verify start completed before pull
+                assert!(
+                    self.start_completed.load(Ordering::SeqCst),
+                    "pull called before start completed"
+                );
+
+                if !self.data.is_empty() {
+                    let chunk = self.data.clone();
+                    self.data.clear();
+                    controller.enqueue(chunk)?;
+                } else {
+                    controller.close()?;
+                }
+                Ok(0)
+            }
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let start_completed = Arc::new(AtomicBool::new(false));
+
+        let source = SlowStartByteSource {
+            data: b"delayed data".to_vec(),
+            start_barrier: Arc::clone(&barrier),
+            start_completed: Arc::clone(&start_completed),
+        };
+
+        let stream = ReadableStream::builder(source)
+            .with_spawn(|fut| {
+                tokio::spawn(fut);
+            })
+            .build();
+        let (_locked, reader) = stream.get_reader();
+
+        // Immediately try to read - this should block waiting for start
+        let read_future = reader.read();
+
+        // Verify start hasn't completed yet
+        assert!(!start_completed.load(Ordering::SeqCst));
+
+        // Now allow start to proceed
+        barrier.wait().await;
+
+        // The read should now complete successfully
+        let result = timeout(Duration::from_millis(500), read_future)
+            .await
+            .expect("Read should complete after start finishes")
+            .unwrap();
+
+        assert!(
+            result.is_some(),
+            "Should receive data after start completes"
+        );
+
+        // Verify start did complete
+        assert!(start_completed.load(Ordering::SeqCst));
     }
 }
 
