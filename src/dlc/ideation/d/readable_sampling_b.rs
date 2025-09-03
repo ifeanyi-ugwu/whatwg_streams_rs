@@ -1538,53 +1538,7 @@ pub async fn readable_byte_stream_task<Source>(
 ) where
     Source: ReadableByteSource + Send + 'static,
 {
-    // Call start() on the source
-    /*if let Some(mut source) = byte_state.source.lock().take() {
-        let mut controller_clone = controller.clone();
-        match source.start(&mut controller_clone).await {
-            Ok(()) => {
-                // Put source back
-
-                *byte_state.source.lock() = Some(source);
-            }
-
-            Err(err) => {
-                byte_state.error(err);
-
-                return;
-            }
-        }
-    }*/
-    if let Err(_err) = byte_state.start_source(&controller).await {
-        // start_source already handles error state and mark_start_completed
-        //return;
-    }
-
-    /*if let Some(mut source) = byte_state.source.lock().take() {
-
-        match source.start(&mut controller).await {
-
-            Ok(()) => {
-
-                *byte_state.source.lock() = Some(source);
-
-                byte_state.mark_start_completed(); // Unblock direct reads
-
-            }
-
-            Err(err) => {
-
-                byte_state.error(err);
-
-                byte_state.mark_start_completed(); // Unblock with error state
-
-                return;
-
-            }
-
-        }
-
-    }*/
+    let _ = byte_state.start_source(&controller).await;
 
     // Pending read requests queued while no data is available
     let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
