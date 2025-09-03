@@ -1339,6 +1339,70 @@ where
         Ok(())
     }
 
+    /// Immediately enqueue a chunk for writing without waiting for completion.
+    ///
+    /// This method adds the chunk to the stream's internal write queue and returns
+    /// immediately. Unlike [`write()`], it does not wait for the write operation
+    /// to complete or return a future for tracking completion.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the chunk was successfully enqueued, or `Err` if
+    /// enqueueing fails due to the stream being closed, errored, or the
+    /// stream task being dropped.
+    ///
+    /// # Behavior
+    ///
+    /// - **Does not wait** for the chunk to be written to the underlying sink
+    /// - **Does not provide** completion notification or error handling for the write itself
+    /// - **Does not respect backpressure** - chunks are queued regardless of current queue size
+    /// - **Fire-and-forget** - suitable for high-throughput scenarios where individual
+    ///   write completion tracking isn't needed
+    ///
+    /// # Memory Considerations
+    ///
+    /// Since this method doesn't respect backpressure signals, repeated calls without
+    /// awaiting [`ready()`] can lead to unbounded queue growth and increased memory usage.
+    /// Consider using [`write()`] or [`enqueue_when_ready()`] for backpressure-aware writing.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// // Fire-and-forget writing
+    /// writer.enqueue(chunk1)?;
+    /// writer.enqueue(chunk2)?;
+    ///
+    /// // Later, ensure all writes complete
+    /// writer.close().await?;
+    /// ```
+    ///
+    /// [`write()`]: Self::write
+    /// [`ready()`]: Self::ready
+    /// [`enqueue_when_ready()`]: Self::enqueue_when_ready
+    pub fn enqueue(&self, chunk: T) -> StreamResult<()> {
+        /*if self.stream.errored.load(Ordering::SeqCst) {
+            return Err(self.stream.get_stored_error());
+        }
+        if self.stream.closed.load(Ordering::SeqCst) {
+            return Err(StreamError::Closed);
+        }*/
+        if self.stream.errored.load(Ordering::Acquire) {
+            return Err(self.stream.get_stored_error());
+        }
+        if self.stream.closed.load(Ordering::Acquire) {
+            return Err(StreamError::Closed);
+        }
+
+        let (tx, _rx) = oneshot::channel(); // Drop the receiver since we don't wait
+        self.stream
+            .command_tx
+            .unbounded_send(StreamCommand::Write {
+                chunk,
+                completion: tx,
+            })
+            .map_err(|_| StreamError::Custom("Stream task dropped".into()))
+    }
+
     /// Close the stream asynchronously
     pub async fn close(&self) -> StreamResult<()> {
         let (tx, rx) = oneshot::channel();
