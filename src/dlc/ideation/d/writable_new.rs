@@ -1,4 +1,4 @@
-use super::{Locked, QueuingStrategy, Unlocked, errors::StreamError};
+use super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked, errors::StreamError};
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -1856,6 +1856,88 @@ impl WakerSet {
     pub fn clear(&self) {
         let mut wakers = self.0.lock().unwrap();
         wakers.clear();
+    }
+}
+
+pub struct WritableStreamBuilder<T, Sink>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    sink: Sink,
+    strategy: Option<Box<dyn QueuingStrategy<T> + Send + Sync + 'static>>,
+    spawn_config: WritableSpawnConfig,
+    _phantom: PhantomData<T>,
+}
+
+pub enum WritableSpawnConfig {
+    DefaultThread,
+    CustomSpawn(Box<dyn FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static>),
+}
+
+impl Default for WritableSpawnConfig {
+    fn default() -> Self {
+        WritableSpawnConfig::DefaultThread
+    }
+}
+
+impl<T, Sink> WritableStreamBuilder<T, Sink>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    pub fn new(sink: Sink) -> Self {
+        Self {
+            sink,
+            strategy: None,
+            spawn_config: WritableSpawnConfig::DefaultThread,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn with_strategy<S>(mut self, strategy: S) -> Self
+    where
+        S: QueuingStrategy<T> + Send + Sync + 'static,
+    {
+        self.strategy = Some(Box::new(strategy));
+        self
+    }
+
+    pub fn with_spawn<F>(mut self, spawn_fn: F) -> Self
+    where
+        F: FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static,
+    {
+        self.spawn_config = WritableSpawnConfig::CustomSpawn(Box::new(spawn_fn));
+        self
+    }
+
+    pub fn with_thread_spawn(mut self) -> Self {
+        self.spawn_config = WritableSpawnConfig::DefaultThread;
+        self
+    }
+
+    pub fn build(self) -> WritableStream<T, Sink, Unlocked> {
+        let strategy: Box<dyn QueuingStrategy<T> + Send + Sync> = self
+            .strategy
+            .unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));
+
+        match self.spawn_config {
+            WritableSpawnConfig::DefaultThread => WritableStream::new(self.sink, strategy),
+            WritableSpawnConfig::CustomSpawn(spawn_fn) => {
+                WritableStream::new_with_spawn(self.sink, strategy, spawn_fn)
+            }
+        }
+    }
+}
+
+// Add static constructor method to existing WritableStream
+impl<T, Sink> WritableStream<T, Sink, Unlocked>
+where
+    T: Send + 'static,
+    Sink: WritableSink<T> + Send + 'static,
+{
+    pub fn builder(sink: Sink) -> WritableStreamBuilder<T, Sink> {
+        WritableStreamBuilder::new(sink)
     }
 }
 
@@ -3957,5 +4039,197 @@ mod async_write_integration_tests {
         fn high_water_mark(&self) -> usize {
             self.high_water_mark
         }
+    }
+}
+
+#[cfg(test)]
+mod writable_builder_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    // Test sink that records operations
+    struct RecordingSink {
+        operations: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> (Self, Arc<Mutex<Vec<String>>>) {
+            let ops = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    operations: Arc::clone(&ops),
+                },
+                ops,
+            )
+        }
+    }
+
+    impl WritableSink<String> for RecordingSink {
+        async fn start(
+            &mut self,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.operations.lock().unwrap().push("start".to_string());
+            Ok(())
+        }
+
+        async fn write(
+            &mut self,
+            chunk: String,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(format!("write: {}", chunk));
+            Ok(())
+        }
+
+        async fn close(self) -> StreamResult<()> {
+            self.operations.lock().unwrap().push("close".to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_basic_builder() {
+        let (sink, ops) = RecordingSink::new();
+
+        let stream = WritableStreamBuilder::new(sink).build();
+        let (_, writer) = stream.get_writer().unwrap();
+
+        block_on(async {
+            writer.write("hello".to_string()).await.unwrap();
+            writer.write("world".to_string()).await.unwrap();
+            writer.close().await.unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+
+        let operations = ops.lock().unwrap();
+        assert!(operations.contains(&"start".to_string()));
+        assert!(operations.contains(&"write: hello".to_string()));
+        assert!(operations.contains(&"write: world".to_string()));
+        assert!(operations.contains(&"close".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_custom_strategy() {
+        let (sink, _) = RecordingSink::new();
+
+        let stream = WritableStreamBuilder::new(sink)
+            .with_strategy(CountQueuingStrategy::new(8))
+            .build();
+
+        assert_eq!(stream.high_water_mark.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn test_builder_with_custom_spawn() {
+        let (sink, ops) = RecordingSink::new();
+
+        let spawn_called = Arc::new(Mutex::new(false));
+        let spawn_called_clone = Arc::clone(&spawn_called);
+
+        let stream = WritableStreamBuilder::new(sink)
+            .with_spawn(move |fut| {
+                *spawn_called_clone.lock().unwrap() = true;
+                std::thread::spawn(move || {
+                    futures::executor::block_on(fut);
+                });
+            })
+            .build();
+
+        thread::sleep(Duration::from_millis(10));
+        assert!(*spawn_called.lock().unwrap());
+
+        let (_, writer) = stream.get_writer().unwrap();
+        block_on(async {
+            writer.write("spawned".to_string()).await.unwrap();
+            writer.close().await.unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let operations = ops.lock().unwrap();
+        assert!(operations.contains(&"write: spawned".to_string()));
+    }
+
+    #[test]
+    fn test_static_builder_method() {
+        let (sink, ops) = RecordingSink::new();
+
+        let stream = WritableStream::builder(sink).build();
+
+        let (_, writer) = stream.get_writer().unwrap();
+        block_on(async {
+            writer.write("static".to_string()).await.unwrap();
+            writer.close().await.unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let operations = ops.lock().unwrap();
+        assert!(operations.contains(&"write: static".to_string()));
+    }
+
+    #[test]
+    fn test_enqueue_method() {
+        let (sink, ops) = RecordingSink::new();
+        let stream = WritableStreamBuilder::new(sink).build();
+        let (_, writer) = stream.get_writer().unwrap();
+
+        block_on(async {
+            // Use enqueue for fire-and-forget
+            writer.enqueue("fire".to_string()).unwrap();
+            writer.enqueue("forget".to_string()).unwrap();
+
+            // Still need to close properly
+            writer.close().await.unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let operations = ops.lock().unwrap();
+        assert!(operations.contains(&"write: fire".to_string()));
+        assert!(operations.contains(&"write: forget".to_string()));
+    }
+
+    #[test]
+    fn test_enqueue_error_handling() {
+        let (sink, _) = RecordingSink::new();
+        let stream = WritableStreamBuilder::new(sink).build();
+        let (_, writer) = stream.get_writer().unwrap();
+
+        block_on(async {
+            // Close the stream first
+            writer.close().await.unwrap();
+
+            // Now enqueue should fail
+            match writer.enqueue("should_fail".to_string()) {
+                Err(StreamError::Closed) => {} // Expected
+                other => panic!("Expected Closed error, got: {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn test_builder_chaining() {
+        let (sink, ops) = RecordingSink::new();
+
+        let stream = WritableStreamBuilder::new(sink)
+            .with_strategy(CountQueuingStrategy::new(4))
+            .with_thread_spawn()
+            .build();
+
+        let (_, writer) = stream.get_writer().unwrap();
+        block_on(async {
+            writer.write("chained".to_string()).await.unwrap();
+            writer.close().await.unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let operations = ops.lock().unwrap();
+        assert!(operations.contains(&"write: chained".to_string()));
     }
 }
