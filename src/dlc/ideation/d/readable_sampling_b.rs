@@ -373,14 +373,14 @@ where
     }
 }
 
-/*impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
 where
     Source: Send + 'static,
 {
-    pub(crate) fn controller(&self) -> &ReadableByteStreamController<Self> {
+    pub(crate) fn controller(&self) -> &ReadableByteStreamController {
         self.controller.as_ref()
     }
-}*/
+}
 
 impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
