@@ -2461,7 +2461,6 @@ mod tests {
 
     // ========== Byte Stream Specific Tests ==========
 
-    // TODO: nothing here just a market used to test default reader on byte streams
     #[tokio::test]
     async fn test_byte_stream_basic_functionality() {
         struct ChunkedByteSource {
@@ -4043,14 +4042,8 @@ mod builder_tests {
             //println!("all success")
             match reader.read(&mut buffer).await.unwrap() {
                 bytes_read => {
-                    println!("bytes_read: {}", bytes_read); // Add this
-                    println!("buffer content: {:?}", buffer); // Add this
-                    println!("asserting bytes read");
                     assert_eq!(bytes_read, 13);
-                    println!("asserting buffer");
-                    //TODO: fix the byob implementation, it always returns 0's meaning the buffer is not filled
-                    //assert_eq!(buffer, b"Hello, World!".to_vec());
-                    println!("all success")
+                    assert_eq!(buffer, b"Hello, World!".to_vec());
                 } //None => panic!("Expected data but stream ended"),
             }
         });
