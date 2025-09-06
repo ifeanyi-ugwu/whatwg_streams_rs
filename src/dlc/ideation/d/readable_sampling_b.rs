@@ -554,14 +554,219 @@ where
         let fut = Box::pin(async move { self.pipe_to_inner(&destination, options).await });
         spawn(fut)
     }*/
+}
 
+// tee implementation
+
+// Tee source that receives data from the coordinator
+pub struct TeeSource<T> {
+    chunk_rx: UnboundedReceiver<TeeChunk<T>>,
+    branch_id: TeeSourceId,
+    branch_canceled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeeSourceId {
+    Branch1,
+    Branch2,
+}
+
+#[derive(Debug, Clone)]
+enum TeeChunk<T> {
+    Data(T),
+    End,
+    Error(StreamError),
+}
+
+impl<T> ReadableSource<T> for TeeSource<T>
+where
+    T: Send + 'static,
+{
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<T>,
+    ) -> StreamResult<()> {
+        // If this branch was canceled, close immediately
+        if self.branch_canceled.load(Ordering::SeqCst) {
+            controller.close()?;
+            return Ok(());
+        }
+
+        // Wait for data from coordinator
+        match self.chunk_rx.next().await {
+            Some(TeeChunk::Data(chunk)) => {
+                controller.enqueue(chunk)?;
+            }
+            Some(TeeChunk::End) => {
+                controller.close()?;
+            }
+            Some(TeeChunk::Error(err)) => {
+                return Err(err);
+            }
+            None => {
+                // Coordinator dropped - treat as end of stream
+                controller.close()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+        self.branch_canceled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+// Coordinator that reads from original and distributes to branches
+struct TeeCoordinator<T, Source, StreamType, LockState>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker,
+    LockState: Send + 'static,
+{
+    reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
+    branch1_tx: UnboundedSender<TeeChunk<T>>,
+    branch2_tx: UnboundedSender<TeeChunk<T>>,
+    branch1_canceled: Arc<AtomicBool>,
+    branch2_canceled: Arc<AtomicBool>,
+}
+
+impl<T, Source, StreamType, LockState> TeeCoordinator<T, Source, StreamType, LockState>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker,
+    LockState: Send + 'static,
+{
+    async fn run(mut self) {
+        loop {
+            // Check if both branches are canceled
+            let branch1_dead =
+                self.branch1_canceled.load(Ordering::SeqCst) || self.branch1_tx.is_closed();
+            let branch2_dead =
+                self.branch2_canceled.load(Ordering::SeqCst) || self.branch2_tx.is_closed();
+
+            if branch1_dead && branch2_dead {
+                // Both branches canceled/dropped - cancel original stream
+                let _ = self
+                    .reader
+                    .cancel(Some("Both tee branches canceled".to_string()))
+                    .await;
+                break;
+            }
+
+            // Read from original stream
+            match self.reader.read().await {
+                Ok(Some(chunk)) => {
+                    // Clone and send to active branches
+                    if !branch1_dead {
+                        if self
+                            .branch1_tx
+                            .unbounded_send(TeeChunk::Data(chunk.clone()))
+                            .is_err()
+                        {
+                            // Branch 1 receiver dropped
+                            self.branch1_canceled.store(true, Ordering::SeqCst);
+                        }
+                    }
+
+                    if !branch2_dead {
+                        if self
+                            .branch2_tx
+                            .unbounded_send(TeeChunk::Data(chunk))
+                            .is_err()
+                        {
+                            // Branch 2 receiver dropped
+                            self.branch2_canceled.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Source ended - notify all active branches
+                    if !branch1_dead {
+                        let _ = self.branch1_tx.unbounded_send(TeeChunk::End);
+                    }
+                    if !branch2_dead {
+                        let _ = self.branch2_tx.unbounded_send(TeeChunk::End);
+                    }
+                    break;
+                }
+                Err(error) => {
+                    // Error - notify all active branches
+                    if !branch1_dead {
+                        let _ = self
+                            .branch1_tx
+                            .unbounded_send(TeeChunk::Error(error.clone()));
+                    }
+                    if !branch2_dead {
+                        let _ = self.branch2_tx.unbounded_send(TeeChunk::Error(error));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Update the tee method implementation
+impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker,
+{
     pub fn tee(
         self,
     ) -> (
-        ReadableStream<T, Source, S, Locked>,
-        ReadableStream<T, Source, S, Locked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
     ) {
-        todo!("tee implementation")
+        // Lock the original stream and get a reader
+        let (_, reader) = self.get_reader();
+
+        // Create channels for each branch
+        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
+        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
+
+        // Shared cancellation state
+        let branch1_canceled = Arc::new(AtomicBool::new(false));
+        let branch2_canceled = Arc::new(AtomicBool::new(false));
+
+        // Create coordinator
+        let coordinator = TeeCoordinator {
+            reader,
+            branch1_tx,
+            branch2_tx,
+            branch1_canceled: branch1_canceled.clone(),
+            branch2_canceled: branch2_canceled.clone(),
+        };
+
+        // Spawn coordinator task
+        std::thread::spawn(move || {
+            futures::executor::block_on(coordinator.run());
+        });
+
+        // Create tee sources with default strategies (ignoring original HWM)
+        let source1 = TeeSource {
+            chunk_rx: branch1_rx,
+            branch_id: TeeSourceId::Branch1,
+            branch_canceled: branch1_canceled,
+        };
+
+        let source2 = TeeSource {
+            chunk_rx: branch2_rx,
+            branch_id: TeeSourceId::Branch2,
+            branch_canceled: branch2_canceled,
+        };
+
+        // Create the two streams with default strategies
+        // Note: Each branch gets fresh default strategy, ignoring original's HWM
+        let stream1 = ReadableStream::new(source1);
+        let stream2 = ReadableStream::new(source2);
+
+        (stream1, stream2)
     }
 }
 
@@ -4560,5 +4765,264 @@ mod pipe_through_tests {
         assert_eq!(reader.read().await.unwrap(), Some(8)); // 2 * 2 * 2
         assert_eq!(reader.read().await.unwrap(), Some(12)); // 3 * 2 * 2
         assert_eq!(reader.read().await.unwrap(), None); // The stream should be closed now.
+    }
+}
+
+#[cfg(test)]
+mod tee_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_tee_basic() {
+        // Create source stream
+        let data = vec![1, 2, 3, 4];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // Tee the stream
+        let (stream1, stream2) = source_stream.tee();
+
+        // Get readers for both branches
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Both branches should get the same data
+        assert_eq!(reader1.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+
+        assert_eq!(reader1.read().await.unwrap(), Some(2));
+        assert_eq!(reader2.read().await.unwrap(), Some(2));
+
+        assert_eq!(reader1.read().await.unwrap(), Some(3));
+        assert_eq!(reader2.read().await.unwrap(), Some(3));
+
+        assert_eq!(reader1.read().await.unwrap(), Some(4));
+        assert_eq!(reader2.read().await.unwrap(), Some(4));
+
+        // Both should end
+        assert_eq!(reader1.read().await.unwrap(), None);
+        assert_eq!(reader2.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tee_different_read_speeds() {
+        let data = vec![1, 2, 3];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee();
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Reader1 reads everything quickly
+        assert_eq!(reader1.read().await.unwrap(), Some(1));
+        assert_eq!(reader1.read().await.unwrap(), Some(2));
+        assert_eq!(reader1.read().await.unwrap(), Some(3));
+        assert_eq!(reader1.read().await.unwrap(), None);
+
+        // Reader2 can still read all data (buffered by coordinator)
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(2));
+        assert_eq!(reader2.read().await.unwrap(), Some(3));
+        assert_eq!(reader2.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tee_one_branch_cancel() {
+        let data = vec![1, 2, 3, 4];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee();
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Read first item from both
+        assert_eq!(reader1.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+
+        // Cancel reader1
+        reader1
+            .cancel(Some("Branch 1 canceled".to_string()))
+            .await
+            .unwrap();
+
+        // Reader2 should still work (original stream continues)
+        assert_eq!(reader2.read().await.unwrap(), Some(2));
+        assert_eq!(reader2.read().await.unwrap(), Some(3));
+        assert_eq!(reader2.read().await.unwrap(), Some(4));
+        assert_eq!(reader2.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tee_both_branches_cancel() {
+        let data = vec![1, 2, 3, 4];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee();
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Read first item from both
+        assert_eq!(reader1.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+
+        // Cancel both branches
+        reader1
+            .cancel(Some("Branch 1 canceled".to_string()))
+            .await
+            .unwrap();
+        reader2
+            .cancel(Some("Branch 2 canceled".to_string()))
+            .await
+            .unwrap();
+
+        // Give coordinator time to process cancellations
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Original stream should be canceled (coordinator should have exited)
+        // We can't directly test the original stream since it's consumed by tee,
+        // but if both readers are canceled, the coordinator should stop
+    }
+
+    #[tokio::test]
+    async fn test_tee_empty_stream() {
+        let data: Vec<i32> = vec![];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee();
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Both should immediately return None
+        assert_eq!(reader1.read().await.unwrap(), None);
+        assert_eq!(reader2.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tee_error_propagation() {
+        // Create a stream that will error
+        struct ErrorSource {
+            count: i32,
+        }
+
+        impl ReadableSource<i32> for ErrorSource {
+            async fn pull(
+                &mut self,
+                controller: &mut ReadableStreamDefaultController<i32>,
+            ) -> StreamResult<()> {
+                if self.count < 2 {
+                    controller.enqueue(self.count)?;
+                    self.count += 1;
+                    Ok(())
+                } else {
+                    Err(StreamError::Custom("Test error".into()))
+                }
+            }
+        }
+
+        let error_stream = ReadableStream::new(ErrorSource { count: 0 });
+        let (stream1, stream2) = error_stream.tee();
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Both should get the data before error
+        assert_eq!(reader1.read().await.unwrap(), Some(0));
+        assert_eq!(reader2.read().await.unwrap(), Some(0));
+
+        assert_eq!(reader1.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+
+        // Both should get the same error
+        let err1 = reader1.read().await.unwrap_err();
+        let err2 = reader2.read().await.unwrap_err();
+
+        match (&err1, &err2) {
+            (StreamError::Custom(msg1), StreamError::Custom(msg2)) => {
+                assert_eq!(msg1.to_string(), "Test error");
+                assert_eq!(msg2.to_string(), "Test error");
+            }
+            _ => panic!("Expected Custom error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tee_chained() {
+        // Test tee of a tee (multiple levels)
+        let data = vec![1, 2];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        // First level tee
+        let (stream1, stream2) = source_stream.tee();
+
+        // Second level tee on stream1
+        let (stream1a, stream1b) = stream1.tee();
+
+        // Get readers
+        let (_, reader1a) = stream1a.get_reader();
+        let (_, reader1b) = stream1b.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // All should get the same data
+        assert_eq!(reader1a.read().await.unwrap(), Some(1));
+        assert_eq!(reader1b.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+
+        assert_eq!(reader1a.read().await.unwrap(), Some(2));
+        assert_eq!(reader1b.read().await.unwrap(), Some(2));
+        assert_eq!(reader2.read().await.unwrap(), Some(2));
+
+        // All should end
+        assert_eq!(reader1a.read().await.unwrap(), None);
+        assert_eq!(reader1b.read().await.unwrap(), None);
+        assert_eq!(reader2.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tee_with_pipe_operations() {
+        // Test that tee branches can be used in pipe operations
+        let data = vec![1, 2, 3];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee();
+
+        // Use stream1 directly
+        let (_, reader1) = stream1.get_reader();
+
+        // Pipe stream2 through a transform (if you have transforms implemented)
+        // For now, just read from stream2 directly
+        let (_, reader2) = stream2.get_reader();
+
+        // Both should work independently
+        assert_eq!(reader1.read().await.unwrap(), Some(1));
+        assert_eq!(reader2.read().await.unwrap(), Some(1));
+
+        assert_eq!(reader1.read().await.unwrap(), Some(2));
+        assert_eq!(reader2.read().await.unwrap(), Some(2));
+
+        assert_eq!(reader1.read().await.unwrap(), Some(3));
+        assert_eq!(reader2.read().await.unwrap(), Some(3));
+
+        assert_eq!(reader1.read().await.unwrap(), None);
+        assert_eq!(reader2.read().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_tee_string_data() {
+        // Test with string data to ensure cloning works for different types
+        let data = vec!["hello".to_string(), "world".to_string()];
+        let source_stream = ReadableStream::from_iter(data.into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee();
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        assert_eq!(reader1.read().await.unwrap(), Some("hello".to_string()));
+        assert_eq!(reader2.read().await.unwrap(), Some("hello".to_string()));
+
+        assert_eq!(reader1.read().await.unwrap(), Some("world".to_string()));
+        assert_eq!(reader2.read().await.unwrap(), Some("world".to_string()));
+
+        assert_eq!(reader1.read().await.unwrap(), None);
+        assert_eq!(reader2.read().await.unwrap(), None);
     }
 }
