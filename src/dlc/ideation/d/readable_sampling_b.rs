@@ -1006,7 +1006,7 @@ where
         ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
         ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
     ) {
-        self.tee_with_backpressure(BackpressureMode::Unbounded, None)
+        self.tee_with_backpressure(BackpressureMode::SpecCompliant, None)
     }
 }
 
