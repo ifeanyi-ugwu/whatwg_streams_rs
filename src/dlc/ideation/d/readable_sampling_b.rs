@@ -101,7 +101,7 @@ where
 }*/
 
 // ----------- WakerSet -----------
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct WakerSet(Arc<Mutex<Vec<Waker>>>);
 
 impl WakerSet {
@@ -771,6 +771,440 @@ where
         let stream2 = ReadableStream::new(source2);
 
         (stream1, stream2)
+    }
+}
+
+/*use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};*/
+
+// Enhanced tee configuration
+#[derive(Debug, Clone)]
+pub struct TeeConfig {
+    pub backpressure_mode: BackpressureMode,
+    pub branch1_hwm: Option<usize>, // Override HWM for branch 1
+    pub branch2_hwm: Option<usize>, // Override HWM for branch 2
+    pub max_buffer_per_branch: Option<usize>, // Memory safety limit
+}
+
+impl Default for TeeConfig {
+    fn default() -> Self {
+        Self {
+            backpressure_mode: BackpressureMode::SpecCompliant,
+            branch1_hwm: None,
+            branch2_hwm: None,
+            max_buffer_per_branch: Some(1000), // Safety limit
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum BackpressureMode {
+    /// WHATWG spec-compliant: faster consumer wins, slower consumer buffers
+    SpecCompliant,
+    /// Slowest consumer controls backpressure (prevents unbounded buffering)
+    SlowestConsumer,
+    /// Custom: aggregate both consumers' desired sizes
+    Aggregate,
+    /// Independent: each branch has separate backpressure
+    Independent,
+}
+
+// Enhanced branch state tracking
+#[derive(Debug)]
+struct BranchState<T> {
+    queue: VecDeque<T>,
+    queue_size: usize,
+    high_water_mark: usize,
+    pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<T>>>>,
+    closed: bool,
+    errored: Option<StreamError>,
+    canceled: Arc<AtomicBool>,
+    wakers: WakerSet,
+    pull_needed: bool,
+}
+
+impl<T> BranchState<T> {
+    fn new(hwm: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            queue_size: 0,
+            high_water_mark: hwm,
+            pending_reads: VecDeque::new(),
+            closed: false,
+            errored: None,
+            canceled: Arc::new(AtomicBool::new(false)),
+            wakers: WakerSet::new(),
+            pull_needed: false,
+        }
+    }
+
+    fn desired_size(&self) -> isize {
+        if self.closed || self.errored.is_some() {
+            return 0;
+        }
+        (self.high_water_mark as isize) - (self.queue_size as isize)
+    }
+
+    fn needs_data(&self) -> bool {
+        !self.closed
+            && self.errored.is_none()
+            && !self.canceled.load(Ordering::SeqCst)
+            && (self.desired_size() > 0 || !self.pending_reads.is_empty())
+    }
+
+    fn is_active(&self) -> bool {
+        !self.canceled.load(Ordering::SeqCst) && !self.closed
+    }
+}
+
+// Enhanced coordinator with configurable backpressure
+struct EnhancedTeeCoordinator<T, Source, StreamType, LockState>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker,
+    LockState: Send + 'static,
+{
+    reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
+    branch1: Arc<Mutex<BranchState<T>>>,
+    branch2: Arc<Mutex<BranchState<T>>>,
+    config: TeeConfig,
+    original_pulling: Arc<AtomicBool>,
+}
+
+impl<T, Source, StreamType, LockState> EnhancedTeeCoordinator<T, Source, StreamType, LockState>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker,
+    LockState: Send + 'static,
+{
+    fn should_pull(&self) -> bool {
+        if self.original_pulling.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let branch1 = self.branch1.lock().unwrap();
+        let branch2 = self.branch2.lock().unwrap();
+
+        match self.config.backpressure_mode {
+            BackpressureMode::SpecCompliant => {
+                // Pull if either branch needs data (faster consumer wins)
+                branch1.needs_data() || branch2.needs_data()
+            }
+            BackpressureMode::SlowestConsumer => {
+                // Pull only if both branches can accept data
+                (branch1.needs_data() || !branch1.is_active())
+                    && (branch2.needs_data() || !branch2.is_active())
+            }
+            BackpressureMode::Aggregate => {
+                // Pull if aggregate desired size > 0
+                let total_desired = branch1.desired_size() + branch2.desired_size();
+                total_desired > 0
+            }
+            BackpressureMode::Independent => {
+                // Pull if either branch needs data, but respect individual limits
+                let b1_ok = !branch1.is_active()
+                    || (branch1.needs_data() && self.check_buffer_limit(&branch1));
+                let b2_ok = !branch2.is_active()
+                    || (branch2.needs_data() && self.check_buffer_limit(&branch2));
+
+                b1_ok && b2_ok && (branch1.needs_data() || branch2.needs_data())
+            }
+        }
+    }
+
+    fn check_buffer_limit(&self, branch: &BranchState<T>) -> bool {
+        if let Some(limit) = self.config.max_buffer_per_branch {
+            branch.queue.len() < limit
+        } else {
+            true
+        }
+    }
+
+    async fn run(mut self) {
+        loop {
+            // Check termination conditions
+            let both_done = {
+                let b1 = self.branch1.lock().unwrap();
+                let b2 = self.branch2.lock().unwrap();
+                (!b1.is_active() && !b2.is_active())
+                    || (b1.closed && b2.closed)
+                    || (b1.errored.is_some() && b2.errored.is_some())
+            };
+
+            if both_done {
+                let _ = self
+                    .reader
+                    .cancel(Some("Both branches terminated".to_string()))
+                    .await;
+                break;
+            }
+
+            // Decide whether to pull
+            if self.should_pull() {
+                self.original_pulling.store(true, Ordering::SeqCst);
+
+                match self.reader.read().await {
+                    Ok(Some(chunk)) => {
+                        self.distribute_chunk(chunk).await;
+                    }
+                    Ok(None) => {
+                        self.close_branches().await;
+                        break;
+                    }
+                    Err(error) => {
+                        self.error_branches(error).await;
+                        break;
+                    }
+                }
+
+                self.original_pulling.store(false, Ordering::SeqCst);
+            } else {
+                // Wait for one of the branches to signal they need data
+                self.wait_for_pull_signal().await;
+            }
+        }
+    }
+
+    async fn distribute_chunk(&self, chunk: T) {
+        let mut branch1 = self.branch1.lock().unwrap();
+        let mut branch2 = self.branch2.lock().unwrap();
+
+        // Send to branch 1 if active and within limits
+        if branch1.is_active() && self.check_buffer_limit(&branch1) {
+            if let Some(completion) = branch1.pending_reads.pop_front() {
+                let _ = completion.send(Ok(Some(chunk.clone())));
+            } else {
+                // Add to queue if within HWM or using spec-compliant mode
+                if branch1.desired_size() > 0
+                    || matches!(
+                        self.config.backpressure_mode,
+                        BackpressureMode::SpecCompliant
+                    )
+                {
+                    branch1.queue.push_back(chunk.clone());
+                    branch1.queue_size += 1; // Simplified size calculation
+                }
+            }
+            branch1.wakers.wake_all();
+        }
+
+        // Send to branch 2 if active and within limits
+        if branch2.is_active() && self.check_buffer_limit(&branch2) {
+            if let Some(completion) = branch2.pending_reads.pop_front() {
+                let _ = completion.send(Ok(Some(chunk)));
+            } else {
+                // Add to queue if within HWM or using spec-compliant mode
+                if branch2.desired_size() > 0
+                    || matches!(
+                        self.config.backpressure_mode,
+                        BackpressureMode::SpecCompliant
+                    )
+                {
+                    branch2.queue.push_back(chunk);
+                    branch2.queue_size += 1;
+                }
+            }
+            branch2.wakers.wake_all();
+        }
+    }
+
+    async fn close_branches(&self) {
+        let mut branch1 = self.branch1.lock().unwrap();
+        let mut branch2 = self.branch2.lock().unwrap();
+
+        branch1.closed = true;
+        branch2.closed = true;
+
+        // Fulfill pending reads with None (EOF)
+        while let Some(completion) = branch1.pending_reads.pop_front() {
+            let _ = completion.send(Ok(None));
+        }
+        while let Some(completion) = branch2.pending_reads.pop_front() {
+            let _ = completion.send(Ok(None));
+        }
+
+        branch1.wakers.wake_all();
+        branch2.wakers.wake_all();
+    }
+
+    async fn error_branches(&self, error: StreamError) {
+        let mut branch1 = self.branch1.lock().unwrap();
+        let mut branch2 = self.branch2.lock().unwrap();
+
+        branch1.errored = Some(error.clone());
+        branch2.errored = Some(error.clone());
+
+        // Fulfill pending reads with error
+        while let Some(completion) = branch1.pending_reads.pop_front() {
+            let _ = completion.send(Err(error.clone()));
+        }
+        while let Some(completion) = branch2.pending_reads.pop_front() {
+            let _ = completion.send(Err(error.clone()));
+        }
+
+        branch1.wakers.wake_all();
+        branch2.wakers.wake_all();
+    }
+
+    async fn wait_for_pull_signal(&self) {
+        // Implementation would use proper async signaling
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+// Enhanced TeeSource that works with the coordinator
+pub struct EnhancedTeeSource<T> {
+    branch_state: Arc<Mutex<BranchState<T>>>,
+    branch_id: TeeSourceId,
+}
+
+impl<T> ReadableSource<T> for EnhancedTeeSource<T>
+where
+    T: Send + Clone + 'static,
+{
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<T>,
+    ) -> StreamResult<()> {
+        let mut state = self.branch_state.lock().unwrap();
+
+        // Return queued data if available
+        if let Some(chunk) = state.queue.pop_front() {
+            state.queue_size -= 1;
+            drop(state); // Release lock before controller operation
+            controller.enqueue(chunk)?;
+            return Ok(());
+        }
+
+        // Check for terminal states
+        if let Some(error) = &state.errored {
+            return Err(error.clone());
+        }
+
+        if state.closed {
+            drop(state);
+            controller.close()?;
+            return Ok(());
+        }
+
+        // Signal that we need data (would coordinate with TeeCoordinator)
+        state.pull_needed = true;
+
+        Ok(())
+    }
+
+    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+        let mut state = self.branch_state.lock().unwrap();
+        state.canceled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+// Enhanced tee method implementation
+impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker,
+{
+    pub fn tee_enhanced(
+        self,
+        config: TeeConfig,
+    ) -> (
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+    ) {
+        let (_, reader) = self.get_reader();
+
+        // Determine HWM for each branch
+        let original_hwm = self.high_water_mark.load(Ordering::SeqCst);
+        let branch1_hwm = config.branch1_hwm.unwrap_or(original_hwm);
+        let branch2_hwm = config.branch2_hwm.unwrap_or(original_hwm);
+
+        // Create branch states
+        let branch1_state = Arc::new(Mutex::new(BranchState::new(branch1_hwm)));
+        let branch2_state = Arc::new(Mutex::new(BranchState::new(branch2_hwm)));
+
+        // Create coordinator
+        let coordinator = EnhancedTeeCoordinator {
+            reader,
+            branch1: branch1_state.clone(),
+            branch2: branch2_state.clone(),
+            config,
+            original_pulling: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Spawn coordinator
+        std::thread::spawn(move || {
+            futures::executor::block_on(coordinator.run());
+        });
+
+        // Create sources
+        let source1 = EnhancedTeeSource {
+            branch_state: branch1_state,
+            branch_id: TeeSourceId::Branch1,
+        };
+
+        let source2 = EnhancedTeeSource {
+            branch_state: branch2_state,
+            branch_id: TeeSourceId::Branch2,
+        };
+
+        // Create streams with appropriate strategies
+        let stream1 = ReadableStreamBuilder::new(source1)
+            .with_strategy(CountQueuingStrategy::new(branch1_hwm))
+            .build();
+
+        let stream2 = ReadableStreamBuilder::new(source2)
+            .with_strategy(CountQueuingStrategy::new(branch2_hwm))
+            .build();
+
+        (stream1, stream2)
+    }
+
+    /// Spec-compliant tee (faster consumer wins, slower buffers)
+    pub fn tee_spec_compliant(
+        self,
+    ) -> (
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+    ) {
+        self.tee_enhanced(TeeConfig::default())
+    }
+
+    /// Memory-safe tee (slowest consumer controls backpressure)
+    pub fn tee_memory_safe(
+        self,
+    ) -> (
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+    ) {
+        self.tee_enhanced(TeeConfig {
+            backpressure_mode: BackpressureMode::SlowestConsumer,
+            ..Default::default()
+        })
+    }
+
+    /// Custom tee with specific HWM for each branch
+    pub fn tee_with_hwm(
+        self,
+        branch1_hwm: usize,
+        branch2_hwm: usize,
+    ) -> (
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+    ) {
+        self.tee_enhanced(TeeConfig {
+            backpressure_mode: BackpressureMode::Independent,
+            branch1_hwm: Some(branch1_hwm),
+            branch2_hwm: Some(branch2_hwm),
+            ..Default::default()
+        })
     }
 }
 
