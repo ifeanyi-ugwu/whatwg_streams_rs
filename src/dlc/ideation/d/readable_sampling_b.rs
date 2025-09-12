@@ -774,12 +774,6 @@ where
     }
 }
 
-/*use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};*/
-
 // Enhanced tee configuration
 #[derive(Debug, Clone)]
 pub struct TeeConfig {
@@ -812,56 +806,8 @@ pub enum BackpressureMode {
     Independent,
 }
 
-// Enhanced branch state tracking
-#[derive(Debug)]
-struct BranchState<T> {
-    queue: VecDeque<T>,
-    queue_size: usize,
-    high_water_mark: usize,
-    pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<T>>>>,
-    closed: bool,
-    errored: Option<StreamError>,
-    canceled: Arc<AtomicBool>,
-    wakers: WakerSet,
-    pull_needed: bool,
-}
-
-impl<T> BranchState<T> {
-    fn new(hwm: usize) -> Self {
-        Self {
-            queue: VecDeque::new(),
-            queue_size: 0,
-            high_water_mark: hwm,
-            pending_reads: VecDeque::new(),
-            closed: false,
-            errored: None,
-            canceled: Arc::new(AtomicBool::new(false)),
-            wakers: WakerSet::new(),
-            pull_needed: false,
-        }
-    }
-
-    fn desired_size(&self) -> isize {
-        if self.closed || self.errored.is_some() {
-            return 0;
-        }
-        (self.high_water_mark as isize) - (self.queue_size as isize)
-    }
-
-    fn needs_data(&self) -> bool {
-        !self.closed
-            && self.errored.is_none()
-            && !self.canceled.load(Ordering::SeqCst)
-            && (self.desired_size() > 0 || !self.pending_reads.is_empty())
-    }
-
-    fn is_active(&self) -> bool {
-        !self.canceled.load(Ordering::SeqCst) && !self.closed
-    }
-}
-
-// Enhanced coordinator with configurable backpressure
-struct EnhancedTeeCoordinator<T, Source, StreamType, LockState>
+// Enhanced TeeCoordinator that builds on your working implementation
+struct BackpressureTeeCoordinator<T, Source, StreamType, LockState>
 where
     T: Send + Clone + 'static,
     Source: Send + 'static,
@@ -869,13 +815,57 @@ where
     LockState: Send + 'static,
 {
     reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
-    branch1: Arc<Mutex<BranchState<T>>>,
-    branch2: Arc<Mutex<BranchState<T>>>,
-    config: TeeConfig,
-    original_pulling: Arc<AtomicBool>,
+    branch1_tx: UnboundedSender<TeeChunk<T>>,
+    branch2_tx: UnboundedSender<TeeChunk<T>>,
+    branch1_canceled: Arc<AtomicBool>,
+    branch2_canceled: Arc<AtomicBool>,
+
+    // Backpressure additions
+    backpressure_mode: BackpressureMode,
+    branch1_pending_count: Arc<AtomicUsize>,
+    branch2_pending_count: Arc<AtomicUsize>,
+    max_buffer_per_branch: usize,
+
+    // Runtime-agnostic signaling
+    backpressure_signal: AsyncSignal,
 }
 
-impl<T, Source, StreamType, LockState> EnhancedTeeCoordinator<T, Source, StreamType, LockState>
+// Runtime-agnostic async coordination primitive
+#[derive(Clone)]
+pub struct AsyncSignal {
+    waker: Arc<Mutex<Option<Waker>>>,
+    signaled: Arc<AtomicBool>,
+}
+
+impl AsyncSignal {
+    pub fn new() -> Self {
+        Self {
+            waker: Arc::new(Mutex::new(None)),
+            signaled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub async fn wait(&self) {
+        poll_fn(|cx| {
+            if self.signaled.swap(false, Ordering::SeqCst) {
+                Poll::Ready(())
+            } else {
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    pub fn signal(&self) {
+        self.signaled.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+
+impl<T, Source, StreamType, LockState> BackpressureTeeCoordinator<T, Source, StreamType, LockState>
 where
     T: Send + Clone + 'static,
     Source: Send + 'static,
@@ -883,260 +873,242 @@ where
     LockState: Send + 'static,
 {
     fn should_pull(&self) -> bool {
-        if self.original_pulling.load(Ordering::SeqCst) {
-            return false;
+        let branch1_active =
+            !self.branch1_canceled.load(Ordering::SeqCst) && !self.branch1_tx.is_closed();
+        let branch2_active =
+            !self.branch2_canceled.load(Ordering::SeqCst) && !self.branch2_tx.is_closed();
+
+        if !branch1_active && !branch2_active {
+            return false; // Both branches dead
         }
 
-        let branch1 = self.branch1.lock().unwrap();
-        let branch2 = self.branch2.lock().unwrap();
+        let branch1_pending = self.branch1_pending_count.load(Ordering::SeqCst);
+        let branch2_pending = self.branch2_pending_count.load(Ordering::SeqCst);
 
-        match self.config.backpressure_mode {
+        match self.backpressure_mode {
             BackpressureMode::SpecCompliant => {
-                // Pull if either branch needs data (faster consumer wins)
-                branch1.needs_data() || branch2.needs_data()
+                // Pull if either branch is active (faster consumer wins)
+                branch1_active || branch2_active
             }
             BackpressureMode::SlowestConsumer => {
-                // Pull only if both branches can accept data
-                (branch1.needs_data() || !branch1.is_active())
-                    && (branch2.needs_data() || !branch2.is_active())
+                // Pull only if both active branches are below their limits
+                let branch1_ok = !branch1_active || branch1_pending < self.max_buffer_per_branch;
+                let branch2_ok = !branch2_active || branch2_pending < self.max_buffer_per_branch;
+                branch1_ok && branch2_ok
             }
             BackpressureMode::Aggregate => {
-                // Pull if aggregate desired size > 0
-                let total_desired = branch1.desired_size() + branch2.desired_size();
-                total_desired > 0
+                // Pull if total pending is reasonable
+                let total_pending = branch1_pending + branch2_pending;
+                total_pending < (self.max_buffer_per_branch * 2)
             }
             BackpressureMode::Independent => {
-                // Pull if either branch needs data, but respect individual limits
-                let b1_ok = !branch1.is_active()
-                    || (branch1.needs_data() && self.check_buffer_limit(&branch1));
-                let b2_ok = !branch2.is_active()
-                    || (branch2.needs_data() && self.check_buffer_limit(&branch2));
-
-                b1_ok && b2_ok && (branch1.needs_data() || branch2.needs_data())
+                // Pull if at least one branch can accept data
+                let branch1_can_accept =
+                    !branch1_active || branch1_pending < self.max_buffer_per_branch;
+                let branch2_can_accept =
+                    !branch2_active || branch2_pending < self.max_buffer_per_branch;
+                branch1_can_accept || branch2_can_accept
             }
-        }
-    }
-
-    fn check_buffer_limit(&self, branch: &BranchState<T>) -> bool {
-        if let Some(limit) = self.config.max_buffer_per_branch {
-            branch.queue.len() < limit
-        } else {
-            true
         }
     }
 
     async fn run(mut self) {
         loop {
-            // Check termination conditions
-            let both_done = {
-                let b1 = self.branch1.lock().unwrap();
-                let b2 = self.branch2.lock().unwrap();
-                (!b1.is_active() && !b2.is_active())
-                    || (b1.closed && b2.closed)
-                    || (b1.errored.is_some() && b2.errored.is_some())
-            };
+            // Check termination condition
+            let branch1_dead =
+                self.branch1_canceled.load(Ordering::SeqCst) || self.branch1_tx.is_closed();
+            let branch2_dead =
+                self.branch2_canceled.load(Ordering::SeqCst) || self.branch2_tx.is_closed();
 
-            if both_done {
+            if branch1_dead && branch2_dead {
                 let _ = self
                     .reader
-                    .cancel(Some("Both branches terminated".to_string()))
+                    .cancel(Some("Both tee branches terminated".to_string()))
                     .await;
                 break;
             }
 
-            // Decide whether to pull
-            if self.should_pull() {
-                self.original_pulling.store(true, Ordering::SeqCst);
+            // Wait for backpressure to clear if needed
+            while !self.should_pull() {
+                self.backpressure_signal.wait().await;
 
-                match self.reader.read().await {
-                    Ok(Some(chunk)) => {
-                        self.distribute_chunk(chunk).await;
-                    }
-                    Ok(None) => {
-                        self.close_branches().await;
-                        break;
-                    }
-                    Err(error) => {
-                        self.error_branches(error).await;
-                        break;
-                    }
+                // Recheck termination after waiting
+                let branch1_dead =
+                    self.branch1_canceled.load(Ordering::SeqCst) || self.branch1_tx.is_closed();
+                let branch2_dead =
+                    self.branch2_canceled.load(Ordering::SeqCst) || self.branch2_tx.is_closed();
+                if branch1_dead && branch2_dead {
+                    let _ = self
+                        .reader
+                        .cancel(Some("Both tee branches terminated".to_string()))
+                        .await;
+                    return;
                 }
+            }
 
-                self.original_pulling.store(false, Ordering::SeqCst);
-            } else {
-                // Wait for one of the branches to signal they need data
-                self.wait_for_pull_signal().await;
+            // Pull from original stream
+            match self.reader.read().await {
+                Ok(Some(chunk)) => {
+                    self.distribute_chunk(chunk).await;
+                }
+                Ok(None) => {
+                    // EOF - notify both branches
+                    let _ = self.branch1_tx.unbounded_send(TeeChunk::End);
+                    let _ = self.branch2_tx.unbounded_send(TeeChunk::End);
+                    break;
+                }
+                Err(error) => {
+                    // Error - notify both branches
+                    let _ = self
+                        .branch1_tx
+                        .unbounded_send(TeeChunk::Error(error.clone()));
+                    let _ = self.branch2_tx.unbounded_send(TeeChunk::Error(error));
+                    break;
+                }
             }
         }
     }
 
     async fn distribute_chunk(&self, chunk: T) {
-        let mut branch1 = self.branch1.lock().unwrap();
-        let mut branch2 = self.branch2.lock().unwrap();
+        let branch1_active =
+            !self.branch1_canceled.load(Ordering::SeqCst) && !self.branch1_tx.is_closed();
+        let branch2_active =
+            !self.branch2_canceled.load(Ordering::SeqCst) && !self.branch2_tx.is_closed();
 
-        // Send to branch 1 if active and within limits
-        if branch1.is_active() && self.check_buffer_limit(&branch1) {
-            if let Some(completion) = branch1.pending_reads.pop_front() {
-                let _ = completion.send(Ok(Some(chunk.clone())));
-            } else {
-                // Add to queue if within HWM or using spec-compliant mode
-                if branch1.desired_size() > 0
-                    || matches!(
-                        self.config.backpressure_mode,
-                        BackpressureMode::SpecCompliant
-                    )
+        // Send to branch1 if active and within backpressure limits
+        if branch1_active {
+            let should_send = match self.backpressure_mode {
+                BackpressureMode::SpecCompliant => true, // Always send in spec mode
+                _ => self.branch1_pending_count.load(Ordering::SeqCst) < self.max_buffer_per_branch,
+            };
+
+            if should_send {
+                if self
+                    .branch1_tx
+                    .unbounded_send(TeeChunk::Data(chunk.clone()))
+                    .is_ok()
                 {
-                    branch1.queue.push_back(chunk.clone());
-                    branch1.queue_size += 1; // Simplified size calculation
+                    self.branch1_pending_count.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.branch1_canceled.store(true, Ordering::SeqCst);
                 }
             }
-            branch1.wakers.wake_all();
         }
 
-        // Send to branch 2 if active and within limits
-        if branch2.is_active() && self.check_buffer_limit(&branch2) {
-            if let Some(completion) = branch2.pending_reads.pop_front() {
-                let _ = completion.send(Ok(Some(chunk)));
-            } else {
-                // Add to queue if within HWM or using spec-compliant mode
-                if branch2.desired_size() > 0
-                    || matches!(
-                        self.config.backpressure_mode,
-                        BackpressureMode::SpecCompliant
-                    )
+        // Send to branch2 if active and within backpressure limits
+        if branch2_active {
+            let should_send = match self.backpressure_mode {
+                BackpressureMode::SpecCompliant => true,
+                _ => self.branch2_pending_count.load(Ordering::SeqCst) < self.max_buffer_per_branch,
+            };
+
+            if should_send {
+                if self
+                    .branch2_tx
+                    .unbounded_send(TeeChunk::Data(chunk))
+                    .is_ok()
                 {
-                    branch2.queue.push_back(chunk);
-                    branch2.queue_size += 1;
+                    self.branch2_pending_count.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.branch2_canceled.store(true, Ordering::SeqCst);
                 }
             }
-            branch2.wakers.wake_all();
         }
-    }
-
-    async fn close_branches(&self) {
-        let mut branch1 = self.branch1.lock().unwrap();
-        let mut branch2 = self.branch2.lock().unwrap();
-
-        branch1.closed = true;
-        branch2.closed = true;
-
-        // Fulfill pending reads with None (EOF)
-        while let Some(completion) = branch1.pending_reads.pop_front() {
-            let _ = completion.send(Ok(None));
-        }
-        while let Some(completion) = branch2.pending_reads.pop_front() {
-            let _ = completion.send(Ok(None));
-        }
-
-        branch1.wakers.wake_all();
-        branch2.wakers.wake_all();
-    }
-
-    async fn error_branches(&self, error: StreamError) {
-        let mut branch1 = self.branch1.lock().unwrap();
-        let mut branch2 = self.branch2.lock().unwrap();
-
-        branch1.errored = Some(error.clone());
-        branch2.errored = Some(error.clone());
-
-        // Fulfill pending reads with error
-        while let Some(completion) = branch1.pending_reads.pop_front() {
-            let _ = completion.send(Err(error.clone()));
-        }
-        while let Some(completion) = branch2.pending_reads.pop_front() {
-            let _ = completion.send(Err(error.clone()));
-        }
-
-        branch1.wakers.wake_all();
-        branch2.wakers.wake_all();
-    }
-
-    async fn wait_for_pull_signal(&self) {
-        // Implementation would use proper async signaling
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
     }
 }
 
-// Enhanced TeeSource that works with the coordinator
-pub struct EnhancedTeeSource<T> {
-    branch_state: Arc<Mutex<BranchState<T>>>,
+// Enhanced TeeSource that signals backpressure relief
+pub struct BackpressureTeeSource<T> {
+    chunk_rx: UnboundedReceiver<TeeChunk<T>>,
     branch_id: TeeSourceId,
+    branch_canceled: Arc<AtomicBool>,
+    pending_count: Arc<AtomicUsize>,
+    backpressure_signal: AsyncSignal,
 }
 
-impl<T> ReadableSource<T> for EnhancedTeeSource<T>
+impl<T> ReadableSource<T> for BackpressureTeeSource<T>
 where
-    T: Send + Clone + 'static,
+    T: Send + 'static,
 {
     async fn pull(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
     ) -> StreamResult<()> {
-        let mut state = self.branch_state.lock().unwrap();
-
-        // Return queued data if available
-        if let Some(chunk) = state.queue.pop_front() {
-            state.queue_size -= 1;
-            drop(state); // Release lock before controller operation
-            controller.enqueue(chunk)?;
-            return Ok(());
-        }
-
-        // Check for terminal states
-        if let Some(error) = &state.errored {
-            return Err(error.clone());
-        }
-
-        if state.closed {
-            drop(state);
+        if self.branch_canceled.load(Ordering::SeqCst) {
             controller.close()?;
             return Ok(());
         }
 
-        // Signal that we need data (would coordinate with TeeCoordinator)
-        state.pull_needed = true;
+        match self.chunk_rx.next().await {
+            Some(TeeChunk::Data(chunk)) => {
+                // Decrement pending count and signal backpressure relief
+                let old_count = self.pending_count.fetch_sub(1, Ordering::SeqCst);
+                if old_count > 0 {
+                    self.backpressure_signal.signal();
+                }
+                controller.enqueue(chunk)?;
+            }
+            Some(TeeChunk::End) => {
+                controller.close()?;
+            }
+            Some(TeeChunk::Error(err)) => {
+                return Err(err);
+            }
+            None => {
+                controller.close()?;
+            }
+        }
 
         Ok(())
     }
 
     async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
-        let mut state = self.branch_state.lock().unwrap();
-        state.canceled.store(true, Ordering::SeqCst);
+        self.branch_canceled.store(true, Ordering::SeqCst);
+        self.backpressure_signal.signal(); // Wake coordinator
         Ok(())
     }
 }
 
-// Enhanced tee method implementation
+// Clean tee implementation
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Send + Clone + 'static,
     Source: Send + 'static,
     S: StreamTypeMarker,
 {
-    pub fn tee_enhanced(
+    pub fn tee_with_backpressure(
         self,
-        config: TeeConfig,
+        mode: BackpressureMode,
+        max_buffer_per_branch: Option<usize>,
     ) -> (
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, BackpressureTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, BackpressureTeeSource<T>, DefaultStream, Unlocked>,
     ) {
         let (_, reader) = self.get_reader();
+        let max_buffer = max_buffer_per_branch.unwrap_or(1000);
 
-        // Determine HWM for each branch
-        let original_hwm = self.high_water_mark.load(Ordering::SeqCst);
-        let branch1_hwm = config.branch1_hwm.unwrap_or(original_hwm);
-        let branch2_hwm = config.branch2_hwm.unwrap_or(original_hwm);
+        // Create channels and shared state
+        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
+        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
 
-        // Create branch states
-        let branch1_state = Arc::new(Mutex::new(BranchState::new(branch1_hwm)));
-        let branch2_state = Arc::new(Mutex::new(BranchState::new(branch2_hwm)));
+        let branch1_canceled = Arc::new(AtomicBool::new(false));
+        let branch2_canceled = Arc::new(AtomicBool::new(false));
+        let branch1_pending = Arc::new(AtomicUsize::new(0));
+        let branch2_pending = Arc::new(AtomicUsize::new(0));
+        let backpressure_signal = AsyncSignal::new();
 
         // Create coordinator
-        let coordinator = EnhancedTeeCoordinator {
+        let coordinator = BackpressureTeeCoordinator {
             reader,
-            branch1: branch1_state.clone(),
-            branch2: branch2_state.clone(),
-            config,
-            original_pulling: Arc::new(AtomicBool::new(false)),
+            branch1_tx,
+            branch2_tx,
+            branch1_canceled: branch1_canceled.clone(),
+            branch2_canceled: branch2_canceled.clone(),
+            backpressure_mode: mode,
+            branch1_pending_count: branch1_pending.clone(),
+            branch2_pending_count: branch2_pending.clone(),
+            max_buffer_per_branch: max_buffer,
+            backpressure_signal: backpressure_signal.clone(),
         };
 
         // Spawn coordinator
@@ -1145,66 +1117,27 @@ where
         });
 
         // Create sources
-        let source1 = EnhancedTeeSource {
-            branch_state: branch1_state,
+        let source1 = BackpressureTeeSource {
+            chunk_rx: branch1_rx,
             branch_id: TeeSourceId::Branch1,
+            branch_canceled: branch1_canceled,
+            pending_count: branch1_pending,
+            backpressure_signal: backpressure_signal.clone(),
         };
 
-        let source2 = EnhancedTeeSource {
-            branch_state: branch2_state,
+        let source2 = BackpressureTeeSource {
+            chunk_rx: branch2_rx,
             branch_id: TeeSourceId::Branch2,
+            branch_canceled: branch2_canceled,
+            pending_count: branch2_pending,
+            backpressure_signal,
         };
 
-        // Create streams with appropriate strategies
-        let stream1 = ReadableStreamBuilder::new(source1)
-            .with_strategy(CountQueuingStrategy::new(branch1_hwm))
-            .build();
-
-        let stream2 = ReadableStreamBuilder::new(source2)
-            .with_strategy(CountQueuingStrategy::new(branch2_hwm))
-            .build();
+        // Create streams with default strategy
+        let stream1 = ReadableStream::new(source1);
+        let stream2 = ReadableStream::new(source2);
 
         (stream1, stream2)
-    }
-
-    /// Spec-compliant tee (faster consumer wins, slower buffers)
-    pub fn tee_spec_compliant(
-        self,
-    ) -> (
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-    ) {
-        self.tee_enhanced(TeeConfig::default())
-    }
-
-    /// Memory-safe tee (slowest consumer controls backpressure)
-    pub fn tee_memory_safe(
-        self,
-    ) -> (
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-    ) {
-        self.tee_enhanced(TeeConfig {
-            backpressure_mode: BackpressureMode::SlowestConsumer,
-            ..Default::default()
-        })
-    }
-
-    /// Custom tee with specific HWM for each branch
-    pub fn tee_with_hwm(
-        self,
-        branch1_hwm: usize,
-        branch2_hwm: usize,
-    ) -> (
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, EnhancedTeeSource<T>, DefaultStream, Unlocked>,
-    ) {
-        self.tee_enhanced(TeeConfig {
-            backpressure_mode: BackpressureMode::Independent,
-            branch1_hwm: Some(branch1_hwm),
-            branch2_hwm: Some(branch2_hwm),
-            ..Default::default()
-        })
     }
 }
 
@@ -5461,5 +5394,223 @@ mod tee_tests {
 
         assert_eq!(reader1.read().await.unwrap(), None);
         assert_eq!(reader2.read().await.unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod backpressure_tee_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn test_spec_compliant_fast_reader_not_throttled() {
+        let data: Vec<i32> = (1..=10).collect();
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let (stream1, stream2) =
+            source_stream.tee_with_backpressure(BackpressureMode::SpecCompliant, Some(2));
+
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        let fast_count = Arc::new(Mutex::new(0));
+        let slow_count = Arc::new(Mutex::new(0));
+
+        let fast_count_clone = fast_count.clone();
+        let slow_count_clone = slow_count.clone();
+
+        // Fast reader
+        let fast_task = tokio::spawn(async move {
+            while let Ok(Some(_)) = reader1.read().await {
+                *fast_count_clone.lock().unwrap() += 1;
+            }
+        });
+
+        // Slow reader
+        let slow_task = tokio::spawn(async move {
+            while let Ok(Some(_)) = reader2.read().await {
+                *slow_count_clone.lock().unwrap() += 1;
+                sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        tokio::join!(fast_task, slow_task);
+
+        let fast = *fast_count.lock().unwrap();
+        let slow = *slow_count.lock().unwrap();
+
+        // SpecCompliant: fast reader is unconstrained
+        assert_eq!(fast, data.len());
+        assert_eq!(slow, data.len());
+        assert!(
+            fast >= slow,
+            "Fast should finish before or alongside slow reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slowest_consumer_fast_reader_throttled() {
+        let data: Vec<i32> = (1..=10).collect();
+        let buffer_size = 2;
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let (stream1, stream2) = source_stream
+            .tee_with_backpressure(BackpressureMode::SlowestConsumer, Some(buffer_size));
+
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        let fast_progress = Arc::new(Mutex::new(Vec::new()));
+        let slow_progress = Arc::new(Mutex::new(Vec::new()));
+
+        let fast_progress_clone = fast_progress.clone();
+        let slow_progress_clone = slow_progress.clone();
+
+        // Fast reader (throttled by slow)
+        let fast_task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Some(_)) = reader1.read().await {
+                count += 1;
+                fast_progress_clone.lock().unwrap().push(count);
+            }
+        });
+
+        // Slow reader (controls pace)
+        let slow_task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Some(_)) = reader2.read().await {
+                count += 1;
+                slow_progress_clone.lock().unwrap().push(count);
+                sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        tokio::join!(fast_task, slow_task);
+
+        let fast = fast_progress.lock().unwrap();
+        let slow = slow_progress.lock().unwrap();
+
+        for i in 0..fast.len().min(slow.len()) {
+            assert!(
+                fast[i] <= slow[i] + buffer_size,
+                "Fast reader got too far ahead at step {}: fast={}, slow={}",
+                i,
+                fast[i],
+                slow[i]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_independent_mode_separate_limits() {
+        let data: Vec<i32> = (1..=10).collect();
+        let buffer_size = 2;
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let (stream1, stream2) =
+            source_stream.tee_with_backpressure(BackpressureMode::Independent, Some(buffer_size));
+
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        let fast_progress = Arc::new(Mutex::new(Vec::new()));
+        let slow_progress = Arc::new(Mutex::new(Vec::new()));
+
+        let fast_progress_clone = fast_progress.clone();
+        let slow_progress_clone = slow_progress.clone();
+
+        // Fast reader (independent but bounded by its buffer)
+        let fast_task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Some(_)) = reader1.read().await {
+                count += 1;
+                fast_progress_clone.lock().unwrap().push(count);
+            }
+        });
+
+        // Slow reader
+        let slow_task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Some(_)) = reader2.read().await {
+                count += 1;
+                slow_progress_clone.lock().unwrap().push(count);
+                sleep(Duration::from_millis(15)).await;
+            }
+        });
+
+        tokio::join!(fast_task, slow_task);
+
+        let fast = fast_progress.lock().unwrap();
+        let slow = slow_progress.lock().unwrap();
+
+        // Independent mode: fast can progress more than slow, but only within its buffer limit
+        for i in 0..fast.len().min(slow.len()) {
+            assert!(
+                fast[i] <= slow[i] + buffer_size,
+                "Fast reader exceeded its independent buffer at step {}: fast={}, slow={}",
+                i,
+                fast[i],
+                slow[i]
+            );
+        }
+
+        assert!(
+            fast.len() >= slow.len(),
+            "Fast should advance more than slow overall"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_limit_enforcement() {
+        let data: Vec<i32> = (1..=8).collect();
+        let buffer_size = 1;
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let (stream1, stream2) = source_stream
+            .tee_with_backpressure(BackpressureMode::SlowestConsumer, Some(buffer_size));
+
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        let fast_progress = Arc::new(Mutex::new(Vec::new()));
+        let slow_progress = Arc::new(Mutex::new(Vec::new()));
+
+        let fast_progress_clone = fast_progress.clone();
+        let slow_progress_clone = slow_progress.clone();
+
+        // Fast reader
+        let fast_task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Some(_)) = reader1.read().await {
+                count += 1;
+                fast_progress_clone.lock().unwrap().push(count);
+            }
+        });
+
+        // Slow reader
+        let slow_task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Some(_)) = reader2.read().await {
+                count += 1;
+                slow_progress_clone.lock().unwrap().push(count);
+                sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        tokio::join!(fast_task, slow_task);
+
+        let fast = fast_progress.lock().unwrap();
+        let slow = slow_progress.lock().unwrap();
+
+        for i in 0..fast.len().min(slow.len()) {
+            assert!(
+                fast[i] <= slow[i] + buffer_size,
+                "Buffer overflow: fast got {} vs slow {} at step {}",
+                fast[i],
+                slow[i],
+                i
+            );
+        }
     }
 }
