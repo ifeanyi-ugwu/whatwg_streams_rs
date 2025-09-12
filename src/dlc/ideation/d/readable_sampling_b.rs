@@ -560,14 +560,7 @@ where
     }*/
 }
 
-// tee implementation
-
-// Tee source that receives data from the coordinator
-pub struct TeeSource<T> {
-    chunk_rx: UnboundedReceiver<TeeChunk<T>>,
-    branch_id: TeeSourceId,
-    branch_canceled: Arc<AtomicBool>,
-}
+// ===== Tee implementation =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeeSourceId {
@@ -582,205 +575,12 @@ enum TeeChunk<T> {
     Error(StreamError),
 }
 
-impl<T> ReadableSource<T> for TeeSource<T>
-where
-    T: Send + 'static,
-{
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<T>,
-    ) -> StreamResult<()> {
-        // If this branch was canceled, close immediately
-        if self.branch_canceled.load(Ordering::SeqCst) {
-            controller.close()?;
-            return Ok(());
-        }
-
-        // Wait for data from coordinator
-        match self.chunk_rx.next().await {
-            Some(TeeChunk::Data(chunk)) => {
-                controller.enqueue(chunk)?;
-            }
-            Some(TeeChunk::End) => {
-                controller.close()?;
-            }
-            Some(TeeChunk::Error(err)) => {
-                return Err(err);
-            }
-            None => {
-                // Coordinator dropped - treat as end of stream
-                controller.close()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
-        self.branch_canceled.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-// Coordinator that reads from original and distributes to branches
-struct TeeCoordinator<T, Source, StreamType, LockState>
-where
-    T: Send + Clone + 'static,
-    Source: Send + 'static,
-    StreamType: StreamTypeMarker,
-    LockState: Send + 'static,
-{
-    reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
-    branch1_tx: UnboundedSender<TeeChunk<T>>,
-    branch2_tx: UnboundedSender<TeeChunk<T>>,
-    branch1_canceled: Arc<AtomicBool>,
-    branch2_canceled: Arc<AtomicBool>,
-}
-
-impl<T, Source, StreamType, LockState> TeeCoordinator<T, Source, StreamType, LockState>
-where
-    T: Send + Clone + 'static,
-    Source: Send + 'static,
-    StreamType: StreamTypeMarker,
-    LockState: Send + 'static,
-{
-    async fn run(mut self) {
-        loop {
-            // Check if both branches are canceled
-            let branch1_dead =
-                self.branch1_canceled.load(Ordering::SeqCst) || self.branch1_tx.is_closed();
-            let branch2_dead =
-                self.branch2_canceled.load(Ordering::SeqCst) || self.branch2_tx.is_closed();
-
-            if branch1_dead && branch2_dead {
-                // Both branches canceled/dropped - cancel original stream
-                let _ = self
-                    .reader
-                    .cancel(Some("Both tee branches canceled".to_string()))
-                    .await;
-                break;
-            }
-
-            // Read from original stream
-            match self.reader.read().await {
-                Ok(Some(chunk)) => {
-                    // Clone and send to active branches
-                    if !branch1_dead {
-                        if self
-                            .branch1_tx
-                            .unbounded_send(TeeChunk::Data(chunk.clone()))
-                            .is_err()
-                        {
-                            // Branch 1 receiver dropped
-                            self.branch1_canceled.store(true, Ordering::SeqCst);
-                        }
-                    }
-
-                    if !branch2_dead {
-                        if self
-                            .branch2_tx
-                            .unbounded_send(TeeChunk::Data(chunk))
-                            .is_err()
-                        {
-                            // Branch 2 receiver dropped
-                            self.branch2_canceled.store(true, Ordering::SeqCst);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // Source ended - notify all active branches
-                    if !branch1_dead {
-                        let _ = self.branch1_tx.unbounded_send(TeeChunk::End);
-                    }
-                    if !branch2_dead {
-                        let _ = self.branch2_tx.unbounded_send(TeeChunk::End);
-                    }
-                    break;
-                }
-                Err(error) => {
-                    // Error - notify all active branches
-                    if !branch1_dead {
-                        let _ = self
-                            .branch1_tx
-                            .unbounded_send(TeeChunk::Error(error.clone()));
-                    }
-                    if !branch2_dead {
-                        let _ = self.branch2_tx.unbounded_send(TeeChunk::Error(error));
-                    }
-                    break;
-                }
-            }
-        }
-    }
-}
-
-// Update the tee method implementation
-impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
-where
-    T: Send + Clone + 'static,
-    Source: Send + 'static,
-    S: StreamTypeMarker,
-{
-    pub fn tee(
-        self,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    ) {
-        // Lock the original stream and get a reader
-        let (_, reader) = self.get_reader();
-
-        // Create channels for each branch
-        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
-        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
-
-        // Shared cancellation state
-        let branch1_canceled = Arc::new(AtomicBool::new(false));
-        let branch2_canceled = Arc::new(AtomicBool::new(false));
-
-        // Create coordinator
-        let coordinator = TeeCoordinator {
-            reader,
-            branch1_tx,
-            branch2_tx,
-            branch1_canceled: branch1_canceled.clone(),
-            branch2_canceled: branch2_canceled.clone(),
-        };
-
-        // Spawn coordinator task
-        std::thread::spawn(move || {
-            futures::executor::block_on(coordinator.run());
-        });
-
-        // Create tee sources with default strategies (ignoring original HWM)
-        let source1 = TeeSource {
-            chunk_rx: branch1_rx,
-            branch_id: TeeSourceId::Branch1,
-            branch_canceled: branch1_canceled,
-        };
-
-        let source2 = TeeSource {
-            chunk_rx: branch2_rx,
-            branch_id: TeeSourceId::Branch2,
-            branch_canceled: branch2_canceled,
-        };
-
-        // Create the two streams with default strategies
-        // Note: Each branch gets fresh default strategy, ignoring original's HWM
-        let stream1 = ReadableStream::new(source1);
-        let stream2 = ReadableStream::new(source2);
-
-        (stream1, stream2)
-    }
-}
-
-// Enhanced tee configuration
 #[derive(Debug, Clone)]
 pub struct TeeConfig {
     pub backpressure_mode: BackpressureMode,
-    pub branch1_hwm: Option<usize>, // Override HWM for branch 1
-    pub branch2_hwm: Option<usize>, // Override HWM for branch 2
-    pub max_buffer_per_branch: Option<usize>, // Memory safety limit
+    pub branch1_hwm: Option<usize>,
+    pub branch2_hwm: Option<usize>,
+    pub max_buffer_per_branch: Option<usize>,
 }
 
 impl Default for TeeConfig {
@@ -789,7 +589,7 @@ impl Default for TeeConfig {
             backpressure_mode: BackpressureMode::Unbounded,
             branch1_hwm: None,
             branch2_hwm: None,
-            max_buffer_per_branch: Some(1000), // Safety limit
+            max_buffer_per_branch: Some(1000),
         }
     }
 }
@@ -826,31 +626,6 @@ pub enum BackpressureMode {
     Aggregate,
 }
 
-// Enhanced TeeCoordinator that builds on your working implementation
-struct BackpressureTeeCoordinator<T, Source, StreamType, LockState>
-where
-    T: Send + Clone + 'static,
-    Source: Send + 'static,
-    StreamType: StreamTypeMarker,
-    LockState: Send + 'static,
-{
-    reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
-    branch1_tx: UnboundedSender<TeeChunk<T>>,
-    branch2_tx: UnboundedSender<TeeChunk<T>>,
-    branch1_canceled: Arc<AtomicBool>,
-    branch2_canceled: Arc<AtomicBool>,
-
-    // Backpressure additions
-    backpressure_mode: BackpressureMode,
-    branch1_pending_count: Arc<AtomicUsize>,
-    branch2_pending_count: Arc<AtomicUsize>,
-    max_buffer_per_branch: usize,
-
-    // Runtime-agnostic signaling
-    backpressure_signal: AsyncSignal,
-}
-
-// Runtime-agnostic async coordination primitive
 #[derive(Clone)]
 pub struct AsyncSignal {
     waker: Arc<Mutex<Option<Waker>>>,
@@ -879,19 +654,107 @@ impl AsyncSignal {
 
     pub fn signal(&self) {
         self.signaled.store(true, Ordering::SeqCst);
-        if let Some(waker) = self.waker.lock().unwrap().take() {
-            waker.wake();
+        if let Some(w) = self.waker.lock().unwrap().take() {
+            w.wake();
         }
     }
 }
 
-impl<T, Source, StreamType, LockState> BackpressureTeeCoordinator<T, Source, StreamType, LockState>
+pub struct TeeSource<T> {
+    chunk_rx: UnboundedReceiver<TeeChunk<T>>,
+    branch_id: TeeSourceId,
+    branch_canceled: Arc<AtomicBool>,
+
+    // Optional fields used only for backpressure-aware modes.
+    // None for the Unbounded fast-path.
+    pending_count: Option<Arc<AtomicUsize>>,
+    backpressure_signal: Option<AsyncSignal>,
+}
+
+impl<T> ReadableSource<T> for TeeSource<T>
+where
+    T: Send + 'static,
+{
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<T>,
+    ) -> StreamResult<()> {
+        if self.branch_canceled.load(Ordering::SeqCst) {
+            controller.close()?;
+            return Ok(());
+        }
+
+        match self.chunk_rx.next().await {
+            Some(TeeChunk::Data(chunk)) => {
+                // If we have pending_count (i.e., not fast-path), decrement and signal.
+                if let Some(pending) = &self.pending_count {
+                    let old = pending.fetch_sub(1, Ordering::SeqCst);
+                    if old > 0 {
+                        if let Some(sig) = &self.backpressure_signal {
+                            sig.signal();
+                        }
+                    }
+                }
+
+                controller.enqueue(chunk)?;
+            }
+            Some(TeeChunk::End) => {
+                controller.close()?;
+            }
+            Some(TeeChunk::Error(err)) => {
+                return Err(err);
+            }
+            None => {
+                controller.close()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+        self.branch_canceled.store(true, Ordering::SeqCst);
+
+        // Wake coordinator if we have a signal (non-fast path).
+        if let Some(sig) = &self.backpressure_signal {
+            sig.signal();
+        }
+        Ok(())
+    }
+}
+
+struct TeeCoordinator<T, Source, StreamType, LockState>
 where
     T: Send + Clone + 'static,
     Source: Send + 'static,
     StreamType: StreamTypeMarker,
     LockState: Send + 'static,
 {
+    reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
+
+    branch1_tx: UnboundedSender<TeeChunk<T>>,
+    branch2_tx: UnboundedSender<TeeChunk<T>>,
+
+    branch1_canceled: Arc<AtomicBool>,
+    branch2_canceled: Arc<AtomicBool>,
+
+    // Backpressure configuration
+    backpressure_mode: BackpressureMode,
+    branch1_pending_count: Option<Arc<AtomicUsize>>,
+    branch2_pending_count: Option<Arc<AtomicUsize>>,
+    max_buffer_per_branch: usize,
+
+    backpressure_signal: Option<AsyncSignal>,
+}
+
+impl<T, Source, StreamType, LockState> TeeCoordinator<T, Source, StreamType, LockState>
+where
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    StreamType: StreamTypeMarker,
+    LockState: Send + 'static,
+{
+    // Decide whether to pull; respects fast-path (None pending counts => Unbounded fast-path)
     fn should_pull(&self) -> bool {
         let branch1_active =
             !self.branch1_canceled.load(Ordering::SeqCst) && !self.branch1_tx.is_closed();
@@ -899,42 +762,113 @@ where
             !self.branch2_canceled.load(Ordering::SeqCst) && !self.branch2_tx.is_closed();
 
         if !branch1_active && !branch2_active {
-            return false; // Both branches dead
+            return false;
         }
 
-        let branch1_pending = self.branch1_pending_count.load(Ordering::SeqCst);
-        let branch2_pending = self.branch2_pending_count.load(Ordering::SeqCst);
+        // Fast-path: no pending counts allocated => treat as Unbounded behavior.
+        if self.branch1_pending_count.is_none() || self.branch2_pending_count.is_none() {
+            // fast path: pull if either active
+            return branch1_active || branch2_active;
+        }
+
+        // Safe to unwrap because we checked above
+        let branch1_pending = self
+            .branch1_pending_count
+            .as_ref()
+            .unwrap()
+            .load(Ordering::SeqCst);
+        let branch2_pending = self
+            .branch2_pending_count
+            .as_ref()
+            .unwrap()
+            .load(Ordering::SeqCst);
 
         match self.backpressure_mode {
-            BackpressureMode::Unbounded => {
-                // Pull if either branch is active (faster consumer wins)
-                branch1_active || branch2_active
-            }
+            BackpressureMode::Unbounded => branch1_active || branch2_active,
             BackpressureMode::SlowestConsumer => {
-                // Pull only if both active branches are below their limits
-                let branch1_ok = !branch1_active || branch1_pending < self.max_buffer_per_branch;
-                let branch2_ok = !branch2_active || branch2_pending < self.max_buffer_per_branch;
-                branch1_ok && branch2_ok
+                let b1_ok = !branch1_active || branch1_pending < self.max_buffer_per_branch;
+                let b2_ok = !branch2_active || branch2_pending < self.max_buffer_per_branch;
+                b1_ok && b2_ok
             }
             BackpressureMode::Aggregate => {
-                // Pull if total pending is reasonable
-                let total_pending = branch1_pending + branch2_pending;
-                total_pending < (self.max_buffer_per_branch * 2)
+                let total = branch1_pending + branch2_pending;
+                total < (self.max_buffer_per_branch * 2)
             }
             BackpressureMode::SpecCompliant => {
-                // Pull if at least one branch can accept data
-                let branch1_can_accept =
-                    !branch1_active || branch1_pending < self.max_buffer_per_branch;
-                let branch2_can_accept =
-                    !branch2_active || branch2_pending < self.max_buffer_per_branch;
-                branch1_can_accept || branch2_can_accept
+                let b1_can = !branch1_active || branch1_pending < self.max_buffer_per_branch;
+                let b2_can = !branch2_active || branch2_pending < self.max_buffer_per_branch;
+                b1_can || b2_can
+            }
+        }
+    }
+
+    async fn distribute_chunk(&self, chunk: T) {
+        let branch1_active =
+            !self.branch1_canceled.load(Ordering::SeqCst) && !self.branch1_tx.is_closed();
+        let branch2_active =
+            !self.branch2_canceled.load(Ordering::SeqCst) && !self.branch2_tx.is_closed();
+
+        // Try send to branch1
+        if branch1_active {
+            let should_send = match self.backpressure_mode {
+                BackpressureMode::Unbounded => true,
+                _ => {
+                    // If we don't have a pending count, be permissive (shouldn't happen for non-Unbounded)
+                    if let Some(p) = &self.branch1_pending_count {
+                        p.load(Ordering::SeqCst) < self.max_buffer_per_branch
+                    } else {
+                        true
+                    }
+                }
+            };
+
+            if should_send {
+                if self
+                    .branch1_tx
+                    .unbounded_send(TeeChunk::Data(chunk.clone()))
+                    .is_ok()
+                {
+                    if let Some(p) = &self.branch1_pending_count {
+                        p.fetch_add(1, Ordering::SeqCst);
+                    }
+                } else {
+                    self.branch1_canceled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        // Branch2
+        if branch2_active {
+            let should_send = match self.backpressure_mode {
+                BackpressureMode::Unbounded => true,
+                _ => {
+                    if let Some(p) = &self.branch2_pending_count {
+                        p.load(Ordering::SeqCst) < self.max_buffer_per_branch
+                    } else {
+                        true
+                    }
+                }
+            };
+
+            if should_send {
+                if self
+                    .branch2_tx
+                    .unbounded_send(TeeChunk::Data(chunk))
+                    .is_ok()
+                {
+                    if let Some(p) = &self.branch2_pending_count {
+                        p.fetch_add(1, Ordering::SeqCst);
+                    }
+                } else {
+                    self.branch2_canceled.store(true, Ordering::SeqCst);
+                }
             }
         }
     }
 
     async fn run(mut self) {
         loop {
-            // Check termination condition
+            // termination check
             let branch1_dead =
                 self.branch1_canceled.load(Ordering::SeqCst) || self.branch1_tx.is_closed();
             let branch2_dead =
@@ -949,8 +883,14 @@ where
             }
 
             // Wait for backpressure to clear if needed
+            // If non-fast-path, wait while should_pull() is false using a real signal.
             while !self.should_pull() {
-                self.backpressure_signal.wait().await;
+                if let Some(sig) = &self.backpressure_signal {
+                    sig.wait().await;
+                } else {
+                    // No signal available (fast-path) — shouldn't be here, but break to avoid deadlock.
+                    break;
+                }
 
                 // Recheck termination after waiting
                 let branch1_dead =
@@ -977,119 +917,17 @@ where
                     let _ = self.branch2_tx.unbounded_send(TeeChunk::End);
                     break;
                 }
-                Err(error) => {
+                Err(err) => {
                     // Error - notify both branches
-                    let _ = self
-                        .branch1_tx
-                        .unbounded_send(TeeChunk::Error(error.clone()));
-                    let _ = self.branch2_tx.unbounded_send(TeeChunk::Error(error));
+                    let _ = self.branch1_tx.unbounded_send(TeeChunk::Error(err.clone()));
+                    let _ = self.branch2_tx.unbounded_send(TeeChunk::Error(err));
                     break;
                 }
             }
         }
     }
-
-    async fn distribute_chunk(&self, chunk: T) {
-        let branch1_active =
-            !self.branch1_canceled.load(Ordering::SeqCst) && !self.branch1_tx.is_closed();
-        let branch2_active =
-            !self.branch2_canceled.load(Ordering::SeqCst) && !self.branch2_tx.is_closed();
-
-        // Send to branch1 if active and within backpressure limits
-        if branch1_active {
-            let should_send = match self.backpressure_mode {
-                BackpressureMode::Unbounded => true, // Always send in spec mode
-                _ => self.branch1_pending_count.load(Ordering::SeqCst) < self.max_buffer_per_branch,
-            };
-
-            if should_send {
-                if self
-                    .branch1_tx
-                    .unbounded_send(TeeChunk::Data(chunk.clone()))
-                    .is_ok()
-                {
-                    self.branch1_pending_count.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    self.branch1_canceled.store(true, Ordering::SeqCst);
-                }
-            }
-        }
-
-        // Send to branch2 if active and within backpressure limits
-        if branch2_active {
-            let should_send = match self.backpressure_mode {
-                BackpressureMode::Unbounded => true,
-                _ => self.branch2_pending_count.load(Ordering::SeqCst) < self.max_buffer_per_branch,
-            };
-
-            if should_send {
-                if self
-                    .branch2_tx
-                    .unbounded_send(TeeChunk::Data(chunk))
-                    .is_ok()
-                {
-                    self.branch2_pending_count.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    self.branch2_canceled.store(true, Ordering::SeqCst);
-                }
-            }
-        }
-    }
 }
 
-// Enhanced TeeSource that signals backpressure relief
-pub struct BackpressureTeeSource<T> {
-    chunk_rx: UnboundedReceiver<TeeChunk<T>>,
-    branch_id: TeeSourceId,
-    branch_canceled: Arc<AtomicBool>,
-    pending_count: Arc<AtomicUsize>,
-    backpressure_signal: AsyncSignal,
-}
-
-impl<T> ReadableSource<T> for BackpressureTeeSource<T>
-where
-    T: Send + 'static,
-{
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<T>,
-    ) -> StreamResult<()> {
-        if self.branch_canceled.load(Ordering::SeqCst) {
-            controller.close()?;
-            return Ok(());
-        }
-
-        match self.chunk_rx.next().await {
-            Some(TeeChunk::Data(chunk)) => {
-                // Decrement pending count and signal backpressure relief
-                let old_count = self.pending_count.fetch_sub(1, Ordering::SeqCst);
-                if old_count > 0 {
-                    self.backpressure_signal.signal();
-                }
-                controller.enqueue(chunk)?;
-            }
-            Some(TeeChunk::End) => {
-                controller.close()?;
-            }
-            Some(TeeChunk::Error(err)) => {
-                return Err(err);
-            }
-            None => {
-                controller.close()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
-        self.branch_canceled.store(true, Ordering::SeqCst);
-        self.backpressure_signal.signal(); // Wake coordinator
-        Ok(())
-    }
-}
-
-// Clean tee implementation
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Send + Clone + 'static,
@@ -1101,8 +939,8 @@ where
         mode: BackpressureMode,
         max_buffer_per_branch: Option<usize>,
     ) -> (
-        ReadableStream<T, BackpressureTeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, BackpressureTeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
     ) {
         let (_, reader) = self.get_reader();
         let max_buffer = max_buffer_per_branch.unwrap_or(1000);
@@ -1113,15 +951,23 @@ where
 
         let branch1_canceled = Arc::new(AtomicBool::new(false));
         let branch2_canceled = Arc::new(AtomicBool::new(false));
-        let branch1_pending = Arc::new(AtomicUsize::new(0));
-        let branch2_pending = Arc::new(AtomicUsize::new(0));
-        let backpressure_signal = AsyncSignal::new();
 
-        // Create coordinator
-        let coordinator = BackpressureTeeCoordinator {
+        // Fast-path: do not allocate pending counters or signals
+        let (branch1_pending, branch2_pending, backpressure_signal) =
+            if matches!(mode, BackpressureMode::Unbounded) {
+                (None, None, None)
+            } else {
+                (
+                    Some(Arc::new(AtomicUsize::new(0))),
+                    Some(Arc::new(AtomicUsize::new(0))),
+                    Some(AsyncSignal::new()),
+                )
+            };
+
+        let coordinator = TeeCoordinator {
             reader,
-            branch1_tx,
-            branch2_tx,
+            branch1_tx: branch1_tx.clone(),
+            branch2_tx: branch2_tx.clone(),
             branch1_canceled: branch1_canceled.clone(),
             branch2_canceled: branch2_canceled.clone(),
             backpressure_mode: mode,
@@ -1131,21 +977,19 @@ where
             backpressure_signal: backpressure_signal.clone(),
         };
 
-        // Spawn coordinator
         std::thread::spawn(move || {
             futures::executor::block_on(coordinator.run());
         });
 
-        // Create sources
-        let source1 = BackpressureTeeSource {
+        let source1 = TeeSource {
             chunk_rx: branch1_rx,
             branch_id: TeeSourceId::Branch1,
             branch_canceled: branch1_canceled,
-            pending_count: branch1_pending,
+            pending_count: branch1_pending.clone(),
             backpressure_signal: backpressure_signal.clone(),
         };
 
-        let source2 = BackpressureTeeSource {
+        let source2 = TeeSource {
             chunk_rx: branch2_rx,
             branch_id: TeeSourceId::Branch2,
             branch_canceled: branch2_canceled,
@@ -1153,11 +997,16 @@ where
             backpressure_signal,
         };
 
-        // Create streams with default strategy
-        let stream1 = ReadableStream::new(source1);
-        let stream2 = ReadableStream::new(source2);
+        (ReadableStream::new(source1), ReadableStream::new(source2))
+    }
 
-        (stream1, stream2)
+    pub fn tee(
+        self,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    ) {
+        self.tee_with_backpressure(BackpressureMode::Unbounded, None)
     }
 }
 
