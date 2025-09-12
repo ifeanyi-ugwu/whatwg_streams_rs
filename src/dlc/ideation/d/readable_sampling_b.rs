@@ -786,7 +786,7 @@ pub struct TeeConfig {
 impl Default for TeeConfig {
     fn default() -> Self {
         Self {
-            backpressure_mode: BackpressureMode::SpecCompliant,
+            backpressure_mode: BackpressureMode::Unbounded,
             branch1_hwm: None,
             branch2_hwm: None,
             max_buffer_per_branch: Some(1000), // Safety limit
@@ -796,14 +796,34 @@ impl Default for TeeConfig {
 
 #[derive(Debug, Clone)]
 pub enum BackpressureMode {
-    /// WHATWG spec-compliant: faster consumer wins, slower consumer buffers
+    /// Matches the behavior of `ReadableStream.prototype.tee()` in the WHATWG Streams spec.  
+    ///
+    /// - Pulls if *either branch* has demand (the faster consumer drives progress).  
+    /// - Every pulled chunk is cloned and enqueued into *both* branches.  
+    /// - The slower consumer buffers unboundedly (no backpressure limit applied).  
+    /// - ⚠️ This can lead to unbounded memory use if one branch lags indefinitely.
     SpecCompliant,
-    /// Slowest consumer controls backpressure (prevents unbounded buffering)
+
+    /// Always pulls if at least one branch is active, ignoring per-branch limits.  
+    /// - Ignores backpressure entirely.  
+    /// - Every chunk is cloned and sent to all active branches.  
+    /// - Can quickly lead to runaway memory usage if consumers stall.  
+    /// - ⚠️ Not part of the WHATWG spec — this is a "push at all costs" mode.
+    Unbounded,
+
+    /// Both branches must have buffer space before a pull is made.  
+    /// - The slowest consumer throttles the entire stream.  
+    /// - Prevents unbounded buffering.  
+    /// - Sacrifices throughput if one branch is consistently slower.  
+    /// - Useful when strict fairness between consumers is required.
     SlowestConsumer,
-    /// Custom: aggregate both consumers' desired sizes
+
+    /// Pulls based on the *combined demand* of both branches.  
+    /// - If the total buffered items across both branches is under
+    ///   `2 * max_buffer_per_branch`, a pull is allowed.  
+    /// - Balances throughput and safety.  
+    /// - Allows temporary imbalance, but prevents runaway growth.
     Aggregate,
-    /// Independent: each branch has separate backpressure
-    Independent,
 }
 
 // Enhanced TeeCoordinator that builds on your working implementation
@@ -886,7 +906,7 @@ where
         let branch2_pending = self.branch2_pending_count.load(Ordering::SeqCst);
 
         match self.backpressure_mode {
-            BackpressureMode::SpecCompliant => {
+            BackpressureMode::Unbounded => {
                 // Pull if either branch is active (faster consumer wins)
                 branch1_active || branch2_active
             }
@@ -901,7 +921,7 @@ where
                 let total_pending = branch1_pending + branch2_pending;
                 total_pending < (self.max_buffer_per_branch * 2)
             }
-            BackpressureMode::Independent => {
+            BackpressureMode::SpecCompliant => {
                 // Pull if at least one branch can accept data
                 let branch1_can_accept =
                     !branch1_active || branch1_pending < self.max_buffer_per_branch;
@@ -978,7 +998,7 @@ where
         // Send to branch1 if active and within backpressure limits
         if branch1_active {
             let should_send = match self.backpressure_mode {
-                BackpressureMode::SpecCompliant => true, // Always send in spec mode
+                BackpressureMode::Unbounded => true, // Always send in spec mode
                 _ => self.branch1_pending_count.load(Ordering::SeqCst) < self.max_buffer_per_branch,
             };
 
@@ -998,7 +1018,7 @@ where
         // Send to branch2 if active and within backpressure limits
         if branch2_active {
             let should_send = match self.backpressure_mode {
-                BackpressureMode::SpecCompliant => true,
+                BackpressureMode::Unbounded => true,
                 _ => self.branch2_pending_count.load(Ordering::SeqCst) < self.max_buffer_per_branch,
             };
 
@@ -5409,7 +5429,7 @@ mod backpressure_tee_tests {
         let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
 
         let (stream1, stream2) =
-            source_stream.tee_with_backpressure(BackpressureMode::SpecCompliant, Some(2));
+            source_stream.tee_with_backpressure(BackpressureMode::Unbounded, Some(2));
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
@@ -5509,7 +5529,7 @@ mod backpressure_tee_tests {
         let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
 
         let (stream1, stream2) =
-            source_stream.tee_with_backpressure(BackpressureMode::Independent, Some(buffer_size));
+            source_stream.tee_with_backpressure(BackpressureMode::SpecCompliant, Some(buffer_size));
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
