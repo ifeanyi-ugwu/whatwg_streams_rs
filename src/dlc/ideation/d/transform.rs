@@ -110,6 +110,29 @@ impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
     }
 }
 
+/// Creates a new `TransformStream` that acts as an **identity transform**,
+/// passing chunks from the writable side directly to the readable side
+/// without modification.
+///
+/// This provides a convenient way to create a pair of connected
+/// readable and writable streams for tasks like piping or buffering.
+///
+/// # Panics
+/// This method does not panic.
+///
+/// # Example
+/// ```rust
+/// use crate::transform::TransformStream;
+///
+/// let transform_stream = TransformStream::<String, String>::default();
+/// let (readable, writable) = transform_stream.split();
+/// ```
+impl<T: Send + 'static> Default for TransformStream<T, T> {
+    fn default() -> Self {
+        Self::new(IdentityTransformer::new())
+    }
+}
+
 /// Controller for transform operations
 pub struct TransformStreamDefaultController<O> {
     readable_controller: Arc<ReadableStreamDefaultController<O>>,
@@ -314,6 +337,30 @@ async fn transform_task<I, O, T>(
                 break;
             }
         }
+    }
+}
+
+/// An identity transformer that passes chunks through unchanged.
+pub struct IdentityTransformer<T> {
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> IdentityTransformer<T> {
+    pub fn new() -> Self {
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Send + 'static> Transformer<T, T> for IdentityTransformer<T> {
+    fn transform(
+        &mut self,
+        chunk: T,
+        controller: &mut TransformStreamDefaultController<T>,
+    ) -> impl Future<Output = StreamResult<()>> + Send {
+        let result = controller.enqueue(chunk);
+        future::ready(result)
     }
 }
 
@@ -546,5 +593,34 @@ mod tests {
         // Subsequent reads should fail
         let read_result = reader.read().await;
         assert!(read_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_identity_transform_default() {
+        let transform_stream = TransformStream::<i32, i32>::default();
+        let (readable, writable) = transform_stream.split();
+        let (_stream, writer) = writable.get_writer().unwrap();
+        let (_, reader) = readable.get_reader();
+
+        let numbers = vec![1, 2, 3, 4, 5];
+
+        for &num in numbers.iter() {
+            writer.write(num).await.unwrap();
+        }
+        writer.close().await.unwrap();
+
+        for &num in numbers.iter() {
+            let result = timeout(Duration::from_secs(1), reader.read())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, Some(num));
+        }
+
+        let result_none = timeout(Duration::from_secs(1), reader.read())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result_none, None);
     }
 }
