@@ -1168,6 +1168,111 @@ where
     }
 }
 
+//TODO: update implementation so that `Send` is not required upstream, in that way i can relax this and remove the `Send` bound on this
+impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+where
+    T: Clone + Send + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker,
+{
+    // Internal method for local async spawn
+    fn tee_internal_local_async<SpawnFn>(
+        self,
+        mode: BackpressureMode,
+        max_buffer_per_branch: Option<usize>,
+        spawn: SpawnFn,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = ()>>>) + 'static,
+    {
+        let (_, reader) = self.get_reader();
+        let max_buffer = max_buffer_per_branch.unwrap_or(1000);
+
+        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
+        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
+
+        let branch1_canceled = Arc::new(AtomicBool::new(false));
+        let branch2_canceled = Arc::new(AtomicBool::new(false));
+
+        let (branch1_pending, branch2_pending, backpressure_signal) =
+            if matches!(mode, BackpressureMode::Unbounded) {
+                (None, None, None)
+            } else {
+                (
+                    Some(Arc::new(AtomicUsize::new(0))),
+                    Some(Arc::new(AtomicUsize::new(0))),
+                    Some(AsyncSignal::new()),
+                )
+            };
+
+        let coordinator = TeeCoordinator {
+            reader,
+            branch1_tx: branch1_tx.clone(),
+            branch2_tx: branch2_tx.clone(),
+            branch1_canceled: branch1_canceled.clone(),
+            branch2_canceled: branch2_canceled.clone(),
+            backpressure_mode: mode,
+            branch1_pending_count: branch1_pending.clone(),
+            branch2_pending_count: branch2_pending.clone(),
+            max_buffer_per_branch: max_buffer,
+            backpressure_signal: backpressure_signal.clone(),
+        };
+
+        // Local async spawn pattern
+        spawn(Box::pin(coordinator.run()));
+
+        let source1 = TeeSource {
+            chunk_rx: branch1_rx,
+            branch_id: TeeSourceId::Branch1,
+            branch_canceled: branch1_canceled,
+            pending_count: branch1_pending,
+            backpressure_signal: backpressure_signal.clone(),
+        };
+
+        let source2 = TeeSource {
+            chunk_rx: branch2_rx,
+            branch_id: TeeSourceId::Branch2,
+            branch_canceled: branch2_canceled,
+            pending_count: branch2_pending,
+            backpressure_signal,
+        };
+
+        (ReadableStream::new(source1), ReadableStream::new(source2))
+    }
+
+    // Public local async methods
+    pub fn tee_with_local_async_spawn<SpawnFn>(
+        self,
+        spawn: SpawnFn,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = ()>>>) + 'static,
+    {
+        self.tee_internal_local_async(BackpressureMode::SpecCompliant, Some(1000), spawn)
+    }
+
+    pub fn tee_with_backpressure_and_local_async_spawn<SpawnFn>(
+        self,
+        mode: BackpressureMode,
+        max_buffer_per_branch: Option<usize>,
+        spawn: SpawnFn,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = ()>>>) + 'static,
+    {
+        self.tee_internal_local_async(mode, max_buffer_per_branch, spawn)
+    }
+}
+
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Send + Sync + 'static,
@@ -5867,5 +5972,170 @@ mod spawn_variant_tests {
             assert_eq!(reader1.read().await.unwrap(), None);
             assert_eq!(reader2.read().await.unwrap(), None);
         });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn _test_local_async_spawn_with_tokio() {
+        let data = test_data();
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee_with_local_async_spawn(|fut| {
+            tokio::task::spawn_local(fut);
+        });
+
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        // Read concurrently
+        let task1 = tokio::task::spawn_local(async move {
+            let mut results = Vec::new();
+            while let Ok(Some(value)) = reader1.read().await {
+                results.push(value);
+            }
+            results
+        });
+
+        let task2 = tokio::task::spawn_local(async move {
+            let mut results = Vec::new();
+            while let Ok(Some(value)) = reader2.read().await {
+                results.push(value);
+            }
+            results
+        });
+
+        let results1 = task1.await.unwrap();
+        let results2 = task2.await.unwrap();
+
+        assert_eq!(results1, data);
+        assert_eq!(results2, data);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_local_async_spawn_with_tokio() {
+        let data = test_data();
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        // Create LocalSet
+        let local = tokio::task::LocalSet::new();
+
+        // Run everything inside the LocalSet
+        local
+            .run_until(async move {
+                let (stream1, stream2) = source_stream.tee_with_local_async_spawn(|fut| {
+                    tokio::task::spawn_local(fut);
+                });
+
+                let (_, reader1) = stream1.get_reader();
+                let (_, reader2) = stream2.get_reader();
+
+                let task1 = tokio::task::spawn_local(async move {
+                    let mut results = Vec::new();
+                    while let Ok(Some(value)) = reader1.read().await {
+                        results.push(value);
+                    }
+                    results
+                });
+
+                let task2 = tokio::task::spawn_local(async move {
+                    let mut results = Vec::new();
+                    while let Ok(Some(value)) = reader2.read().await {
+                        results.push(value);
+                    }
+                    results
+                });
+
+                let results1 = task1.await.unwrap();
+                let results2 = task2.await.unwrap();
+
+                assert_eq!(results1, data);
+                assert_eq!(results2, data);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn _test_backpressure_with_local_async_spawn() {
+        let data = test_data();
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let (stream1, stream2) = source_stream.tee_with_backpressure_and_local_async_spawn(
+            BackpressureMode::SlowestConsumer,
+            Some(2),
+            |fut| {
+                tokio::task::spawn_local(fut);
+            },
+        );
+
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        let count1 = Arc::new(Mutex::new(0));
+        let count2 = Arc::new(Mutex::new(0));
+
+        let count1_clone = count1.clone();
+        let count2_clone = count2.clone();
+
+        let task1 = tokio::task::spawn_local(async move {
+            while let Ok(Some(_)) = reader1.read().await {
+                *count1_clone.lock().unwrap() += 1;
+            }
+        });
+
+        let task2 = tokio::task::spawn_local(async move {
+            while let Ok(Some(_)) = reader2.read().await {
+                *count2_clone.lock().unwrap() += 1;
+            }
+        });
+
+        tokio::join!(task1, task2);
+
+        assert_eq!(*count1.lock().unwrap(), data.len());
+        assert_eq!(*count2.lock().unwrap(), data.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_backpressure_with_local_async_spawn() {
+        let data = test_data();
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), None);
+
+        let local = tokio::task::LocalSet::new();
+
+        local
+            .run_until(async move {
+                let (stream1, stream2) = source_stream.tee_with_backpressure_and_local_async_spawn(
+                    BackpressureMode::SlowestConsumer,
+                    Some(2),
+                    |fut| {
+                        tokio::task::spawn_local(fut);
+                    },
+                );
+
+                let (_, reader1) = stream1.get_reader();
+                let (_, reader2) = stream2.get_reader();
+
+                let count1 = Arc::new(Mutex::new(0));
+                let count2 = Arc::new(Mutex::new(0));
+
+                let count1_clone = count1.clone();
+                let count2_clone = count2.clone();
+
+                let task1 = tokio::task::spawn_local(async move {
+                    while let Ok(Some(_)) = reader1.read().await {
+                        *count1_clone.lock().unwrap() += 1;
+                    }
+                });
+
+                let task2 = tokio::task::spawn_local(async move {
+                    while let Ok(Some(_)) = reader2.read().await {
+                        *count2_clone.lock().unwrap() += 1;
+                    }
+                });
+
+                tokio::join!(task1, task2);
+
+                assert_eq!(*count1.lock().unwrap(), data.len());
+                assert_eq!(*count2.lock().unwrap(), data.len());
+            })
+            .await;
     }
 }
