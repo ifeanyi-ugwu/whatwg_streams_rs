@@ -379,7 +379,7 @@ mod tests {
             &mut self,
             chunk: String,
             controller: &mut TransformStreamDefaultController<String>,
-        ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+        ) -> impl Future<Output = StreamResult<()>> + Send {
             let result = controller.enqueue(chunk.to_uppercase());
             future::ready(result)
         }
@@ -393,7 +393,7 @@ mod tests {
             &mut self,
             chunk: i32,
             controller: &mut TransformStreamDefaultController<i32>,
-        ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+        ) -> impl Future<Output = StreamResult<()>> + Send {
             let result = controller.enqueue(chunk * 2);
             future::ready(result)
         }
@@ -407,7 +407,7 @@ mod tests {
             &mut self,
             chunk: i32,
             controller: &mut TransformStreamDefaultController<i32>,
-        ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+        ) -> impl Future<Output = StreamResult<()>> + Send {
             let result = if chunk % 2 != 0 {
                 controller.enqueue(chunk)
             } else {
@@ -425,7 +425,7 @@ mod tests {
             &mut self,
             chunk: i32,
             controller: &mut TransformStreamDefaultController<i32>,
-        ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
+        ) -> impl Future<Output = StreamResult<()>> + Send {
             if chunk == 3 {
                 future::ready(Err(StreamError::Custom("Cannot process 3".into())))
             } else {
