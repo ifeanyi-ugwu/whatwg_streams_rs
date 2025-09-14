@@ -7,6 +7,7 @@ pub mod readable_sampling_b;
 pub mod transform;
 pub mod writable;
 pub mod writable_new;
+pub mod writable_send_and_non_send;
 
 // Re-exports for compatibility with futures ecosystem
 pub use futures_core::Stream;
