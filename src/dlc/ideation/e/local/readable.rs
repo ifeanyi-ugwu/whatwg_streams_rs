@@ -1000,14 +1000,14 @@ where
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
-    pub fn pipe_through_with_spawn<O: 'static, SpawnFn>(
+    pub fn pipe_through_with_spawn<O: 'static, SpawnFn, R>(
         self,
         transform: TransformStream<T, O>,
         options: Option<StreamPipeOptions>,
         spawn: SpawnFn,
     ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
     where
-        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>),
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
     {
         let (readable, writable) = transform.split();
 
@@ -1244,16 +1244,16 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
 
 impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
     /// Create a new ReadableStream using a shared `'static` spawn function reference.
-    pub fn new_with_spawn_ref<F>(source: Source, spawn_fn: &'static F) -> Self
+    pub fn new_with_spawn_ref<F, R>(source: Source, spawn_fn: &'static F) -> Self
     where
         Source: ReadableSource<T>,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_with_strategy_and_spawn_ref(source, CountQueuingStrategy::new(1), spawn_fn)
     }
 
     /// Full variant with strategy and shared spawn reference
-    pub fn new_with_strategy_and_spawn_ref<Strategy, F>(
+    pub fn new_with_strategy_and_spawn_ref<Strategy, F, R>(
         source: Source,
         strategy: Strategy,
         spawn_fn: &'static F,
@@ -1261,7 +1261,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     where
         Source: ReadableSource<T>,
         Strategy: QueuingStrategy<T> + 'static,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
@@ -2215,12 +2215,12 @@ impl<T: 'static, Source> ReadableStreamBuilder<T, Source, DefaultStream>
 where
     Source: ReadableSource<T>,
 {
-    pub fn build_with_spawn<F>(
+    pub fn build_with_spawn<F, R>(
         self,
         spawn_fn: F,
     ) -> ReadableStream<T, Source, DefaultStream, Unlocked>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let strategy = self
             .strategy
@@ -4753,9 +4753,8 @@ mod pipe_through_tests {
         });
 
         // Pipe through
-        let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let result_stream =
+            source_stream.pipe_through_with_spawn(transform, None, tokio::task::spawn_local);
         let (_locked, reader) = result_stream.get_reader();
 
         // Read results

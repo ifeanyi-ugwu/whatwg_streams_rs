@@ -259,13 +259,13 @@ where
     }
 
     /// Create a new WritableStream using a shared `'static` spawner reference.
-    pub fn new_with_spawn_ref<F>(
+    pub fn new_with_spawn_ref<F, R>(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
         spawn_fn: &'static F,
     ) -> Self
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));

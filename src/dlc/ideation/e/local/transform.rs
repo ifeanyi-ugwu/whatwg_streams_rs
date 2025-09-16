@@ -63,10 +63,10 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
 
 impl<I: 'static, O: 'static> TransformStream<I, O> {
     /// Create a new TransformStream using a shared `'static` spawner reference with default strategies.
-    pub fn new_with_spawn_ref<T, F>(transformer: T, spawn_fn: &'static F) -> Self
+    pub fn new_with_spawn_ref<T, F, R>(transformer: T, spawn_fn: &'static F) -> Self
     where
         T: Transformer<I, O> + 'static,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_with_strategies_and_spawn_ref(
             transformer,
@@ -77,7 +77,7 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
     }
 
     /// Create a new TransformStream using custom writable and readable strategies, with a shared spawn reference.
-    pub fn new_with_strategies_and_spawn_ref<T, WS, RS, F>(
+    pub fn new_with_strategies_and_spawn_ref<T, WS, RS, F, R>(
         transformer: T,
         writable_strategy: WS,
         readable_strategy: RS,
@@ -87,7 +87,7 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
         T: Transformer<I, O> + 'static,
         WS: QueuingStrategy<I> + 'static,
         RS: QueuingStrategy<O> + 'static,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
 
@@ -463,9 +463,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_basic_transform() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform_stream =
+            TransformStream::new_with_spawn_ref(transformer, &tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader();
