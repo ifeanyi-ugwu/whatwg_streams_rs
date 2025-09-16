@@ -425,7 +425,7 @@ where
         options: Option<StreamPipeOptions>,
     ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
     where
-        O: Send + Sync + 'static,
+        O: Send + 'static,
     {
         let (readable, writable) = transform.split();
 
