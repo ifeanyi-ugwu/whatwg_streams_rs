@@ -352,11 +352,9 @@ async fn transform_task<I, O, T>(
                 break;
             }
 
-            TransformCommand::Abort {
-                reason: _,
-                completion,
-            } => {
-                let error = StreamError::Custom("Transform stream aborted".into());
+            TransformCommand::Abort { reason, completion } => {
+                let error =
+                    StreamError::Custom(reason.unwrap_or("Transform stream aborted".into()).into());
                 let _ = controller.error(error.clone());
                 let _ = completion.send(Err(error));
                 break;
