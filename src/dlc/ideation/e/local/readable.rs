@@ -957,57 +957,6 @@ where
 
         (stream1, stream2)
     }
-
-    pub fn tee_with_pool<F>(
-        self,
-        spawn_fn: F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-    {
-        self.tee_with_options_and_pool(BackpressureMode::SpecCompliant, Some(1000), spawn_fn)
-    }
-
-    pub fn tee_with_options_and_pool<F>(
-        self,
-        mode: BackpressureMode,
-        max_buffer_per_branch: Option<usize>,
-        spawn_fn: F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-    {
-        let (coordinator, source1, source2) = self.tee_internal(mode, max_buffer_per_branch);
-
-        let (stream1, mut pool1) =
-            ReadableStream::new_with_pool_and_strategy(source1, CountQueuingStrategy::new(1));
-        let (stream2, mut pool2) =
-            ReadableStream::new_with_pool_and_strategy(source2, CountQueuingStrategy::new(1));
-
-        spawn_fn(Box::pin(async move {
-            let coord_fut = coordinator.run().fuse();
-            pin_mut!(coord_fut);
-
-            loop {
-                futures::select! {
-                    _ = &mut coord_fut => {
-                        pool1.run_until_stalled();
-                        pool2.run_until_stalled();
-                        break;
-                    }
-                    _ = async { pool1.run_until_stalled(); }.fuse() => {}
-                    _ = async { pool2.run_until_stalled(); }.fuse() => {}
-                }
-            }
-        }));
-        (stream1, stream2)
-    }
 }
 
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
@@ -1188,37 +1137,6 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), spawn_fn)
-    }
-
-    /// Create a stream backed by a `LocalPool` with the default `CountQueuingStrategy`.
-    pub(crate) fn new_with_pool(source: Source) -> (Self, futures::executor::LocalPool) {
-        let pool = futures::executor::LocalPool::new();
-        let spawner = pool.spawner();
-
-        let stream =
-            Self::new_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), |fut| {
-                spawner.spawn_local(fut).expect("spawn failed");
-            });
-
-        (stream, pool)
-    }
-
-    /// Create a stream backed by a `LocalPool` with a custom queuing strategy.
-    pub(crate) fn new_with_pool_and_strategy<Strategy>(
-        source: Source,
-        strategy: Strategy,
-    ) -> (Self, futures::executor::LocalPool)
-    where
-        Strategy: QueuingStrategy<T> + 'static,
-    {
-        let pool = futures::executor::LocalPool::new();
-        let spawner = pool.spawner();
-
-        let stream = Self::new_with_strategy_and_spawn(source, strategy, |fut| {
-            spawner.spawn_local(fut).expect("spawn failed");
-        });
-
-        (stream, pool)
     }
 
     pub fn new_with_strategy_and_spawn<Strategy, F, R>(
@@ -2275,19 +2193,6 @@ where
 
         ReadableStream::new_with_strategy_and_spawn(self.source, strategy, spawn_fn)
     }
-
-    pub(crate) fn build_with_pool(
-        self,
-    ) -> (
-        ReadableStream<T, Source, DefaultStream, Unlocked>,
-        futures::executor::LocalPool,
-    ) {
-        let strategy = self
-            .strategy
-            .unwrap_or_else(|| CountQueuingStrategy::new(1));
-
-        ReadableStream::new_with_pool_and_strategy(self.source, strategy)
-    }
 }
 
 impl<Source> ReadableStreamBuilder<Vec<u8>, Source, ByteStream>
@@ -2306,28 +2211,6 @@ where
             .unwrap_or_else(|| CountQueuingStrategy::new(1));
 
         ReadableStream::new_bytes_with_strategy_and_spawn(self.source, strategy, spawn_fn)
-    }
-
-    pub(crate) fn build_with_pool(
-        self,
-    ) -> (
-        ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>,
-        futures::executor::LocalPool,
-    ) {
-        let strategy = self
-            .strategy
-            .unwrap_or_else(|| CountQueuingStrategy::new(1));
-
-        // (could add new_with_pool_and_strategy for byte streams too)
-        let pool = futures::executor::LocalPool::new();
-        let spawner = pool.spawner();
-
-        let stream =
-            ReadableStream::new_bytes_with_strategy_and_spawn(self.source, strategy, move |fut| {
-                spawner.spawn_local(fut).expect("spawn failed");
-            });
-
-        (stream, pool)
     }
 }
 
