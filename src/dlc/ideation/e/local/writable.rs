@@ -183,62 +183,6 @@ where
     T: 'static,
     Sink: WritableSink<T> + 'static,
 {
-    /*/// Create a new WritableStream and spawn a dedicated thread for the stream task.
-    ///
-    /// For custom executor control, use [`new_with_spawn()`] instead.
-    pub fn new(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        //spawner: &impl LocalSpawn,
-    ) -> Self {
-        let mut pool = futures::executor::LocalPool::new();
-        let spawner = pool.spawner();
-
-        Self::new_with_spawn(sink, strategy, |fut| {
-            spawner.spawn_local(fut).expect("spawn failed");
-            pool.run_until_stalled();
-        })
-    }
-
-    pub fn new_with_pool(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-    ) -> (Self, futures::executor::LocalPool) {
-        let pool = futures::executor::LocalPool::new();
-        let spawner = pool.spawner();
-
-        let stream = Self::new_with_spawn(sink, strategy, |fut| {
-            spawner.spawn_local(fut).expect("spawn failed");
-            // Don't run here - let caller drive the pool
-        });
-
-        (stream, pool)
-    }*/
-    /*pub fn new(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        spawner: &impl LocalSpawn,
-    ) -> Self {
-        Self::new_with_spawn(sink, strategy, |fut| {
-            spawner.spawn_local(fut);
-        })
-    }*/
-
-    pub(crate) fn new_with_pool(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-    ) -> (Self, futures::executor::LocalPool) {
-        let pool = futures::executor::LocalPool::new();
-        let spawner = pool.spawner();
-
-        let stream = Self::new_with_spawn(sink, strategy, |fut| {
-            spawner.spawn_local(fut).expect("spawn failed");
-            // Don't run here - let caller drive the pool
-        });
-
-        (stream, pool)
-    }
-
     pub fn new_with_spawn<F>(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
@@ -294,7 +238,6 @@ where
         );
 
         spawn_fn(Box::pin(fut));
-        //spawner.spawn(fut);
 
         Self {
             command_tx,
@@ -315,11 +258,11 @@ where
         }
     }
 
-    // New variant that takes Fn instead of FnOnce
-    pub fn new_with_reusable_spawn<F>(
+    /// Create a new WritableStream using a shared `'static` spawner reference.
+    pub fn new_with_spawn_ref<F>(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        spawn_fn: F,
+        spawn_fn: &'static F,
     ) -> Self
     where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
@@ -390,43 +333,6 @@ where
             controller: controller.into(),
         }
     }
-
-    // Helper method that takes &F for borrowing
-    pub fn new_with_borrowed_spawn<F>(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        spawn_fn: &F,
-    ) -> Self
-    where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + Clone + 'static,
-    {
-        Self::new_with_reusable_spawn(sink, strategy, spawn_fn.clone())
-    }
-
-    // Most flexible: takes any spawn function that can be called
-    pub fn new_with_spawn_ref<F>(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        spawn_fn: F,
-    ) -> Self
-    where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
-    {
-        Self::new_with_reusable_spawn(sink, strategy, spawn_fn)
-    }
-
-    /*pub fn new_with_local_spawn<S>(
-        sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        spawner: &S,
-    ) -> Self
-    where
-        S: futures::task::LocalSpawn,
-    {
-        Self::new_with_spawn(sink, strategy, |fut| {
-            let _ = spawner.spawn_local_obj(fut.into());
-        })
-    }*/
 }
 
 impl<T, Sink, S> WritableStream<T, Sink, S>

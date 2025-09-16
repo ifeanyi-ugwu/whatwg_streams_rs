@@ -1289,6 +1289,81 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     }
 }
 
+impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
+    /// Create a new ReadableStream using a shared `'static` spawn function reference.
+    pub fn new_with_spawn_ref<F>(source: Source, spawn_fn: &'static F) -> Self
+    where
+        Source: ReadableSource<T>,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+    {
+        Self::new_with_strategy_and_spawn_ref(source, CountQueuingStrategy::new(1), spawn_fn)
+    }
+
+    /// Full variant with strategy and shared spawn reference
+    pub fn new_with_strategy_and_spawn_ref<Strategy, F>(
+        source: Source,
+        strategy: Strategy,
+        spawn_fn: &'static F,
+    ) -> Self
+    where
+        Source: ReadableSource<T>,
+        Strategy: QueuingStrategy<T> + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+    {
+        let (command_tx, command_rx) = unbounded();
+        let (ctrl_tx, ctrl_rx) = unbounded();
+        let queue_total_size = Rc::new(AtomicUsize::new(0));
+        let closed = Rc::new(AtomicBool::new(false));
+        let errored = Rc::new(AtomicBool::new(false));
+        let locked = Rc::new(AtomicBool::new(false));
+        let stored_error = Rc::new(RwLock::new(None));
+
+        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
+        let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
+
+        let inner = ReadableStreamInner::new(source, Box::new(strategy));
+
+        let controller = ReadableStreamDefaultController::new(
+            ctrl_tx.clone(),
+            Rc::clone(&queue_total_size),
+            Rc::clone(&high_water_mark),
+            Rc::clone(&desired_size),
+            Rc::clone(&closed),
+            Rc::clone(&errored),
+        );
+
+        let task_fut = readable_stream_task(
+            command_rx,
+            ctrl_rx,
+            inner,
+            Rc::clone(&queue_total_size),
+            Rc::clone(&high_water_mark),
+            Rc::clone(&desired_size),
+            Rc::clone(&closed),
+            Rc::clone(&errored),
+            Rc::clone(&stored_error),
+            ctrl_tx,
+            controller.clone(),
+        );
+
+        spawn_fn(Box::pin(task_fut));
+
+        Self {
+            command_tx,
+            queue_total_size,
+            high_water_mark,
+            desired_size,
+            closed,
+            errored,
+            locked,
+            stored_error,
+            controller: controller.into(),
+            byte_state: None,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<T: 'static, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked>
 where
     I: Iterator<Item = T> + 'static,
@@ -4781,7 +4856,7 @@ mod pipe_through_tests {
         });
 
         // Create transform
-        let transform = TransformStream::new_with_spawn(UppercaseTransformer, |fut| {
+        let transform = TransformStream::new_with_spawn_ref(UppercaseTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
 
@@ -4818,7 +4893,7 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn(DoubleTransformer, |fut| {
+        let transform = TransformStream::new_with_spawn_ref(DoubleTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
@@ -4841,7 +4916,7 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn(UppercaseTransformer, |fut| {
+        let transform = TransformStream::new_with_spawn_ref(UppercaseTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
@@ -4862,7 +4937,7 @@ mod pipe_through_tests {
         });
 
         // First transform: double
-        let transform1 = TransformStream::new_with_spawn(DoubleTransformer, |fut| {
+        let transform1 = TransformStream::new_with_spawn_ref(DoubleTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let intermediate_stream = source_stream.pipe_through_with_spawn(transform1, None, |fut| {
@@ -4870,7 +4945,7 @@ mod pipe_through_tests {
         });
 
         // Second transform: double again
-        let transform2 = TransformStream::new_with_spawn(DoubleTransformer, |fut| {
+        let transform2 = TransformStream::new_with_spawn_ref(DoubleTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let result_stream = intermediate_stream.pipe_through_with_spawn(transform2, None, |fut| {
@@ -4893,7 +4968,7 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn(UppercaseTransformer, |fut| {
+        let transform = TransformStream::new_with_spawn_ref(UppercaseTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
 
@@ -4939,7 +5014,7 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn(ErrorTransformer, |fut| {
+        let transform = TransformStream::new_with_spawn_ref(ErrorTransformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {

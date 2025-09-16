@@ -3,7 +3,6 @@ use super::{
     readable::{DefaultStream, ReadableSource, ReadableStream, ReadableStreamDefaultController},
     writable::{WritableSink, WritableStream, WritableStreamDefaultController},
 };
-use futures::{FutureExt, pin_mut};
 use futures::{
     channel::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
@@ -39,128 +38,6 @@ pub struct TransformStream<I, O> {
 }
 
 impl<I: 'static, O: 'static> TransformStream<I, O> {
-    /// Create a new TransformStream with default strategies
-    pub fn new_with_spawn<T, F>(transformer: T, spawn_fn: F) -> Self
-    where
-        T: Transformer<I, O> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-    {
-        Self::new_with_strategies_and_spawn(
-            transformer,
-            CountQueuingStrategy::new(1),
-            CountQueuingStrategy::new(1),
-            spawn_fn,
-        )
-    }
-
-    /// Create a new TransformStream with custom strategies
-    pub fn new_with_strategies_and_spawn<T, WS, RS, F>(
-        transformer: T,
-        writable_strategy: WS,
-        readable_strategy: RS,
-        spawn_fn: F,
-    ) -> Self
-    where
-        T: Transformer<I, O> + 'static,
-        WS: QueuingStrategy<I> + 'static,
-        RS: QueuingStrategy<O> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-    {
-        let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
-
-        // Create the readable source (minimal, just needs to exist)
-        let readable_source = TransformReadableSource::new();
-
-        // Create the writable sink that sends data to be transformed
-        let writable_sink = TransformWritableSink::new(transform_tx);
-
-        // Create the streams - they handle their own queuing
-        //let readable = ReadableStream::new_with_strategy(readable_source, readable_strategy);
-        /*let writable =
-        WritableStream::new_with_spawn(writable_sink, Box::new(writable_strategy), |fut| {
-            spawn_fn(fut)
-        });*/
-        let (readable, mut readable_pool) = ReadableStream::new_with_pool_and_strategy(
-            readable_source,
-            CountQueuingStrategy::new(1),
-        );
-        let (writable, mut writable_pool) =
-            WritableStream::new_with_pool(writable_sink, Box::new(CountQueuingStrategy::new(1)));
-
-        // Spawn the transform task
-        let readable_controller = readable.controller.clone();
-        let writable_controller = writable.controller.clone();
-        let controller =
-            TransformStreamDefaultController::new(readable_controller, writable_controller);
-
-        /*spawn_fn(Box::pin(transform_task(
-            transformer,
-            transform_rx,
-            controller,
-        )));*/
-
-        // Spawn a single task that drives all three components
-        /*spawn_fn(Box::pin(async move {
-            let transform_fut = transform_task(transformer, transform_rx, controller);
-            pin_mut!(transform_fut);
-
-            loop {
-                futures::select! {
-                    result = &mut transform_fut => {
-                        // Optional cleanup
-                        readable_pool.run_until_stalled();
-                        writable_pool.run_until_stalled();
-                        break;
-                    }
-                    _ = async { readable_pool.run_until_stalled(); } => {}
-                    _ = async { writable_pool.run_until_stalled(); } => {}
-                }
-            }
-        }));*/
-
-        /*spawn_fn(Box::pin(async move {
-            let transform_fut = transform_task(transformer, transform_rx, controller).fuse();
-            pin_mut!(transform_fut);
-
-            loop {
-                let readable_work = async { readable_pool.run_until_stalled() }.fuse();
-                let writable_work = async { writable_pool.run_until_stalled() }.fuse();
-                pin_mut!(readable_work, writable_work);
-
-                futures::select! {
-                    result = &mut transform_fut => {
-                        // Optional cleanup
-                        readable_pool.run_until_stalled();
-                        writable_pool.run_until_stalled();
-                        break;
-                    }
-                    _ = &mut readable_work => {}
-                    _ = &mut writable_work => {}
-                }
-            }
-        }));*/
-
-        spawn_fn(Box::pin(async move {
-            let transform_fut = transform_task(transformer, transform_rx, controller).fuse();
-            pin_mut!(transform_fut);
-
-            loop {
-                futures::select! {
-                    result = &mut transform_fut => {
-                        // Optional cleanup
-                        readable_pool.run_until_stalled();
-                        writable_pool.run_until_stalled();
-                        break;
-                    }
-                    _ = async { readable_pool.run_until_stalled() }.fuse() => {}
-                    _ = async { writable_pool.run_until_stalled() }.fuse() => {}
-                }
-            }
-        }));
-
-        TransformStream { readable, writable }
-    }
-
     /// Get the readable side
     pub fn readable(
         self,
@@ -184,17 +61,65 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
     }
 }
 
-/*impl<I: 'static, O: 'static> TransformStream<I, O> {
-    pub fn new_with_spawn_fn<T, F>(transformer: T, spawn_fn: F) -> Self
+impl<I: 'static, O: 'static> TransformStream<I, O> {
+    /// Create a new TransformStream using a shared `'static` spawner reference with default strategies.
+    pub fn new_with_spawn_ref<T, F>(transformer: T, spawn_fn: &'static F) -> Self
     where
         T: Transformer<I, O> + 'static,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>),
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
     {
-        let readable = ReadableStream::new_with_reusable_spawn(source, strategy, &spawn_fn);
-        let writable = WritableStream::new_with_reusable_spawn(sink, strategy, &spawn_fn);
-        spawn_fn(transform_task(...));
+        Self::new_with_strategies_and_spawn_ref(
+            transformer,
+            CountQueuingStrategy::new(1),
+            CountQueuingStrategy::new(1),
+            spawn_fn,
+        )
     }
-}*/
+
+    /// Create a new TransformStream using custom writable and readable strategies, with a shared spawn reference.
+    pub fn new_with_strategies_and_spawn_ref<T, WS, RS, F>(
+        transformer: T,
+        writable_strategy: WS,
+        readable_strategy: RS,
+        spawn_fn: &'static F,
+    ) -> Self
+    where
+        T: Transformer<I, O> + 'static,
+        WS: QueuingStrategy<I> + 'static,
+        RS: QueuingStrategy<O> + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+    {
+        let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
+
+        let readable_source = TransformReadableSource::new();
+        let writable_sink = TransformWritableSink::new(transform_tx);
+
+        let readable = ReadableStream::new_with_strategy_and_spawn_ref(
+            readable_source,
+            readable_strategy,
+            spawn_fn,
+        );
+
+        let writable = WritableStream::new_with_spawn_ref(
+            writable_sink,
+            Box::new(writable_strategy),
+            spawn_fn,
+        );
+
+        let readable_controller = readable.controller.clone();
+        let writable_controller = writable.controller.clone();
+        let controller =
+            TransformStreamDefaultController::new(readable_controller, writable_controller);
+
+        spawn_fn(Box::pin(transform_task(
+            transformer,
+            transform_rx,
+            controller,
+        )));
+
+        TransformStream { readable, writable }
+    }
+}
 
 impl<I: 'static, O: 'static> TransformStream<I, O> {
     pub fn new_with_three_spawners<T, F1, F2, F3>(
@@ -205,32 +130,25 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
     ) -> Self
     where
         T: Transformer<I, O> + 'static,
-        F1: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-        F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-        F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        F1: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F2: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F3: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
-
         let readable_source = TransformReadableSource::new();
         let writable_sink = TransformWritableSink::new(transform_tx);
 
-        // Each gets its own dedicated spawner
-        let readable = ReadableStream::new_with_spawn(
-            readable_source,
-            //CountQueuingStrategy::new(1),
-            readable_spawn,
-        );
-
+        let readable = ReadableStream::new_with_spawn(readable_source, readable_spawn);
         let writable = WritableStream::new_with_spawn(
             writable_sink,
             Box::new(CountQueuingStrategy::new(1)),
             writable_spawn,
         );
 
-        let readable_controller = readable.controller.clone();
-        let writable_controller = writable.controller.clone();
-        let controller =
-            TransformStreamDefaultController::new(readable_controller, writable_controller);
+        let controller = TransformStreamDefaultController::new(
+            readable.controller.clone(),
+            writable.controller.clone(),
+        );
 
         transform_spawn(Box::pin(transform_task(
             transformer,
@@ -247,7 +165,7 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
     where
         T: Transformer<I, O> + 'static,
         SF: Fn() -> F,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
 
@@ -306,13 +224,13 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
         let readable = ReadableStream::new_with_spawn(
             readable_source,
             //CountQueuingStrategy::new(1),
-            move |fut| readable_spawner(fut),
+            |fut| readable_spawner(fut),
         );
 
         let writable = WritableStream::new_with_spawn(
             writable_sink,
             Box::new(CountQueuingStrategy::new(1)),
-            move |fut| writable_spawner(fut),
+            |fut| writable_spawner(fut),
         );
 
         let readable_controller = readable.controller.clone();
@@ -656,7 +574,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_basic_transform() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -691,7 +609,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_numeric_transform() {
         let transformer = DoubleTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -714,7 +632,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_filtering_transform() {
         let transformer = OddFilterTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -739,7 +657,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_transform_error_handling() {
         let transformer = ErrorOnThreeTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -766,7 +684,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_empty_stream() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -783,7 +701,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_multiple_writes_before_read() {
         let transformer = DoubleTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -806,7 +724,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_abort_stream() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new_with_spawn(transformer, |fut| {
+        let transform_stream = TransformStream::new_with_spawn_ref(transformer, &|fut| {
             tokio::task::spawn_local(fut);
         });
         let (readable, writable) = transform_stream.split();
@@ -830,7 +748,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_identity_transform_default() {
         let transform_stream =
-            TransformStream::<i32, i32>::new_with_spawn(IdentityTransformer::new(), |fut| {
+            TransformStream::<i32, i32>::new_with_spawn_ref(IdentityTransformer::new(), &|fut| {
                 tokio::task::spawn_local(fut);
             });
         let (readable, writable) = transform_stream.split();
