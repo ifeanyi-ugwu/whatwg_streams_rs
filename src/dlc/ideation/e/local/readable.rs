@@ -13,9 +13,7 @@ use futures::{
     },
     future::{AbortRegistration, Abortable, Aborted, poll_fn},
     io::AsyncRead,
-    pin_mut,
     stream::{Stream, StreamExt},
-    task::LocalSpawnExt,
 };
 use std::{
     collections::VecDeque,
