@@ -957,6 +957,41 @@ where
 
         (stream1, stream2)
     }
+
+    pub fn tee_with_spawn_ref<F>(
+        self,
+        spawn_fn: &'static F,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+    {
+        self.tee_with_options_and_spawn_ref(BackpressureMode::SpecCompliant, Some(1000), spawn_fn)
+    }
+
+    pub fn tee_with_options_and_spawn_ref<F>(
+        self,
+        mode: BackpressureMode,
+        max_buffer_per_branch: Option<usize>,
+        spawn_fn: &'static F,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+    {
+        let (coordinator, source1, source2) = self.tee_internal(mode, max_buffer_per_branch);
+
+        spawn_fn(Box::pin(coordinator.run()));
+
+        let stream1 = ReadableStream::new_with_spawn_ref(source1, spawn_fn);
+        let stream2 = ReadableStream::new_with_spawn_ref(source2, spawn_fn);
+
+        (stream1, stream2)
+    }
 }
 
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
@@ -5542,36 +5577,28 @@ mod spawn_variant_tests {
         vec![1, 2, 3, 4, 5]
     }
 
-    #[test]
-    fn test_default_tee_still_works() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let data = test_data();
-            let source_stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-                tokio::task::spawn_local(fut);
-            });
+    #[localtest_macros::localset_test]
+    async fn test_tee_with_spawn_ref_completes() {
+        fn spawn_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
+            tokio::task::spawn_local(fut);
+        }
 
-            let (stream1, stream2) = source_stream.tee_with_spawn(
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                },
-            );
+        let data = test_data();
+        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), spawn_fn);
 
-            let (_, reader1) = stream1.get_reader();
-            let (_, reader2) = stream2.get_reader();
+        // Tee with shared spawn function
+        let (stream1, stream2) = source_stream.tee_with_spawn_ref(&spawn_fn);
 
-            for expected in &data {
-                assert_eq!(reader1.read().await.unwrap(), Some(*expected));
-                assert_eq!(reader2.read().await.unwrap(), Some(*expected));
-            }
-            assert_eq!(reader1.read().await.unwrap(), None);
-            assert_eq!(reader2.read().await.unwrap(), None);
-        });
+        let (_, reader1) = stream1.get_reader();
+        let (_, reader2) = stream2.get_reader();
+
+        for expected in &data {
+            assert_eq!(reader1.read().await.unwrap(), Some(*expected));
+            assert_eq!(reader2.read().await.unwrap(), Some(*expected));
+        }
+
+        // Both branches should complete
+        assert_eq!(reader1.read().await.unwrap(), None);
+        assert_eq!(reader2.read().await.unwrap(), None);
     }
 }
