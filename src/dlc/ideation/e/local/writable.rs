@@ -3,7 +3,6 @@ use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
 use futures::future::poll_fn;
-use futures::task::{LocalSpawn, LocalSpawnExt};
 use futures::{AsyncWrite, SinkExt, StreamExt, future};
 use futures::{channel::mpsc::UnboundedReceiver, task::AtomicWaker};
 use futures_util::future::AbortHandle;
@@ -2125,28 +2124,6 @@ mod tests {
         writer.close().await.expect("close");
 
         assert_eq!(sink.get_count(), 2);
-    }
-
-    use tokio::task::LocalSet;
-
-    struct LocalSetSpawner<'a> {
-        local_set: &'a LocalSet,
-    }
-
-    impl<'a> LocalSetSpawner<'a> {
-        fn new(local_set: &'a LocalSet) -> Self {
-            Self { local_set }
-        }
-    }
-
-    impl<'a> LocalSpawn for LocalSetSpawner<'a> {
-        fn spawn_local_obj(
-            &self,
-            future: futures::task::LocalFutureObj<'static, ()>,
-        ) -> Result<(), futures::task::SpawnError> {
-            self.local_set.spawn_local(future);
-            Ok(())
-        }
     }
 
     #[localtest_macros::localset_test]
