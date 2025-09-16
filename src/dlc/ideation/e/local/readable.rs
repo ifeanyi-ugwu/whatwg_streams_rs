@@ -1049,22 +1049,22 @@ where
     Source: ReadableSource<T>,
 {
     /// Create a stream with the default `CountQueuingStrategy`.
-    pub fn new_default_with_spawn<F>(source: Source, spawner: F) -> Self
+    pub fn new_default_with_spawn<F, R>(source: Source, spawner: F) -> Self
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_default_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), spawner)
     }
 
     /// Create a stream with a custom queuing strategy.
-    pub fn new_default_with_strategy_and_spawn<S, F>(
+    pub fn new_default_with_strategy_and_spawn<S, F, R>(
         source: Source,
         strategy: S,
         spawner: F,
     ) -> Self
     where
         S: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
@@ -1182,10 +1182,10 @@ where
 
 // ----------- Generic Constructor -----------
 impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
-    pub fn new_with_spawn<F>(source: Source, spawn_fn: F) -> Self
+    pub fn new_with_spawn<F, R>(source: Source, spawn_fn: F) -> Self
     where
         Source: ReadableSource<T>,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), spawn_fn)
     }
@@ -1221,7 +1221,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         (stream, pool)
     }
 
-    pub fn new_with_strategy_and_spawn<Strategy, F>(
+    pub fn new_with_strategy_and_spawn<Strategy, F, R>(
         source: Source,
         strategy: Strategy,
         spawn_fn: F,
@@ -1229,7 +1229,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     where
         Source: ReadableSource<T>,
         Strategy: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
@@ -1368,17 +1368,17 @@ impl<T: 'static, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked
 where
     I: Iterator<Item = T> + 'static,
 {
-    pub fn from_iter<F>(iter: I, spawner: F) -> Self
+    pub fn from_iter<F, R>(iter: I, spawner: F) -> Self
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::from_iter_with_strategy(iter, CountQueuingStrategy::new(1), spawner)
     }
 
-    pub fn from_iter_with_strategy<S, F>(iter: I, strategy: S, spawner: F) -> Self
+    pub fn from_iter_with_strategy<S, F, R>(iter: I, strategy: S, spawner: F) -> Self
     where
         S: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_default_with_strategy_and_spawn(IteratorSource { iter }, strategy, spawner)
     }
@@ -1388,21 +1388,21 @@ impl<T: 'static, S> ReadableStream<T, AsyncStreamSource<S>, DefaultStream, Unloc
 where
     S: Stream<Item = T> + Unpin + 'static,
 {
-    pub fn from_async_stream<F>(stream: S, spawner: F) -> Self
+    pub fn from_async_stream<F, R>(stream: S, spawner: F) -> Self
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::from_async_stream_with_strategy(stream, CountQueuingStrategy::new(1), spawner)
     }
 
-    pub fn from_async_stream_with_strategy<Strategy, F>(
+    pub fn from_async_stream_with_strategy<Strategy, F, R>(
         stream: S,
         strategy: Strategy,
         spawner: F,
     ) -> Self
     where
         Strategy: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         Self::new_default_with_strategy_and_spawn(AsyncStreamSource { stream }, strategy, spawner)
     }
@@ -2375,9 +2375,7 @@ mod tests_old {
     #[localtest_macros::localset_test]
     async fn test_iterator_source_basic() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::from_iter(data.into_iter(), tokio::task::spawn_local);
         let (_locked_stream, reader) = stream.get_reader();
 
         // Read all items
@@ -2624,9 +2622,7 @@ mod tests_old {
             }
         }
 
-        let stream = ReadableStream::new_default_with_spawn(ErrorSource, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::new_default_with_spawn(ErrorSource, tokio::task::spawn_local);
         let (_locked_stream, reader) = stream.get_reader();
 
         // Should get the error
@@ -2860,9 +2856,8 @@ mod tests {
         let items = vec![10, 20, 30];
         let async_stream = stream::iter(items.clone());
 
-        let readable_stream = ReadableStream::from_async_stream(async_stream, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let readable_stream =
+            ReadableStream::from_async_stream(async_stream, tokio::task::spawn_local);
         let (_locked, reader) = readable_stream.get_reader();
 
         // Should read all items from async stream
@@ -5243,9 +5238,8 @@ mod tee_tests {
             }
         }
 
-        let error_stream = ReadableStream::new_with_spawn(ErrorSource { count: 0 }, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let error_stream =
+            ReadableStream::new_with_spawn(ErrorSource { count: 0 }, tokio::task::spawn_local);
         let (stream1, stream2) = error_stream.tee_with_spawn(
             |fut| {
                 tokio::task::spawn_local(fut);

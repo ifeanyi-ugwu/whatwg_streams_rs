@@ -183,13 +183,13 @@ where
     T: 'static,
     Sink: WritableSink<T> + 'static,
 {
-    pub fn new_with_spawn<F>(
+    pub fn new_with_spawn<F, R>(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
         spawn_fn: F,
     ) -> Self
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
@@ -2031,9 +2031,11 @@ mod tests {
                 let strategy = Box::new(CountQueuingStrategy::new(2));
 
                 //let stream = WritableStream::new(sink.clone(), strategy);
-                let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-                    tokio::task::spawn_local(fut);
-                });
+                let stream = WritableStream::new_with_spawn(
+                    sink.clone(),
+                    strategy,
+                    tokio::task::spawn_local,
+                );
                 let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
                 // Write some chunks
