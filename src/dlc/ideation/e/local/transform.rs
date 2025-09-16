@@ -122,7 +122,7 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
 }
 
 impl<I: 'static, O: 'static> TransformStream<I, O> {
-    pub fn new_with_three_spawners<T, F1, F2, F3>(
+    pub fn new_with_spawners<T, F1, F2, F3>(
         transformer: T,
         readable_spawn: F1,
         writable_spawn: F2,
@@ -159,117 +159,6 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
         TransformStream { readable, writable }
     }
 }
-
-impl<I: 'static, O: 'static> TransformStream<I, O> {
-    pub fn new_with_spawner_factory<T, SF, F>(transformer: T, spawner_factory: SF) -> Self
-    where
-        T: Transformer<I, O> + 'static,
-        SF: Fn() -> F,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
-    {
-        let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
-
-        let readable_source = TransformReadableSource::new();
-        let writable_sink = TransformWritableSink::new(transform_tx);
-
-        // Create a new spawner for each component
-        let readable = ReadableStream::new_with_spawn(
-            readable_source,
-            // CountQueuingStrategy::new(1),
-            spawner_factory(), // Create new spawner
-        );
-
-        let writable = WritableStream::new_with_spawn(
-            writable_sink,
-            Box::new(CountQueuingStrategy::new(1)),
-            spawner_factory(), // Create new spawner
-        );
-
-        let readable_controller = readable.controller.clone();
-        let writable_controller = writable.controller.clone();
-        let controller =
-            TransformStreamDefaultController::new(readable_controller, writable_controller);
-
-        spawner_factory()(Box::pin(transform_task(
-            // Create new spawner
-            transformer,
-            transform_rx,
-            controller,
-        )));
-
-        TransformStream { readable, writable }
-    }
-}
-
-impl<I: 'static, O: 'static> TransformStream<I, O> {
-    pub fn new_with_rc_spawner<T>(
-        transformer: T,
-        spawner: std::rc::Rc<dyn Fn(futures::future::LocalBoxFuture<'static, ()>)>,
-    ) -> Self
-    where
-        T: Transformer<I, O> + 'static,
-    {
-        let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
-
-        let readable_source = TransformReadableSource::new();
-        let writable_sink = TransformWritableSink::new(transform_tx);
-
-        // Clone the Rc for each use
-        let readable_spawner = spawner.clone();
-        let writable_spawner = spawner.clone();
-        let transform_spawner = spawner.clone();
-
-        // But this still won't work because new_with_spawn expects FnOnce, not Fn
-        // You'd need to wrap each call:
-        let readable = ReadableStream::new_with_spawn(
-            readable_source,
-            //CountQueuingStrategy::new(1),
-            |fut| readable_spawner(fut),
-        );
-
-        let writable = WritableStream::new_with_spawn(
-            writable_sink,
-            Box::new(CountQueuingStrategy::new(1)),
-            |fut| writable_spawner(fut),
-        );
-
-        let readable_controller = readable.controller.clone();
-        let writable_controller = writable.controller.clone();
-        let controller =
-            TransformStreamDefaultController::new(readable_controller, writable_controller);
-
-        transform_spawner(Box::pin(transform_task(
-            transformer,
-            transform_rx,
-            controller,
-        )));
-
-        TransformStream { readable, writable }
-    }
-}
-
-/*/// Creates a new `TransformStream` that acts as an **identity transform**,
-/// passing chunks from the writable side directly to the readable side
-/// without modification.
-///
-/// This provides a convenient way to create a pair of connected
-/// readable and writable streams for tasks like piping or buffering.
-///
-/// # Panics
-/// This method does not panic.
-///
-/// # Example
-/// ```rust
-/// use crate::transform::TransformStream;
-///
-/// let transform_stream = TransformStream::<String, String>::default();
-/// let (readable, writable) = transform_stream.split();
-/// ```
-impl<T: 'static> Default for TransformStream<T, T> {
-    fn default() -> Self {
-        Self::new(IdentityTransformer::new())
-    }
-}*/
 
 /// Controller for transform operations
 pub struct TransformStreamDefaultController<O> {
@@ -782,14 +671,12 @@ mod tests {
 mod usage_examples {
     use super::tests::*;
     use super::*;
-    use std::time::Duration;
-    use tokio::time::timeout;
 
     #[localtest_macros::localset_test]
     async fn test_three_spawners_approach() {
         let transformer = DoubleTransformer;
 
-        let transform_stream = TransformStream::new_with_three_spawners(
+        let transform_stream = TransformStream::new_with_spawners(
             transformer,
             |fut| {
                 tokio::task::spawn_local(fut);
@@ -816,77 +703,6 @@ mod usage_examples {
         assert_eq!(reader.read().await.unwrap(), Some(10));
         assert_eq!(reader.read().await.unwrap(), Some(20));
         assert_eq!(reader.read().await.unwrap(), Some(-6));
-        assert_eq!(reader.read().await.unwrap(), None);
-    }
-
-    #[localtest_macros::localset_test]
-    async fn test_spawner_factory_approach() {
-        let transformer = UppercaseTransformer;
-
-        let transform_stream = TransformStream::new_with_spawner_factory(
-            transformer,
-            || {
-                |fut| {
-                    tokio::task::spawn_local(fut);
-                }
-            }, // Factory returns new spawner each time
-        );
-
-        let (readable, writable) = transform_stream.split();
-        let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
-
-        // Write some strings
-        writer.write("hello".to_string()).await.unwrap();
-        writer.write("world".to_string()).await.unwrap();
-        writer.close().await.unwrap();
-
-        // Verify they get uppercased
-        let result1 = timeout(Duration::from_secs(1), reader.read())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result1, Some("HELLO".to_string()));
-
-        let result2 = timeout(Duration::from_secs(1), reader.read())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result2, Some("WORLD".to_string()));
-
-        let result3 = timeout(Duration::from_secs(1), reader.read())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result3, None);
-    }
-
-    #[localtest_macros::localset_test]
-    async fn test_rc_spawner_approach() {
-        let transformer = OddFilterTransformer;
-
-        let spawner = std::rc::Rc::new(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-
-        let transform_stream = TransformStream::new_with_rc_spawner(transformer, spawner);
-
-        let (readable, writable) = transform_stream.split();
-        let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
-
-        // Write mix of odd and even numbers
-        writer.write(1).await.unwrap(); // odd - should pass
-        writer.write(2).await.unwrap(); // even - should be filtered
-        writer.write(3).await.unwrap(); // odd - should pass
-        writer.write(4).await.unwrap(); // even - should be filtered
-        writer.write(5).await.unwrap(); // odd - should pass
-        writer.close().await.unwrap();
-
-        // Should only get odd numbers
-        assert_eq!(reader.read().await.unwrap(), Some(1));
-        assert_eq!(reader.read().await.unwrap(), Some(3));
-        assert_eq!(reader.read().await.unwrap(), Some(5));
         assert_eq!(reader.read().await.unwrap(), None);
     }
 }
