@@ -4319,7 +4319,6 @@ mod tests {
 #[cfg(test)]
 mod builder_tests {
     use super::*;
-    use futures::executor::block_on;
     use futures::stream::iter as stream_iter;
     use std::sync::Mutex;
     use std::thread;
@@ -4412,7 +4411,7 @@ mod builder_tests {
         }
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_basic_default_stream_builder() {
         let data = vec!["hello".to_string(), "world".to_string()];
         let source = TestSource::new(data.clone());
@@ -4422,14 +4421,12 @@ mod builder_tests {
         });
         let (_, reader) = stream.get_reader();
 
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("hello".to_string()));
-            assert_eq!(reader.read().await.unwrap(), Some("world".to_string()));
-            assert_eq!(reader.read().await.unwrap(), None);
-        });
+        assert_eq!(reader.read().await.unwrap(), Some("hello".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("world".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_byte_stream_builder() {
         let data = b"Hello, World!".to_vec();
         let source = TestByteSource::new(data.clone());
@@ -4439,24 +4436,22 @@ mod builder_tests {
         });
         let (_, reader) = stream.get_byob_reader();
 
-        block_on(async {
-            let mut buffer = vec![0u8; 13];
-            //let bytes_read = reader.read(&mut buffer).await.unwrap().unwrap();
-            //println!("asserting bytes read");
-            //assert_eq!(bytes_read, 13);
-            //println!("asserting buffer");
-            //assert_eq!(buffer, b"Hello, World!");
-            //println!("all success")
-            match reader.read(&mut buffer).await.unwrap() {
-                bytes_read => {
-                    assert_eq!(bytes_read, 13);
-                    assert_eq!(buffer, b"Hello, World!".to_vec());
-                } //None => panic!("Expected data but stream ended"),
-            }
-        });
+        let mut buffer = vec![0u8; 13];
+        //let bytes_read = reader.read(&mut buffer).await.unwrap().unwrap();
+        //println!("asserting bytes read");
+        //assert_eq!(bytes_read, 13);
+        //println!("asserting buffer");
+        //assert_eq!(buffer, b"Hello, World!");
+        //println!("all success")
+        match reader.read(&mut buffer).await.unwrap() {
+            bytes_read => {
+                assert_eq!(bytes_read, 13);
+                assert_eq!(buffer, b"Hello, World!".to_vec());
+            } //None => panic!("Expected data but stream ended"),
+        }
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_builder_with_custom_strategy() {
         let data = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let source = TestSource::new(data);
@@ -4474,12 +4469,11 @@ mod builder_tests {
         assert!(!stream.locked());
 
         let (_, reader) = stream.get_reader();
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("a".to_string()));
-        });
+
+        assert_eq!(reader.read().await.unwrap(), Some("a".to_string()));
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_builder_with_custom_spawn() {
         let data = vec!["test".to_string()];
         let source = TestSource::new(data);
@@ -4499,12 +4493,11 @@ mod builder_tests {
         assert!(*spawn_called.lock().unwrap());
 
         let (_, reader) = stream.get_reader();
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
-        });
+
+        assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_builder_chaining() {
         let data = vec!["chain".to_string(), "test".to_string()];
         let source = TestSource::new(data);
@@ -4517,14 +4510,13 @@ mod builder_tests {
             });
 
         let (_, reader) = stream.get_reader();
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("chain".to_string()));
-            assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
-            assert_eq!(reader.read().await.unwrap(), None);
-        });
+
+        assert_eq!(reader.read().await.unwrap(), Some("chain".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_from_vec_convenience() {
         let data = vec!["item1".to_string(), "item2".to_string()];
 
@@ -4533,14 +4525,12 @@ mod builder_tests {
         });
         let (_, reader) = stream.get_reader();
 
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("item1".to_string()));
-            assert_eq!(reader.read().await.unwrap(), Some("item2".to_string()));
-            assert_eq!(reader.read().await.unwrap(), None);
-        });
+        assert_eq!(reader.read().await.unwrap(), Some("item1".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("item2".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_from_iterator_convenience() {
         let data = vec![1, 2, 3, 4, 5];
         let iter = data.into_iter();
@@ -4550,17 +4540,15 @@ mod builder_tests {
         });
         let (_, reader) = stream.get_reader();
 
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some(1));
-            assert_eq!(reader.read().await.unwrap(), Some(2));
-            assert_eq!(reader.read().await.unwrap(), Some(3));
-            assert_eq!(reader.read().await.unwrap(), Some(4));
-            assert_eq!(reader.read().await.unwrap(), Some(5));
-            assert_eq!(reader.read().await.unwrap(), None);
-        });
+        assert_eq!(reader.read().await.unwrap(), Some(1));
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+        assert_eq!(reader.read().await.unwrap(), Some(3));
+        assert_eq!(reader.read().await.unwrap(), Some(4));
+        assert_eq!(reader.read().await.unwrap(), Some(5));
+        assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_from_stream_convenience() {
         let data = vec!["async1", "async2", "async3"];
         let async_stream = stream_iter(data.into_iter().map(|s| s.to_string()));
@@ -4570,15 +4558,13 @@ mod builder_tests {
         });
         let (_, reader) = stream.get_reader();
 
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("async1".to_string()));
-            assert_eq!(reader.read().await.unwrap(), Some("async2".to_string()));
-            assert_eq!(reader.read().await.unwrap(), Some("async3".to_string()));
-            assert_eq!(reader.read().await.unwrap(), None);
-        });
+        assert_eq!(reader.read().await.unwrap(), Some("async1".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("async2".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("async3".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_builder_reusability() {
         // Test that we can create multiple builders with the same pattern
         let create_stream = |data: Vec<&str>| {
@@ -4596,16 +4582,14 @@ mod builder_tests {
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
-        block_on(async {
-            // Verify both streams work independently
-            assert_eq!(reader1.read().await.unwrap(), Some("test1".to_string()));
-            assert_eq!(reader2.read().await.unwrap(), Some("test3".to_string()));
-            assert_eq!(reader1.read().await.unwrap(), Some("test2".to_string()));
-            assert_eq!(reader2.read().await.unwrap(), Some("test4".to_string()));
-        });
+        // Verify both streams work independently
+        assert_eq!(reader1.read().await.unwrap(), Some("test1".to_string()));
+        assert_eq!(reader2.read().await.unwrap(), Some("test3".to_string()));
+        assert_eq!(reader1.read().await.unwrap(), Some("test2".to_string()));
+        assert_eq!(reader2.read().await.unwrap(), Some("test4".to_string()));
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_stream_static_builder_method() {
         let data = vec!["static".to_string(), "method".to_string()];
         let source = TestSource::new(data);
@@ -4617,14 +4601,13 @@ mod builder_tests {
             });
 
         let (_, reader) = stream.get_reader();
-        block_on(async {
-            assert_eq!(reader.read().await.unwrap(), Some("static".to_string()));
-            assert_eq!(reader.read().await.unwrap(), Some("method".to_string()));
-            assert_eq!(reader.read().await.unwrap(), None);
-        });
+
+        assert_eq!(reader.read().await.unwrap(), Some("static".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("method".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_error_handling_in_builder() {
         // Test that errors in the source are properly handled
         struct ErrorSource;
@@ -4644,17 +4627,15 @@ mod builder_tests {
         });
         let (_, reader) = stream.get_reader();
 
-        block_on(async {
-            match reader.read().await {
-                Err(StreamError::Custom(msg)) => {
-                    assert!(msg.to_string().contains("Test error"));
-                }
-                other => panic!("Expected custom error, got: {:?}", other),
+        match reader.read().await {
+            Err(StreamError::Custom(msg)) => {
+                assert!(msg.to_string().contains("Test error"));
             }
-        });
+            other => panic!("Expected custom error, got: {:?}", other),
+        }
     }
 
-    #[test]
+    #[localtest_macros::localset_test]
     fn test_multiple_configurations() {
         // Test different configuration combinations
         let configs = vec![
@@ -4676,16 +4657,14 @@ mod builder_tests {
             });
             let (_, reader) = stream.get_reader();
 
-            block_on(async {
-                let result = reader.read().await.unwrap().unwrap();
-                match i {
-                    0 => assert_eq!(result, "default"),
-                    1 => assert_eq!(result, "strategy"),
-                    2 => assert_eq!(result, "thread"),
-                    3 => assert_eq!(result, "full"),
-                    _ => unreachable!(),
-                }
-            });
+            let result = reader.read().await.unwrap().unwrap();
+            match i {
+                0 => assert_eq!(result, "default"),
+                1 => assert_eq!(result, "strategy"),
+                2 => assert_eq!(result, "thread"),
+                3 => assert_eq!(result, "full"),
+                _ => unreachable!(),
+            }
         }
     }
 }
