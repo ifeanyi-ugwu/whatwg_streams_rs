@@ -1167,7 +1167,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     pub(crate) fn new_inner(
         source: Source,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
-    ) -> (Self, futures::future::LocalBoxFuture<'static, ()>)
+    ) -> (Self, impl Future<Output = ()>)
     where
         Source: ReadableSource<T>,
     {
@@ -1229,7 +1229,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, task_fut) = Self::new_inner(source, Box::new(CountQueuingStrategy::new(1)));
-        spawn_fn(task_fut);
+        spawn_fn(Box::pin(task_fut));
         stream
     }
 
@@ -1243,7 +1243,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, task_fut) = Self::new_inner(source, Box::new(strategy));
-        spawn_fn(task_fut);
+        spawn_fn(Box::pin(task_fut));
         stream
     }
 
@@ -1253,7 +1253,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, task_fut) = Self::new_inner(source, Box::new(CountQueuingStrategy::new(1)));
-        spawn_fn(task_fut);
+        spawn_fn(Box::pin(task_fut));
         stream
     }
 
@@ -1268,7 +1268,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, task_fut) = Self::new_inner(source, Box::new(strategy));
-        spawn_fn(task_fut);
+        spawn_fn(Box::pin(task_fut));
         stream
     }
 }
