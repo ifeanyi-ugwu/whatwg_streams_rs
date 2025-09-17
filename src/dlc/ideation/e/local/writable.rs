@@ -186,7 +186,7 @@ where
     pub(crate) fn new_inner(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
-    ) -> (Self, futures::future::LocalBoxFuture<'static, ()>) {
+    ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
         let stored_error = Rc::new(RwLock::new(None));
@@ -251,7 +251,7 @@ where
             controller: controller.into(),
         };
 
-        (stream, Box::pin(fut))
+        (stream, fut)
     }
 
     /// Create a new WritableStream using an owned spawner function.
@@ -264,7 +264,7 @@ where
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, fut) = Self::new_inner(sink, strategy);
-        spawn_fn(fut);
+        spawn_fn(Box::pin(fut));
         stream
     }
 
@@ -278,7 +278,7 @@ where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, fut) = Self::new_inner(sink, strategy);
-        spawn_fn(fut);
+        spawn_fn(Box::pin(fut));
         stream
     }
 }
