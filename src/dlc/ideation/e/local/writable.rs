@@ -183,7 +183,7 @@ where
     Sink: WritableSink<T> + 'static,
 {
     /// Common constructor logic shared between spawn variants
-    fn new_inner(
+    pub(crate) fn new_inner(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
     ) -> (Self, futures::future::LocalBoxFuture<'static, ()>) {

@@ -1164,13 +1164,12 @@ where
 
 // ----------- Generic Constructor -----------
 impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
-    fn new_inner<Strategy>(
+    pub(crate) fn new_inner(
         source: Source,
-        strategy: Strategy,
+        strategy: Box<dyn QueuingStrategy<T> + 'static>,
     ) -> (Self, futures::future::LocalBoxFuture<'static, ()>)
     where
         Source: ReadableSource<T>,
-        Strategy: QueuingStrategy<T> + 'static,
     {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
@@ -1183,7 +1182,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
         let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
 
-        let inner = ReadableStreamInner::new(source, Box::new(strategy));
+        let inner = ReadableStreamInner::new(source, strategy);
 
         let controller = ReadableStreamDefaultController::new(
             ctrl_tx.clone(),
@@ -1229,7 +1228,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     where
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (stream, task_fut) = Self::new_inner(source, CountQueuingStrategy::new(1));
+        let (stream, task_fut) = Self::new_inner(source, Box::new(CountQueuingStrategy::new(1)));
         spawn_fn(task_fut);
         stream
     }
@@ -1243,7 +1242,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         Strategy: QueuingStrategy<T> + 'static,
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (stream, task_fut) = Self::new_inner(source, strategy);
+        let (stream, task_fut) = Self::new_inner(source, Box::new(strategy));
         spawn_fn(task_fut);
         stream
     }
@@ -1253,7 +1252,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (stream, task_fut) = Self::new_inner(source, CountQueuingStrategy::new(1));
+        let (stream, task_fut) = Self::new_inner(source, Box::new(CountQueuingStrategy::new(1)));
         spawn_fn(task_fut);
         stream
     }
@@ -1268,7 +1267,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         Strategy: QueuingStrategy<T> + 'static,
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (stream, task_fut) = Self::new_inner(source, strategy);
+        let (stream, task_fut) = Self::new_inner(source, Box::new(strategy));
         spawn_fn(task_fut);
         stream
     }
@@ -4705,9 +4704,8 @@ mod pipe_through_tests {
         });
 
         // Create transform
-        let transform = TransformStream::new_with_spawn_ref(UppercaseTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform =
+            TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
 
         // Pipe through
         let result_stream =
@@ -4741,9 +4739,7 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn_ref(DoubleTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform = TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
             tokio::task::spawn_local(fut);
         });
@@ -4764,9 +4760,8 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn_ref(UppercaseTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform =
+            TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
             tokio::task::spawn_local(fut);
         });
@@ -4785,17 +4780,15 @@ mod pipe_through_tests {
         });
 
         // First transform: double
-        let transform1 = TransformStream::new_with_spawn_ref(DoubleTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform1 =
+            TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
         let intermediate_stream = source_stream.pipe_through_with_spawn(transform1, None, |fut| {
             tokio::task::spawn_local(fut);
         });
 
         // Second transform: double again
-        let transform2 = TransformStream::new_with_spawn_ref(DoubleTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform2 =
+            TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
         let result_stream = intermediate_stream.pipe_through_with_spawn(transform2, None, |fut| {
             tokio::task::spawn_local(fut);
         });
@@ -4816,9 +4809,8 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn_ref(UppercaseTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform =
+            TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
 
         let options = StreamPipeOptions {
             prevent_close: false,
@@ -4862,9 +4854,7 @@ mod pipe_through_tests {
             tokio::task::spawn_local(fut);
         });
 
-        let transform = TransformStream::new_with_spawn_ref(ErrorTransformer, &|fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let transform = TransformStream::builder(ErrorTransformer).spawn(tokio::task::spawn_local);
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
             tokio::task::spawn_local(fut);
         });
