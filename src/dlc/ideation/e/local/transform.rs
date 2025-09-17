@@ -382,24 +382,30 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
         stream
     }
 
+    /// Spawn using a static function reference
     pub fn spawn_ref<F, R>(self, spawn_fn: &'static F) -> TransformStream<I, O>
     where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream, rfut, wfut, tfut) = self.prepare();
         let fut = async move {
-            let _ = futures::join!(rfut, wfut, tfut);
+            futures::join!(rfut, wfut, tfut);
         };
         spawn_fn(Box::pin(fut));
         stream
     }
 
     /// Spawn each part separately
-    pub fn spawn_parts<F1, F2, F3>(self, rf: F1, wf: F2, tf: F3) -> TransformStream<I, O>
+    pub fn spawn_parts<F1, F2, F3, R1, R2, R3>(
+        self,
+        rf: F1,
+        wf: F2,
+        tf: F3,
+    ) -> TransformStream<I, O>
     where
-        F1: Fn(futures::future::LocalBoxFuture<'static, ()>),
-        F2: Fn(futures::future::LocalBoxFuture<'static, ()>),
-        F3: Fn(futures::future::LocalBoxFuture<'static, ()>),
+        F1: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R1,
+        F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R2,
+        F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
     {
         let (stream, rfut, wfut, tfut) = self.prepare();
         rf(rfut);
@@ -408,11 +414,12 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
         stream
     }
 
-    pub fn spawn_parts_ref(
+    /// Spawn each part separately using static function references
+    pub fn spawn_parts_ref<R1, R2, R3>(
         self,
-        rf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>)),
-        wf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>)),
-        tf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>)),
+        rf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R1),
+        wf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R2),
+        tf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3),
     ) -> TransformStream<I, O> {
         let (stream, rfut, wfut, tfut) = self.prepare();
         rf(rfut);
@@ -701,40 +708,104 @@ mod tests {
 }
 
 #[cfg(test)]
-mod usage_examples {
+mod builder_tests {
     use super::tests::*;
     use super::*;
 
     #[localtest_macros::localset_test]
-    async fn test_three_spawners_approach() {
-        let transformer = DoubleTransformer;
+    async fn test_builder_spawn() {
+        let transform_stream =
+            TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
 
-        let transform_stream = TransformStream::builder(transformer).spawn_parts(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            }, // readable
-            |fut| {
-                tokio::task::spawn_local(fut);
-            }, // writable
-            |fut| {
-                tokio::task::spawn_local(fut);
-            }, // transform
+        let (readable, writable) = transform_stream.split();
+        let (_, writer) = writable.get_writer().unwrap();
+        let (_, reader) = readable.get_reader();
+
+        writer.write(1).await.unwrap();
+        writer.write(2).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+        assert_eq!(reader.read().await.unwrap(), Some(4));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[localtest_macros::localset_test]
+    async fn test_builder_spawn_parts() {
+        let transform_stream = TransformStream::builder(DoubleTransformer).spawn_parts(
+            tokio::task::spawn_local, // readable
+            tokio::task::spawn_local, // writable
+            tokio::task::spawn_local, // transform
         );
 
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader();
 
-        // Write some numbers
-        writer.write(5).await.unwrap();
-        writer.write(10).await.unwrap();
-        writer.write(-3).await.unwrap();
+        writer.write(3).await.unwrap();
+        writer.write(4).await.unwrap();
         writer.close().await.unwrap();
 
-        // Verify they get doubled
-        assert_eq!(reader.read().await.unwrap(), Some(10));
-        assert_eq!(reader.read().await.unwrap(), Some(20));
-        assert_eq!(reader.read().await.unwrap(), Some(-6));
+        assert_eq!(reader.read().await.unwrap(), Some(6));
+        assert_eq!(reader.read().await.unwrap(), Some(8));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[localtest_macros::localset_test]
+    async fn test_builder_prepare() {
+        let (stream, rfut, wfut, tfut) = TransformStream::builder(DoubleTransformer).prepare();
+
+        // spawn the tasks manually for the test
+        tokio::task::spawn_local(rfut);
+        tokio::task::spawn_local(wfut);
+        tokio::task::spawn_local(tfut);
+
+        let (readable, writable) = stream.split();
+        let (_, writer) = writable.get_writer().unwrap();
+        let (_, reader) = readable.get_reader();
+
+        writer.write(2).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(reader.read().await.unwrap(), Some(4));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    fn spawn_local_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
+        tokio::task::spawn_local(fut);
+    }
+
+    #[localtest_macros::localset_test]
+    async fn test_builder_spawn_ref() {
+        let stream = TransformStream::builder(DoubleTransformer).spawn_ref(&spawn_local_fn);
+
+        let (readable, writable) = stream.split();
+        let (_, writer) = writable.get_writer().unwrap();
+        let (_, reader) = readable.get_reader();
+
+        writer.write(3).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(reader.read().await.unwrap(), Some(6));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[localtest_macros::localset_test]
+    async fn test_builder_spawn_parts_ref() {
+        let stream = TransformStream::builder(DoubleTransformer).spawn_parts_ref(
+            &spawn_local_fn,
+            &spawn_local_fn,
+            &spawn_local_fn,
+        );
+
+        let (readable, writable) = stream.split();
+        let (_, writer) = writable.get_writer().unwrap();
+        let (_, reader) = readable.get_reader();
+
+        writer.write(4).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(reader.read().await.unwrap(), Some(8));
         assert_eq!(reader.read().await.unwrap(), None);
     }
 }
