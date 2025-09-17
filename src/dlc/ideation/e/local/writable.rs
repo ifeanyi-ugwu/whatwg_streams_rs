@@ -1905,15 +1905,31 @@ where
         self
     }
 
-    pub fn build_with_spawn<F>(self, spawn_fn: F) -> WritableStream<T, Sink, Unlocked>
+    /// Build with an owned spawner function
+    pub fn build_with_spawn<F, R>(self, spawn_fn: F) -> WritableStream<T, Sink, Unlocked>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let strategy = self
             .strategy
             .unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));
 
         WritableStream::new_with_spawn(self.sink, strategy, spawn_fn)
+    }
+
+    /// Build with a reference to a static spawner function
+    pub fn build_with_spawn_ref<F, R>(
+        self,
+        spawn_fn: &'static F,
+    ) -> WritableStream<T, Sink, Unlocked>
+    where
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let strategy = self
+            .strategy
+            .unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));
+
+        WritableStream::new_with_spawn_ref(self.sink, strategy, spawn_fn)
     }
 }
 
