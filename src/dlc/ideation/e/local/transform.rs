@@ -69,9 +69,9 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
         readable_strategy: Box<dyn QueuingStrategy<O>>,
     ) -> (
         Self,
-        futures::future::LocalBoxFuture<'static, ()>, // readable task
-        futures::future::LocalBoxFuture<'static, ()>, // writable task
-        futures::future::LocalBoxFuture<'static, ()>, // transform task
+        impl Future<Output = ()>, // readable task
+        impl Future<Output = ()>, // writable task
+        impl Future<Output = ()>, // transform task
     )
     where
         T: Transformer<I, O> + 'static,
@@ -90,7 +90,7 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
             writable.controller.clone(),
         );
 
-        let transform_fut = Box::pin(transform_task(transformer, transform_rx, controller));
+        let transform_fut = transform_task(transformer, transform_rx, controller);
 
         (
             TransformStream { readable, writable },
@@ -358,9 +358,9 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
         self,
     ) -> (
         TransformStream<I, O>,
-        futures::future::LocalBoxFuture<'static, ()>,
-        futures::future::LocalBoxFuture<'static, ()>,
-        futures::future::LocalBoxFuture<'static, ()>,
+        impl Future<Output = ()>,
+        impl Future<Output = ()>,
+        impl Future<Output = ()>,
     ) {
         TransformStream::new_inner(
             self.transformer,
@@ -408,9 +408,9 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
         F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
     {
         let (stream, rfut, wfut, tfut) = self.prepare();
-        rf(rfut);
-        wf(wfut);
-        tf(tfut);
+        rf(Box::pin(rfut));
+        wf(Box::pin(wfut));
+        tf(Box::pin(tfut));
         stream
     }
 
@@ -422,9 +422,9 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
         tf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3),
     ) -> TransformStream<I, O> {
         let (stream, rfut, wfut, tfut) = self.prepare();
-        rf(rfut);
-        wf(wfut);
-        tf(tfut);
+        rf(Box::pin(rfut));
+        wf(Box::pin(wfut));
+        tf(Box::pin(tfut));
         stream
     }
 }
