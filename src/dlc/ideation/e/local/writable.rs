@@ -182,14 +182,11 @@ where
     T: 'static,
     Sink: WritableSink<T> + 'static,
 {
-    pub fn new_with_spawn<F, R>(
+    /// Common constructor logic shared between spawn variants
+    fn new_inner(
         sink: Sink,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
-        spawn_fn: F,
-    ) -> Self
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
+    ) -> (Self, futures::future::LocalBoxFuture<'static, ()>) {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
         let stored_error = Rc::new(RwLock::new(None));
@@ -236,9 +233,7 @@ where
             ctrl_rx,
         );
 
-        spawn_fn(Box::pin(fut));
-
-        Self {
+        let stream = Self {
             command_tx,
             backpressure,
             closed,
@@ -254,7 +249,23 @@ where
             write_receiver: None,
             pending_write_len: None,
             controller: controller.into(),
-        }
+        };
+
+        (stream, Box::pin(fut))
+    }
+
+    /// Create a new WritableStream using an owned spawner function.
+    pub fn new_with_spawn<F, R>(
+        sink: Sink,
+        strategy: Box<dyn QueuingStrategy<T> + 'static>,
+        spawn_fn: F,
+    ) -> Self
+    where
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let (stream, fut) = Self::new_inner(sink, strategy);
+        spawn_fn(fut);
+        stream
     }
 
     /// Create a new WritableStream using a shared `'static` spawner reference.
@@ -266,74 +277,11 @@ where
     where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
-        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let stored_error = Rc::new(RwLock::new(None));
-
-        let inner = WritableStreamInner {
-            state: StreamState::Writable,
-            queue: VecDeque::new(),
-            queue_total_size: 0,
-            strategy,
-            sink: Some(sink),
-            backpressure: false,
-            close_requested: false,
-            close_completions: Vec::new(),
-            abort_reason: None,
-            abort_requested: false,
-            abort_completions: Vec::new(),
-            stored_error: Rc::clone(&stored_error),
-            ready_wakers: WakerSet::new(),
-            closed_wakers: WakerSet::new(),
-            flush_completions: Vec::new(),
-            pending_flush_commands: Vec::new(),
-        };
-
-        let backpressure = Rc::new(AtomicBool::new(false));
-        let closed = Rc::new(AtomicBool::new(false));
-        let errored = Rc::new(AtomicBool::new(false));
-        let locked = Rc::new(AtomicBool::new(false));
-        let queue_total_size = Rc::new(AtomicUsize::new(0));
-
-        let (ctrl_tx, ctrl_rx): (
-            UnboundedSender<ControllerMsg>,
-            UnboundedReceiver<ControllerMsg>,
-        ) = unbounded();
-        let controller = WritableStreamDefaultController::new(ctrl_tx.clone());
-
-        let fut = stream_task(
-            command_rx,
-            inner,
-            Rc::clone(&backpressure),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-            Rc::clone(&queue_total_size),
-            controller.clone(),
-            ctrl_rx,
-        );
-
-        spawn_fn(Box::pin(fut));
-
-        Self {
-            command_tx,
-            backpressure,
-            closed,
-            errored,
-            locked,
-            queue_total_size,
-            high_water_mark,
-            stored_error,
-            _sink: PhantomData,
-            _state: PhantomData,
-            flush_receiver: None,
-            close_receiver: None,
-            write_receiver: None,
-            pending_write_len: None,
-            controller: controller.into(),
-        }
+        let (stream, fut) = Self::new_inner(sink, strategy);
+        spawn_fn(fut);
+        stream
     }
 }
-
 impl<T, Sink, S> WritableStream<T, Sink, S>
 where
     T: 'static,
