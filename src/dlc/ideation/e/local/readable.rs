@@ -1164,23 +1164,13 @@ where
 
 // ----------- Generic Constructor -----------
 impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
-    pub fn new_with_spawn<F, R>(source: Source, spawn_fn: F) -> Self
-    where
-        Source: ReadableSource<T>,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        Self::new_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), spawn_fn)
-    }
-
-    pub fn new_with_strategy_and_spawn<Strategy, F, R>(
+    fn new_inner<Strategy>(
         source: Source,
         strategy: Strategy,
-        spawn_fn: F,
-    ) -> Self
+    ) -> (Self, futures::future::LocalBoxFuture<'static, ()>)
     where
         Source: ReadableSource<T>,
         Strategy: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
@@ -1189,9 +1179,6 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         let errored = Rc::new(AtomicBool::new(false));
         let locked = Rc::new(AtomicBool::new(false));
         let stored_error = Rc::new(RwLock::new(None));
-
-        /*let strategy: Box<dyn QueuingStrategy<T> + Send + Sync> =
-        strategy.unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));*/
 
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
         let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
@@ -1207,7 +1194,6 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
             Rc::clone(&errored),
         );
 
-        // Spawn the stream task
         let task_fut = readable_stream_task(
             command_rx,
             ctrl_rx,
@@ -1222,9 +1208,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
             controller.clone(),
         );
 
-        spawn_fn(Box::pin(task_fut));
-
-        Self {
+        let stream = Self {
             command_tx,
             queue_total_size,
             high_water_mark,
@@ -1236,18 +1220,42 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
             controller: controller.into(),
             byte_state: None,
             _phantom: PhantomData,
-        }
-    }
-}
+        };
 
-impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
+        (stream, Box::pin(task_fut))
+    }
+
+    pub fn new_with_spawn<F, R>(source: Source, spawn_fn: F) -> Self
+    where
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let (stream, task_fut) = Self::new_inner(source, CountQueuingStrategy::new(1));
+        spawn_fn(task_fut);
+        stream
+    }
+
+    pub fn new_with_strategy_and_spawn<Strategy, F, R>(
+        source: Source,
+        strategy: Strategy,
+        spawn_fn: F,
+    ) -> Self
+    where
+        Strategy: QueuingStrategy<T> + 'static,
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let (stream, task_fut) = Self::new_inner(source, strategy);
+        spawn_fn(task_fut);
+        stream
+    }
+
     /// Create a new ReadableStream using a shared `'static` spawn function reference.
     pub fn new_with_spawn_ref<F, R>(source: Source, spawn_fn: &'static F) -> Self
     where
-        Source: ReadableSource<T>,
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        Self::new_with_strategy_and_spawn_ref(source, CountQueuingStrategy::new(1), spawn_fn)
+        let (stream, task_fut) = Self::new_inner(source, CountQueuingStrategy::new(1));
+        spawn_fn(task_fut);
+        stream
     }
 
     /// Full variant with strategy and shared spawn reference
@@ -1257,61 +1265,12 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         spawn_fn: &'static F,
     ) -> Self
     where
-        Source: ReadableSource<T>,
         Strategy: QueuingStrategy<T> + 'static,
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (command_tx, command_rx) = unbounded();
-        let (ctrl_tx, ctrl_rx) = unbounded();
-        let queue_total_size = Rc::new(AtomicUsize::new(0));
-        let closed = Rc::new(AtomicBool::new(false));
-        let errored = Rc::new(AtomicBool::new(false));
-        let locked = Rc::new(AtomicBool::new(false));
-        let stored_error = Rc::new(RwLock::new(None));
-
-        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
-
-        let inner = ReadableStreamInner::new(source, Box::new(strategy));
-
-        let controller = ReadableStreamDefaultController::new(
-            ctrl_tx.clone(),
-            Rc::clone(&queue_total_size),
-            Rc::clone(&high_water_mark),
-            Rc::clone(&desired_size),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-        );
-
-        let task_fut = readable_stream_task(
-            command_rx,
-            ctrl_rx,
-            inner,
-            Rc::clone(&queue_total_size),
-            Rc::clone(&high_water_mark),
-            Rc::clone(&desired_size),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-            Rc::clone(&stored_error),
-            ctrl_tx,
-            controller.clone(),
-        );
-
-        spawn_fn(Box::pin(task_fut));
-
-        Self {
-            command_tx,
-            queue_total_size,
-            high_water_mark,
-            desired_size,
-            closed,
-            errored,
-            locked,
-            stored_error,
-            controller: controller.into(),
-            byte_state: None,
-            _phantom: PhantomData,
-        }
+        let (stream, task_fut) = Self::new_inner(source, strategy);
+        spawn_fn(task_fut);
+        stream
     }
 }
 
