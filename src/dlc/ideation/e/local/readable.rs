@@ -3229,13 +3229,11 @@ mod tests {
 
         // Create a writable sink that records chunks
         let sink = CountingSink::new();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(CountQueuingStrategy::new(10)),
-            |fut| {
+        let writable = super::WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(|fut| {
                 tokio::task::spawn_local(fut);
-            },
-        );
+            });
 
         // Pipe the readable into the writable
         readable.pipe_to(&writable, None).await.expect("pipe_to");
@@ -3365,13 +3363,9 @@ mod tests {
         });
 
         let sink = FailingWriteSink::new(2); // Fail after 2 successful writes
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         // Test: pipe_to should return error when destination write fails
         let pipe_result = readable.pipe_to(&writable, None).await;
@@ -3513,13 +3507,9 @@ mod tests {
         });
 
         let sink = TrackingSink::new();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         // Test: pipe_to should return error when source errors
         let pipe_result = readable.pipe_to(&writable, None).await;
@@ -3691,13 +3681,9 @@ mod tests {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let result = readable.pipe_to(&writable, None).await;
         assert!(result.is_ok(), "Normal pipe should succeed");
@@ -3716,13 +3702,9 @@ mod tests {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let options = super::StreamPipeOptions {
             prevent_close: true,
@@ -3743,13 +3725,9 @@ mod tests {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let options = super::StreamPipeOptions {
             prevent_cancel: true,
@@ -3775,13 +3753,9 @@ mod tests {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let options = super::StreamPipeOptions {
             prevent_cancel: false,
@@ -3810,13 +3784,9 @@ mod tests {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new().with_error();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let options = super::StreamPipeOptions {
             prevent_abort: true,
@@ -3845,13 +3815,9 @@ mod tests {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new().with_error();
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let options = super::StreamPipeOptions {
             prevent_abort: false,
@@ -3979,13 +3945,9 @@ mod tests {
             sink.clone(),
             Box::new(crate::dlc::ideation::d::CountQueuingStrategy::new(10)),
         );*/
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         // Create abort controller and signal
         let (abort_handle, abort_registration) = futures_util::stream::AbortHandle::new_pair();
