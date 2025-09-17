@@ -950,8 +950,8 @@ where
 
         coordinator_spawn(Box::pin(coordinator.run()));
 
-        let stream1 = ReadableStream::new_with_spawn(source1, branch1_spawn);
-        let stream2 = ReadableStream::new_with_spawn(source2, branch2_spawn);
+        let stream1 = ReadableStream::builder(source1).spawn(branch1_spawn);
+        let stream2 = ReadableStream::builder(source2).spawn(branch2_spawn);
 
         (stream1, stream2)
     }
@@ -985,8 +985,8 @@ where
 
         spawn_fn(Box::pin(coordinator.run()));
 
-        let stream1 = ReadableStream::new_with_spawn_ref(source1, spawn_fn);
-        let stream2 = ReadableStream::new_with_spawn_ref(source2, spawn_fn);
+        let stream1 = ReadableStream::builder(source1).spawn_ref(spawn_fn);
+        let stream2 = ReadableStream::builder(source2).spawn_ref(spawn_fn);
 
         (stream1, stream2)
     }
@@ -1026,103 +1026,15 @@ pub struct StreamPipeOptions {
 }
 
 // ----------- Constructor Implementation  -----------
-impl<T: 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
-where
-    Source: ReadableSource<T>,
-{
-    /// Create a stream with the default `CountQueuingStrategy`.
-    pub fn new_default_with_spawn<F, R>(source: Source, spawner: F) -> Self
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        Self::new_default_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), spawner)
-    }
-
-    /// Create a stream with a custom queuing strategy.
-    pub fn new_default_with_strategy_and_spawn<S, F, R>(
-        source: Source,
-        strategy: S,
-        spawner: F,
-    ) -> Self
-    where
-        S: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        let (command_tx, command_rx) = unbounded();
-        let (ctrl_tx, ctrl_rx) = unbounded();
-        let queue_total_size = Rc::new(AtomicUsize::new(0));
-        let closed = Rc::new(AtomicBool::new(false));
-        let errored = Rc::new(AtomicBool::new(false));
-        let locked = Rc::new(AtomicBool::new(false));
-        let stored_error = Rc::new(RwLock::new(None));
-
-        let strategy: Box<dyn QueuingStrategy<T>> = Box::new(strategy);
-
-        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
-
-        let inner = ReadableStreamInner::new(source, strategy);
-
-        let controller = ReadableStreamDefaultController::new(
-            ctrl_tx.clone(),
-            Rc::clone(&queue_total_size),
-            Rc::clone(&high_water_mark),
-            Rc::clone(&desired_size),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-        );
-
-        // Spawn the stream task
-        let task_fut = readable_stream_task(
-            command_rx,
-            ctrl_rx,
-            inner,
-            Rc::clone(&queue_total_size),
-            Rc::clone(&high_water_mark),
-            Rc::clone(&desired_size),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-            Rc::clone(&stored_error),
-            ctrl_tx,
-            controller.clone(),
-        );
-
-        spawner(Box::pin(task_fut));
-
-        Self {
-            command_tx,
-            queue_total_size,
-            high_water_mark,
-            desired_size,
-            closed,
-            errored,
-            locked,
-            stored_error,
-            controller: controller.into(),
-            byte_state: None,
-            _phantom: PhantomData,
-        }
-    }
-}
 
 impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource,
 {
-    /// Create a byte stream with the default `CountQueuingStrategy`.
-    pub fn new_bytes_with_spawn<F>(source: Source, spawner: F) -> Self
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
-    {
-        Self::new_bytes_with_strategy_and_spawn(source, CountQueuingStrategy::new(1), spawner)
-    }
-
-    /// Create a byte stream with a custom queuing strategy.
-    pub fn new_bytes_with_strategy_and_spawn<S, F>(source: Source, strategy: S, spawner: F) -> Self
-    where
-        S: QueuingStrategy<Vec<u8>> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
-    {
+    pub(crate) fn new_bytes_inner(
+        source: Source,
+        strategy: Box<dyn QueuingStrategy<Vec<u8>> + 'static>,
+    ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = unbounded();
         let (_ctrl_tx, _ctrl_rx) = unbounded::<ByteControllerMsg>();
         let queue_total_size = Rc::new(AtomicUsize::new(0));
@@ -1131,12 +1043,8 @@ where
         let locked = Rc::new(AtomicBool::new(false));
         let stored_error = Rc::new(RwLock::new(None));
 
-        let strategy: Box<dyn QueuingStrategy<Vec<u8>>> = Box::new(strategy);
-
         let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
         let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
-
-        //let inner = ReadableStreamInner::new(source, strategy);
 
         let byte_state = ByteStreamState::new(source, strategy.high_water_mark());
         let controller = ReadableByteStreamController::new(byte_state.clone());
@@ -1144,9 +1052,7 @@ where
         let task_state = byte_state.clone();
         let task_fut = readable_byte_stream_task(task_state, command_rx, controller.clone());
 
-        spawner(Box::pin(task_fut));
-
-        Self {
+        let stream = Self {
             command_tx,
             queue_total_size,
             high_water_mark,
@@ -1158,7 +1064,9 @@ where
             controller: Rc::new(controller),
             byte_state: Some(byte_state),
             _phantom: PhantomData,
-        }
+        };
+
+        (stream, task_fut)
     }
 }
 
@@ -1222,98 +1130,6 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
         };
 
         (stream, Box::pin(task_fut))
-    }
-
-    pub fn new_with_spawn<F, R>(source: Source, spawn_fn: F) -> Self
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        let (stream, task_fut) = Self::new_inner(source, Box::new(CountQueuingStrategy::new(1)));
-        spawn_fn(Box::pin(task_fut));
-        stream
-    }
-
-    pub fn new_with_strategy_and_spawn<Strategy, F, R>(
-        source: Source,
-        strategy: Strategy,
-        spawn_fn: F,
-    ) -> Self
-    where
-        Strategy: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        let (stream, task_fut) = Self::new_inner(source, Box::new(strategy));
-        spawn_fn(Box::pin(task_fut));
-        stream
-    }
-
-    /// Create a new ReadableStream using a shared `'static` spawn function reference.
-    pub fn new_with_spawn_ref<F, R>(source: Source, spawn_fn: &'static F) -> Self
-    where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        let (stream, task_fut) = Self::new_inner(source, Box::new(CountQueuingStrategy::new(1)));
-        spawn_fn(Box::pin(task_fut));
-        stream
-    }
-
-    /// Full variant with strategy and shared spawn reference
-    pub fn new_with_strategy_and_spawn_ref<Strategy, F, R>(
-        source: Source,
-        strategy: Strategy,
-        spawn_fn: &'static F,
-    ) -> Self
-    where
-        Strategy: QueuingStrategy<T> + 'static,
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        let (stream, task_fut) = Self::new_inner(source, Box::new(strategy));
-        spawn_fn(Box::pin(task_fut));
-        stream
-    }
-}
-
-impl<T: 'static, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked>
-where
-    I: Iterator<Item = T> + 'static,
-{
-    pub fn from_iter<F, R>(iter: I, spawner: F) -> Self
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        Self::from_iter_with_strategy(iter, CountQueuingStrategy::new(1), spawner)
-    }
-
-    pub fn from_iter_with_strategy<S, F, R>(iter: I, strategy: S, spawner: F) -> Self
-    where
-        S: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        Self::new_default_with_strategy_and_spawn(IteratorSource { iter }, strategy, spawner)
-    }
-}
-
-impl<T: 'static, S> ReadableStream<T, AsyncStreamSource<S>, DefaultStream, Unlocked>
-where
-    S: Stream<Item = T> + Unpin + 'static,
-{
-    pub fn from_async_stream<F, R>(stream: S, spawner: F) -> Self
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        Self::from_async_stream_with_strategy(stream, CountQueuingStrategy::new(1), spawner)
-    }
-
-    pub fn from_async_stream_with_strategy<Strategy, F, R>(
-        stream: S,
-        strategy: Strategy,
-        spawner: F,
-    ) -> Self
-    where
-        Strategy: QueuingStrategy<T> + 'static,
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
-        Self::new_default_with_strategy_and_spawn(AsyncStreamSource { stream }, strategy, spawner)
     }
 }
 
@@ -2130,83 +1946,175 @@ pub async fn readable_byte_stream_task<Source>(
 }
 
 // ----------- Builder Pattern Implementation -----------
-pub struct ReadableStreamBuilder<
-    T,
-    Source,
-    StreamType = DefaultStream,
-    Strategy = CountQueuingStrategy,
-> where
+pub struct ReadableStreamBuilder<T, Source, StreamType = DefaultStream>
+where
     StreamType: StreamTypeMarker,
 {
     source: Source,
-    strategy: Option<Strategy>,
+    strategy: Box<dyn QueuingStrategy<T>>,
     _phantom: PhantomData<(T, StreamType)>,
 }
 
-impl<T, Source, StreamType> ReadableStreamBuilder<T, Source, StreamType>
+impl<T, Source> ReadableStreamBuilder<T, Source, DefaultStream>
 where
-    StreamType: StreamTypeMarker,
-{
-    pub fn new(source: Source) -> Self {
-        Self {
-            source,
-            strategy: None,
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn with_strategy<S>(self, strategy: S) -> ReadableStreamBuilder<T, Source, StreamType, S>
-    where
-        S: QueuingStrategy<T> + 'static,
-    {
-        ReadableStreamBuilder {
-            source: self.source,
-            strategy: Some(strategy),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T: 'static, Source> ReadableStreamBuilder<T, Source, DefaultStream>
-where
+    T: 'static,
     Source: ReadableSource<T>,
 {
-    pub fn build_with_spawn<F, R>(
+    fn new(source: Source) -> Self {
+        Self {
+            source,
+            strategy: Box::new(CountQueuingStrategy::new(1)),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn strategy<S: QueuingStrategy<T> + 'static>(mut self, s: S) -> Self {
+        self.strategy = Box::new(s);
+        self
+    }
+
+    /// Return stream + future without spawning
+    pub fn prepare(
         self,
-        spawn_fn: F,
-    ) -> ReadableStream<T, Source, DefaultStream, Unlocked>
+    ) -> (
+        ReadableStream<T, Source, DefaultStream, Unlocked>,
+        impl Future<Output = ()>,
+    ) {
+        ReadableStream::new_inner(self.source, self.strategy)
+    }
+
+    /// Spawn bundled into one task
+    pub fn spawn<F, R>(self, spawn_fn: F) -> ReadableStream<T, Source, DefaultStream, Unlocked>
     where
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let strategy = self
-            .strategy
-            .unwrap_or_else(|| CountQueuingStrategy::new(1));
+        let (stream, fut) = self.prepare();
+        spawn_fn(Box::pin(fut));
+        stream
+    }
 
-        ReadableStream::new_with_strategy_and_spawn(self.source, strategy, spawn_fn)
+    /// Spawn using a static function reference
+    pub fn spawn_ref<F, R>(
+        self,
+        spawn_fn: &'static F,
+    ) -> ReadableStream<T, Source, DefaultStream, Unlocked>
+    where
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let (stream, fut) = self.prepare();
+        spawn_fn(Box::pin(fut));
+        stream
     }
 }
 
+// Byte stream builder - specialized for Vec<u8>
 impl<Source> ReadableStreamBuilder<Vec<u8>, Source, ByteStream>
 where
     Source: ReadableByteSource,
 {
-    pub fn build_with_spawn<F>(
+    fn new_bytes(source: Source) -> Self {
+        Self {
+            source,
+            strategy: Box::new(CountQueuingStrategy::new(1)),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn strategy<S: QueuingStrategy<Vec<u8>> + 'static>(mut self, s: S) -> Self {
+        self.strategy = Box::new(s);
+        self
+    }
+
+    /// Return stream + future without spawning
+    pub fn prepare(
         self,
-        spawn_fn: F,
+    ) -> (
+        ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>,
+        impl Future<Output = ()>,
+    ) {
+        ReadableStream::new_bytes_inner(self.source, self.strategy)
+    }
+
+    /// Spawn with an owned spawner function
+    pub fn spawn<F, R>(self, spawn_fn: F) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+    where
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let (stream, fut) = self.prepare();
+        spawn_fn(Box::pin(fut));
+        stream
+    }
+
+    /// Spawn using a static spawner function reference
+    pub fn spawn_ref<F, R>(
+        self,
+        spawn_fn: &'static F,
     ) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let strategy = self
-            .strategy
-            .unwrap_or_else(|| CountQueuingStrategy::new(1));
-
-        ReadableStream::new_bytes_with_strategy_and_spawn(self.source, strategy, spawn_fn)
+        let (stream, fut) = self.prepare();
+        spawn_fn(Box::pin(fut));
+        stream
     }
 }
 
-// Convenience constructors
-impl<T> ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream> {
+// Main ReadableStream impl - default streams
+impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
+where
+    T: 'static,
+    Source: ReadableSource<T>,
+{
+    /// Returns a builder for this readable stream
+    pub fn builder(source: Source) -> ReadableStreamBuilder<T, Source, DefaultStream> {
+        ReadableStreamBuilder::new(source)
+    }
+}
+
+// Shortcut methods on ReadableStream for common cases
+impl<T: 'static> ReadableStream<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream, Unlocked> {
+    /// Create from Vec - shortcut for ReadableStreamBuilder::from_vec()
+    pub fn from_vec(
+        vec: Vec<T>,
+    ) -> ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream> {
+        ReadableStreamBuilder::from_vec(vec)
+    }
+}
+
+impl<T: 'static, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked>
+where
+    I: Iterator<Item = T> + 'static,
+{
+    /// Create from Iterator - shortcut for ReadableStreamBuilder::from_iterator()
+    pub fn from_iterator(iter: I) -> ReadableStreamBuilder<T, IteratorSource<I>, DefaultStream> {
+        ReadableStreamBuilder::from_iterator(iter)
+    }
+}
+
+impl<T: 'static, S> ReadableStream<T, AsyncStreamSource<S>, DefaultStream, Unlocked>
+where
+    S: Stream<Item = T> + Unpin + 'static,
+{
+    /// Create from Stream - shortcut for ReadableStreamBuilder::from_stream()
+    pub fn from_stream(stream: S) -> ReadableStreamBuilder<T, AsyncStreamSource<S>, DefaultStream> {
+        ReadableStreamBuilder::from_stream(stream)
+    }
+}
+
+// Byte streams
+impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+where
+    Source: ReadableByteSource,
+{
+    /// Returns a builder for byte streams
+    pub fn builder_bytes(source: Source) -> ReadableStreamBuilder<Vec<u8>, Source, ByteStream> {
+        ReadableStreamBuilder::new_bytes(source)
+    }
+}
+
+// Convenience constructors as static methods on the builder
+impl<T: 'static> ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream> {
+    /// Create a builder from a Vec
     pub fn from_vec(vec: Vec<T>) -> Self {
         Self::new(IteratorSource {
             iter: vec.into_iter(),
@@ -2214,30 +2122,23 @@ impl<T> ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>, DefaultS
     }
 }
 
-impl<T, I> ReadableStreamBuilder<T, IteratorSource<I>, DefaultStream>
+impl<T: 'static, I> ReadableStreamBuilder<T, IteratorSource<I>, DefaultStream>
 where
-    I: Iterator<Item = T>,
+    I: Iterator<Item = T> + 'static,
 {
+    /// Create a builder from an Iterator
     pub fn from_iterator(iter: I) -> Self {
         Self::new(IteratorSource { iter })
     }
 }
 
-impl<T, S> ReadableStreamBuilder<T, AsyncStreamSource<S>, DefaultStream>
+impl<T: 'static, S> ReadableStreamBuilder<T, AsyncStreamSource<S>, DefaultStream>
 where
-    S: Stream<Item = T> + Unpin,
+    S: Stream<Item = T> + Unpin + 'static,
 {
+    /// Create a builder from a Stream
     pub fn from_stream(stream: S) -> Self {
         Self::new(AsyncStreamSource { stream })
-    }
-}
-
-impl<T, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
-where
-    StreamType: StreamTypeMarker,
-{
-    pub fn builder(source: Source) -> ReadableStreamBuilder<T, Source, StreamType> {
-        ReadableStreamBuilder::new(source)
     }
 }
 
@@ -2249,7 +2150,8 @@ mod tests_old {
     #[localtest_macros::localset_test]
     async fn test_iterator_source_basic() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), tokio::task::spawn_local);
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked_stream, reader) = stream.get_reader();
 
         // Read all items
@@ -2263,7 +2165,7 @@ mod tests_old {
     #[localtest_macros::localset_test]
     async fn test_stream_closes_on_iterator_end() {
         let empty_data: Vec<i32> = vec![];
-        let stream = ReadableStream::from_iter(empty_data.into_iter(), |fut| {
+        let stream = ReadableStream::from_iterator(empty_data.into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked_stream, reader) = stream.get_reader();
@@ -2279,9 +2181,8 @@ mod tests_old {
     #[localtest_macros::localset_test]
     async fn test_cancel_stream() {
         let data = vec![1, 2, 3, 4, 5];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked_stream, reader) = stream.get_reader();
 
         // Read one item
@@ -2337,9 +2238,7 @@ mod tests_old {
             pos: 0,
         };
 
-        let stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
         let (_locked_stream, reader) = stream.get_reader();
 
         // Read data
@@ -2403,9 +2302,7 @@ mod tests_old {
             current: 0,
         };
 
-        let stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
         let (_locked_stream, byob_reader) = stream.get_byob_reader();
 
         let mut buffer = [0u8; 10];
@@ -2464,9 +2361,7 @@ mod tests_old {
             offset: 0,
         };
 
-        let stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
         let (_locked_stream, byob_reader) = stream.get_byob_reader();
 
         let mut buffer = [0u8; 10];
@@ -2496,7 +2391,7 @@ mod tests_old {
             }
         }
 
-        let stream = ReadableStream::new_default_with_spawn(ErrorSource, tokio::task::spawn_local);
+        let stream = ReadableStream::builder(ErrorSource).spawn(tokio::task::spawn_local);
         let (_locked_stream, reader) = stream.get_reader();
 
         // Should get the error
@@ -2510,9 +2405,8 @@ mod tests_old {
     #[localtest_macros::localset_test]
     async fn test_reader_lock_unlock() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         assert!(!stream.locked()); // Initially unlocked
 
@@ -2528,9 +2422,8 @@ mod tests_old {
     #[localtest_macros::localset_test]
     async fn test_cannot_get_multiple_readers() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (_locked_stream, _reader1) = stream.get_reader();
         // At this point, trying to get another reader from the original stream
@@ -2552,7 +2445,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_basic_stream_read_sequence() {
         let data = vec![1, 2, 3, 4, 5];
-        let stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
+        let stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -2569,9 +2462,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_stream_state_transitions() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Stream starts readable
@@ -2589,7 +2481,7 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_empty_stream_immediate_close() {
         let empty: Vec<i32> = vec![];
-        let stream = ReadableStream::from_iter(empty.into_iter(), |fut| {
+        let stream = ReadableStream::from_iterator(empty.into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -2604,9 +2496,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_stream_locking_behavior() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // Initially unlocked
         assert!(!stream.locked());
@@ -2622,9 +2513,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_reader_auto_unlock_on_drop() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let locked_ref = Rc::clone(&stream.locked);
 
         {
@@ -2641,9 +2531,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_stream_cancellation() {
         let data = vec![1, 2, 3, 4, 5];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Read partial data
@@ -2662,9 +2551,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_cancel_without_reason() {
         let data = vec![1, 2, 3];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Cancel without reason should work
@@ -2705,7 +2593,7 @@ mod tests {
         let source = ErroringSource {
             call_count: std::cell::RefCell::new(0),
         };
-        let stream = ReadableStream::new_default_with_spawn(source, |fut| {
+        let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -2731,7 +2619,7 @@ mod tests {
         let async_stream = stream::iter(items.clone());
 
         let readable_stream =
-            ReadableStream::from_async_stream(async_stream, tokio::task::spawn_local);
+            ReadableStream::from_stream(async_stream).spawn(tokio::task::spawn_local);
         let (_locked, reader) = readable_stream.get_reader();
 
         // Should read all items from async stream
@@ -2746,7 +2634,7 @@ mod tests {
         use futures::StreamExt;
 
         let data = vec!["hello", "world", "test"];
-        let stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
+        let stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, _reader) = stream.get_reader();
@@ -2791,7 +2679,7 @@ mod tests {
             pos: 0,
         };
 
-        let mut stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
+        let mut stream = ReadableStream::builder_bytes(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         // Note: AsyncRead integration would need actual implementation
@@ -2856,9 +2744,7 @@ mod tests {
             index: std::cell::RefCell::new(0),
         };
 
-        let stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Collect ALL data from the stream
@@ -2903,9 +2789,7 @@ mod tests {
             consumed: std::cell::RefCell::new(false),
         };
 
-        let stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
         let (_locked, byob_reader) = stream.get_byob_reader();
 
         let mut buffer = [0u8; 20];
@@ -2953,7 +2837,7 @@ mod tests {
             index: std::cell::RefCell::new(0),
         };
 
-        let stream = ReadableStream::new_default_with_spawn(source, |fut| {
+        let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -2993,7 +2877,7 @@ mod tests {
             sent_items: std::cell::RefCell::new(false),
         };
 
-        let stream = ReadableStream::new_default_with_spawn(source, |fut| {
+        let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -3013,9 +2897,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_concurrent_reads() {
         let data: Vec<i32> = (0..10).collect();
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Multiple concurrent read attempts - only one should succeed at a time
@@ -3033,9 +2916,8 @@ mod tests {
     #[localtest_macros::localset_test]
     async fn test_reader_closed_notification() {
         let data = vec![1];
-        let stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Start waiting for close
@@ -3059,7 +2941,7 @@ mod tests {
         let large_data: Vec<i32> = (0..1000).collect();
         let expected_sum: i32 = large_data.iter().sum();
 
-        let stream = ReadableStream::from_iter(large_data.into_iter(), |fut| {
+        let stream = ReadableStream::from_iterator(large_data.into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -3115,7 +2997,7 @@ mod tests {
             enqueued: Rc::new(Mutex::new(false)),
         };
 
-        let stream = super::ReadableStream::new_default_with_spawn(source, |fut| {
+        let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked_stream, reader) = stream.get_reader();
@@ -3153,7 +3035,7 @@ mod tests {
         }
 
         let source = FailingStartSource;
-        let stream = super::ReadableStream::new_default_with_spawn(source, |fut| {
+        let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked_stream, reader) = stream.get_reader();
@@ -3223,9 +3105,8 @@ mod tests {
 
         // Create a readable that yields three chunks
         let data = vec![vec![1u8, 2, 3], vec![4u8, 5], vec![6u8]];
-        let readable = super::ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let readable =
+            ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
         // Create a writable sink that records chunks
         let sink = CountingSink::new();
@@ -3358,7 +3239,7 @@ mod tests {
 
         let source = TrackingSource::new(data.clone());
         let cancelled_flag = Rc::clone(&source.cancelled);
-        let readable = super::ReadableStream::new_default_with_spawn(source, |fut| {
+        let readable = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
 
@@ -3502,7 +3383,7 @@ mod tests {
         let data = vec![vec![1u8, 2, 3], vec![4u8, 5, 6]];
 
         let source = ErroringSource::new(data.clone(), 2); // Error after 2 chunks
-        let readable = super::ReadableStream::new_default_with_spawn(source, |fut| {
+        let readable = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
 
@@ -3677,7 +3558,7 @@ mod tests {
         // Test successful pipe with normal cleanup
         let data = vec![vec![1u8, 2, 3], vec![4u8, 5, 6]];
         let source = TestSource::new(data.clone());
-        let readable = super::ReadableStream::new_default_with_spawn(source.clone(), |fut| {
+        let readable = ReadableStream::builder(source.clone()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
@@ -3698,7 +3579,7 @@ mod tests {
         // Test prevent_close = true
         let data = vec![vec![7u8, 8, 9]];
         let source = TestSource::new(data.clone());
-        let readable = super::ReadableStream::new_default_with_spawn(source, |fut| {
+        let readable = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
@@ -3721,7 +3602,7 @@ mod tests {
         // Test source error with prevent_cancel = true
         let data = vec![vec![1u8, 2], vec![3u8, 4]];
         let source = TestSource::new(data).with_error_after(1);
-        let readable = super::ReadableStream::new_default_with_spawn(source.clone(), |fut| {
+        let readable = ReadableStream::builder(source.clone()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
@@ -3749,7 +3630,7 @@ mod tests {
         // Test source error with prevent_cancel = false
         let data = vec![vec![1u8, 2], vec![3u8, 4]];
         let source = TestSource::new(data).with_error_after(1);
-        let readable = super::ReadableStream::new_default_with_spawn(source.clone(), |fut| {
+        let readable = ReadableStream::builder(source.clone()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new();
@@ -3780,7 +3661,7 @@ mod tests {
         // IMPORTANT write long enough so that a ready call catches an error with the sink
         let data = vec![vec![1u8, 2], vec![3u8, 4], vec![6u8, 7]];
         let source = TestSource::new(data);
-        let readable = super::ReadableStream::new_default_with_spawn(source.clone(), |fut| {
+        let readable = ReadableStream::builder(source.clone()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new().with_error();
@@ -3811,7 +3692,7 @@ mod tests {
         // IMPORTANT write long enough so that a ready call catches an error with the sink
         let data = vec![vec![1u8, 2], vec![3u8, 4], vec![6u8, 7]];
         let source = TestSource::new(data);
-        let readable = super::ReadableStream::new_default_with_spawn(source.clone(), |fut| {
+        let readable = ReadableStream::builder(source.clone()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let sink = TestSink::new().with_error();
@@ -3936,9 +3817,8 @@ mod tests {
             vec![13u8, 14, 15],
         ];
 
-        let readable = super::ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let readable =
+            ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
         let sink = SlowSink::new(100); // 100ms delay per write
 
         /*let writable = super::WritableStream::new(
@@ -4073,7 +3953,7 @@ mod tests {
             call_counter: Rc::clone(&counter),
         };
 
-        let stream = ReadableStream::builder(source).build_with_spawn(|fut| {
+        let stream = ReadableStream::builder_bytes(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -4136,9 +4016,7 @@ mod tests {
             pull_called: Rc::clone(&pull_called),
         };
 
-        let stream = ReadableStream::new_bytes_with_spawn(source, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
         let (_locked, reader) = stream.get_reader();
 
         // Give the stream task time to call start and fail
@@ -4239,7 +4117,7 @@ mod tests {
             start_completed: Rc::clone(&start_completed),
         };
 
-        let stream = ReadableStream::builder(source).build_with_spawn(|fut| {
+        let stream = ReadableStream::builder_bytes(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = stream.get_reader();
@@ -4272,106 +4150,39 @@ mod tests {
 #[cfg(test)]
 mod builder_tests {
     use super::*;
-    use futures::stream::iter as stream_iter;
-    use std::sync::Mutex;
-    use std::thread;
-    use std::time::Duration;
 
-    // Simple test source for verification
-    struct TestSource {
-        data: Vec<String>,
-        index: usize,
-        closed: bool,
+    // Mock source for testing
+    pub struct TestSource {
+        pub data: Vec<String>,
+        pub index: usize,
     }
 
     impl TestSource {
-        fn new(data: Vec<String>) -> Self {
-            Self {
-                data,
-                index: 0,
-                closed: false,
-            }
+        pub fn new(data: Vec<String>) -> Self {
+            Self { data, index: 0 }
         }
     }
 
     impl ReadableSource<String> for TestSource {
         async fn pull(
             &mut self,
-            controller: &mut ReadableStreamDefaultController<String>,
-        ) -> StreamResult<()> {
-            if self.closed {
-                return Ok(());
-            }
-
-            if self.index >= self.data.len() {
-                controller.close()?;
-                self.closed = true;
-            } else {
+            controller: &mut super::ReadableStreamDefaultController<String>,
+        ) -> Result<(), super::super::super::errors::StreamError> {
+            if self.index < self.data.len() {
                 let item = self.data[self.index].clone();
                 self.index += 1;
                 controller.enqueue(item)?;
+            } else {
+                controller.close()?;
             }
             Ok(())
         }
     }
 
-    // Byte source for testing ByteStream builder
-    struct TestByteSource {
-        data: Vec<u8>,
-        position: usize,
-    }
-
-    impl TestByteSource {
-        fn new(data: Vec<u8>) -> Self {
-            Self { data, position: 0 }
-        }
-    }
-
-    impl ReadableByteSource for TestByteSource {
-        async fn pull(
-            &mut self,
-            controller: &mut ReadableByteStreamController,
-            buffer: &mut [u8],
-        ) -> StreamResult<usize> {
-            if self.position >= self.data.len() {
-                controller.close()?;
-                return Ok(0);
-            }
-
-            /*let remaining = self.data.len() - self.position;
-            let to_copy = std::cmp::min(buffer.len(), remaining);
-
-            buffer[..to_copy].copy_from_slice(&self.data[self.position..self.position + to_copy]);
-            self.position += to_copy;
-
-            //let chunk = buffer[..to_copy].to_vec();
-            //controller.enqueue(chunk)?;
-
-            Ok(to_copy)*/
-            // Enqueue all remaining data as one chunk
-            /*let chunk = self.data[self.position..].to_vec();
-            self.position = self.data.len();
-
-            controller.enqueue(chunk)?;
-            Ok(0) // Let reader handle buffer filling*/
-            let remaining = self.data.len() - self.position;
-            let to_copy = std::cmp::min(buffer.len(), remaining);
-
-            buffer[..to_copy].copy_from_slice(&self.data[self.position..self.position + to_copy]);
-            self.position += to_copy;
-
-            Ok(to_copy) // Return the number of bytes copied to the buffer
-        }
-    }
-
     #[localtest_macros::localset_test]
-    fn test_basic_default_stream_builder() {
-        let data = vec!["hello".to_string(), "world".to_string()];
-        let source = TestSource::new(data.clone());
-
-        let stream = ReadableStreamBuilder::new(source).build_with_spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
+    async fn test_builder_spawn() {
+        let source = TestSource::new(vec!["hello".to_string(), "world".to_string()]);
+        let stream = ReadableStream::builder(source).spawn(tokio::task::spawn_local);
         let (_, reader) = stream.get_reader();
 
         assert_eq!(reader.read().await.unwrap(), Some("hello".to_string()));
@@ -4380,245 +4191,83 @@ mod builder_tests {
     }
 
     #[localtest_macros::localset_test]
-    fn test_byte_stream_builder() {
-        let data = b"Hello, World!".to_vec();
-        let source = TestByteSource::new(data.clone());
+    async fn test_builder_prepare() {
+        let source = TestSource::new(vec!["test".to_string()]);
+        let (stream, fut) = ReadableStream::builder(source).prepare();
 
-        let stream = ReadableStreamBuilder::new(source).build_with_spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        let (_, reader) = stream.get_byob_reader();
+        // Spawn the task manually
+        tokio::task::spawn_local(fut);
 
-        let mut buffer = vec![0u8; 13];
-        //let bytes_read = reader.read(&mut buffer).await.unwrap().unwrap();
-        //println!("asserting bytes read");
-        //assert_eq!(bytes_read, 13);
-        //println!("asserting buffer");
-        //assert_eq!(buffer, b"Hello, World!");
-        //println!("all success")
-        match reader.read(&mut buffer).await.unwrap() {
-            bytes_read => {
-                assert_eq!(bytes_read, 13);
-                assert_eq!(buffer, b"Hello, World!".to_vec());
-            } //None => panic!("Expected data but stream ended"),
-        }
+        let (_, reader) = stream.get_reader();
+
+        assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    fn spawn_local_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
+        tokio::task::spawn_local(fut);
     }
 
     #[localtest_macros::localset_test]
-    fn test_builder_with_custom_strategy() {
-        let data = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let source = TestSource::new(data);
+    async fn test_builder_spawn_ref() {
+        let source = TestSource::new(vec!["reference".to_string()]);
+        let stream = ReadableStream::builder(source).spawn_ref(&spawn_local_fn);
+        let (_, reader) = stream.get_reader();
 
-        // Use a custom high water mark
+        assert_eq!(reader.read().await.unwrap(), Some("reference".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
+
+    #[localtest_macros::localset_test]
+    async fn test_builder_with_custom_strategy() {
+        let source = TestSource::new(vec!["custom".to_string()]);
         let custom_strategy = CountQueuingStrategy::new(5);
+        let stream = ReadableStream::builder(source)
+            .strategy(custom_strategy)
+            .spawn(tokio::task::spawn_local);
 
-        let stream = ReadableStreamBuilder::new(source)
-            .with_strategy(custom_strategy)
-            .build_with_spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
+        let (_, reader) = stream.get_reader();
 
-        // Verify the stream was created successfully
-        assert!(!stream.locked());
+        assert_eq!(reader.read().await.unwrap(), Some("custom".to_string()));
+        assert_eq!(reader.read().await.unwrap(), None);
+    }
 
+    #[localtest_macros::localset_test]
+    async fn test_from_vec_builder() {
+        let data = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let stream = ReadableStreamBuilder::from_vec(data).spawn(tokio::task::spawn_local);
         let (_, reader) = stream.get_reader();
 
         assert_eq!(reader.read().await.unwrap(), Some("a".to_string()));
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_builder_with_custom_spawn() {
-        let data = vec!["test".to_string()];
-        let source = TestSource::new(data);
-
-        // Track if custom spawn was called
-        let spawn_called = Rc::new(Mutex::new(false));
-        let spawn_called_clone = Rc::clone(&spawn_called);
-
-        let stream = ReadableStreamBuilder::new(source).build_with_spawn(move |fut| {
-            *spawn_called_clone.lock().unwrap() = true;
-            // Still need to actually run the future for the test to work
-            tokio::task::spawn_local(fut);
-        });
-
-        // Give the spawn function time to be called
-        thread::sleep(Duration::from_millis(10));
-        assert!(*spawn_called.lock().unwrap());
-
-        let (_, reader) = stream.get_reader();
-
-        assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_builder_chaining() {
-        let data = vec!["chain".to_string(), "test".to_string()];
-        let source = TestSource::new(data);
-
-        // Test method chaining
-        let stream = ReadableStreamBuilder::new(source)
-            .with_strategy(CountQueuingStrategy::new(2))
-            .build_with_spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-        let (_, reader) = stream.get_reader();
-
-        assert_eq!(reader.read().await.unwrap(), Some("chain".to_string()));
-        assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("b".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("c".to_string()));
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
     #[localtest_macros::localset_test]
-    fn test_from_vec_convenience() {
-        let data = vec!["item1".to_string(), "item2".to_string()];
-
-        let stream = ReadableStreamBuilder::from_vec(data.clone()).build_with_spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        let (_, reader) = stream.get_reader();
-
-        assert_eq!(reader.read().await.unwrap(), Some("item1".to_string()));
-        assert_eq!(reader.read().await.unwrap(), Some("item2".to_string()));
-        assert_eq!(reader.read().await.unwrap(), None);
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_from_iterator_convenience() {
-        let data = vec![1, 2, 3, 4, 5];
-        let iter = data.into_iter();
-
-        let stream = ReadableStreamBuilder::from_iterator(iter).build_with_spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
+    async fn test_from_iterator_builder() {
+        let numbers = vec![1, 2, 3];
+        let stream = ReadableStreamBuilder::from_iterator(numbers.into_iter())
+            .spawn(tokio::task::spawn_local);
         let (_, reader) = stream.get_reader();
 
         assert_eq!(reader.read().await.unwrap(), Some(1));
         assert_eq!(reader.read().await.unwrap(), Some(2));
         assert_eq!(reader.read().await.unwrap(), Some(3));
-        assert_eq!(reader.read().await.unwrap(), Some(4));
-        assert_eq!(reader.read().await.unwrap(), Some(5));
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
     #[localtest_macros::localset_test]
-    fn test_from_stream_convenience() {
-        let data = vec!["async1", "async2", "async3"];
-        let async_stream = stream_iter(data.into_iter().map(|s| s.to_string()));
-
-        let stream = ReadableStreamBuilder::from_stream(async_stream).build_with_spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
+    async fn test_from_stream_builder() {
+        let async_stream = futures::stream::iter(vec!["x", "y", "z"]);
+        let stream =
+            ReadableStreamBuilder::from_stream(async_stream).spawn(tokio::task::spawn_local);
         let (_, reader) = stream.get_reader();
 
-        assert_eq!(reader.read().await.unwrap(), Some("async1".to_string()));
-        assert_eq!(reader.read().await.unwrap(), Some("async2".to_string()));
-        assert_eq!(reader.read().await.unwrap(), Some("async3".to_string()));
+        assert_eq!(reader.read().await.unwrap(), Some("x"));
+        assert_eq!(reader.read().await.unwrap(), Some("y"));
+        assert_eq!(reader.read().await.unwrap(), Some("z"));
         assert_eq!(reader.read().await.unwrap(), None);
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_builder_reusability() {
-        // Test that we can create multiple builders with the same pattern
-        let create_stream = |data: Vec<&str>| {
-            let string_data: Vec<String> = data.into_iter().map(|s| s.to_string()).collect();
-            ReadableStreamBuilder::from_vec(string_data)
-                .with_strategy(CountQueuingStrategy::new(3))
-                .build_with_spawn(|fut| {
-                    tokio::task::spawn_local(fut);
-                })
-        };
-
-        let stream1 = create_stream(vec!["test1", "test2"]);
-        let stream2 = create_stream(vec!["test3", "test4"]);
-
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
-
-        // Verify both streams work independently
-        assert_eq!(reader1.read().await.unwrap(), Some("test1".to_string()));
-        assert_eq!(reader2.read().await.unwrap(), Some("test3".to_string()));
-        assert_eq!(reader1.read().await.unwrap(), Some("test2".to_string()));
-        assert_eq!(reader2.read().await.unwrap(), Some("test4".to_string()));
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_stream_static_builder_method() {
-        let data = vec!["static".to_string(), "method".to_string()];
-        let source = TestSource::new(data);
-
-        // Test the static builder method on ReadableStream
-        let stream: ReadableStream<String, TestSource, DefaultStream, Unlocked> =
-            ReadableStream::builder(source).build_with_spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-        let (_, reader) = stream.get_reader();
-
-        assert_eq!(reader.read().await.unwrap(), Some("static".to_string()));
-        assert_eq!(reader.read().await.unwrap(), Some("method".to_string()));
-        assert_eq!(reader.read().await.unwrap(), None);
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_error_handling_in_builder() {
-        // Test that errors in the source are properly handled
-        struct ErrorSource;
-
-        impl ReadableSource<String> for ErrorSource {
-            async fn pull(
-                &mut self,
-                controller: &mut ReadableStreamDefaultController<String>,
-            ) -> StreamResult<()> {
-                controller.error(StreamError::Custom("Test error".into()))?;
-                Ok(())
-            }
-        }
-
-        let stream = ReadableStreamBuilder::new(ErrorSource).build_with_spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        let (_, reader) = stream.get_reader();
-
-        match reader.read().await {
-            Err(StreamError::Custom(msg)) => {
-                assert!(msg.to_string().contains("Test error"));
-            }
-            other => panic!("Expected custom error, got: {:?}", other),
-        }
-    }
-
-    #[localtest_macros::localset_test]
-    fn test_multiple_configurations() {
-        // Test different configuration combinations
-        let configs = vec![
-            // Default config
-            ReadableStreamBuilder::from_vec(vec!["default".to_string()]),
-            // With custom strategy
-            ReadableStreamBuilder::from_vec(vec!["strategy".to_string()])
-                .with_strategy(CountQueuingStrategy::new(10)),
-            // With thread spawn
-            ReadableStreamBuilder::from_vec(vec!["thread".to_string()]),
-            // Full config
-            ReadableStreamBuilder::from_vec(vec!["full".to_string()])
-                .with_strategy(CountQueuingStrategy::new(5)),
-        ];
-
-        for (i, builder) in configs.into_iter().enumerate() {
-            let stream = builder.build_with_spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-            let (_, reader) = stream.get_reader();
-
-            let result = reader.read().await.unwrap().unwrap();
-            match i {
-                0 => assert_eq!(result, "default"),
-                1 => assert_eq!(result, "strategy"),
-                2 => assert_eq!(result, "thread"),
-                3 => assert_eq!(result, "full"),
-                _ => unreachable!(),
-            }
-        }
     }
 }
 
@@ -4661,9 +4310,8 @@ mod pipe_through_tests {
     async fn test_pipe_through_basic() {
         // Create source stream
         let data = vec!["hello".to_string(), "world".to_string()];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // Create transform
         let transform =
@@ -4697,9 +4345,8 @@ mod pipe_through_tests {
     #[localtest_macros::localset_test]
     async fn test_pipe_through_numbers() {
         let data = vec![1, 2, 3, 4];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let transform = TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
@@ -4718,9 +4365,8 @@ mod pipe_through_tests {
     #[localtest_macros::localset_test]
     async fn test_pipe_through_empty_stream() {
         let data: Vec<String> = vec![];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let transform =
             TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
@@ -4737,9 +4383,8 @@ mod pipe_through_tests {
     async fn test_pipe_through_chained() {
         // Test chaining multiple transforms
         let data = vec![1, 2, 3];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // First transform: double
         let transform1 =
@@ -4767,9 +4412,8 @@ mod pipe_through_tests {
     #[localtest_macros::localset_test]
     async fn test_pipe_through_with_options() {
         let data = vec!["test".to_string()];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let transform =
             TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
@@ -4812,9 +4456,8 @@ mod pipe_through_tests {
         }
 
         let data = vec![1, 2, 3, 4];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let transform = TransformStream::builder(ErrorTransformer).spawn(tokio::task::spawn_local);
         let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
@@ -4875,9 +4518,8 @@ mod tee_tests {
     async fn test_tee_basic() {
         // Create source stream
         let data = vec![1, 2, 3, 4];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // Tee the stream
         let (stream1, stream2) = source_stream.tee_with_spawn(
@@ -4917,9 +4559,8 @@ mod tee_tests {
     #[localtest_macros::localset_test]
     async fn test_tee_different_read_speeds() {
         let data = vec![1, 2, 3];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_spawn(
             |fut| {
@@ -4951,9 +4592,8 @@ mod tee_tests {
     #[localtest_macros::localset_test]
     async fn test_tee_one_branch_cancel() {
         let data = vec![1, 2, 3, 4];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_spawn(
             |fut| {
@@ -4989,9 +4629,8 @@ mod tee_tests {
     #[localtest_macros::localset_test]
     async fn test_tee_both_branches_cancel() {
         let data = vec![1, 2, 3, 4];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_spawn(
             |fut| {
@@ -5032,9 +4671,8 @@ mod tee_tests {
     #[localtest_macros::localset_test]
     async fn test_tee_empty_stream() {
         let data: Vec<i32> = vec![];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_spawn(
             |fut| {
@@ -5078,7 +4716,7 @@ mod tee_tests {
         }
 
         let error_stream =
-            ReadableStream::new_with_spawn(ErrorSource { count: 0 }, tokio::task::spawn_local);
+            ReadableStream::builder(ErrorSource { count: 0 }).spawn(tokio::task::spawn_local);
         let (stream1, stream2) = error_stream.tee_with_spawn(
             |fut| {
                 tokio::task::spawn_local(fut);
@@ -5117,9 +4755,8 @@ mod tee_tests {
     async fn test_tee_chained() {
         // Test tee of a tee (multiple levels)
         let data = vec![1, 2];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // First level tee
         let (stream1, stream2) = source_stream.tee_with_spawn(
@@ -5171,9 +4808,8 @@ mod tee_tests {
     async fn test_tee_with_pipe_operations() {
         // Test that tee branches can be used in pipe operations
         let data = vec![1, 2, 3];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_spawn(
             |fut| {
@@ -5212,9 +4848,8 @@ mod tee_tests {
     async fn test_tee_string_data() {
         // Test with string data to ensure cloning works for different types
         let data = vec!["hello".to_string(), "world".to_string()];
-        let source_stream = ReadableStream::from_iter(data.into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_spawn(
             |fut| {
@@ -5250,9 +4885,8 @@ mod backpressure_tee_tests {
     #[localtest_macros::localset_test]
     async fn test_spec_compliant_fast_reader_not_throttled() {
         let data: Vec<i32> = (1..=10).collect();
-        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
             BackpressureMode::Unbounded,
@@ -5310,9 +4944,8 @@ mod backpressure_tee_tests {
     async fn test_slowest_consumer_fast_reader_throttled() {
         let data: Vec<i32> = (1..=10).collect();
         let buffer_size = 2;
-        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
             BackpressureMode::SlowestConsumer,
@@ -5376,9 +5009,8 @@ mod backpressure_tee_tests {
     async fn test_independent_mode_separate_limits() {
         let data: Vec<i32> = (1..=10).collect();
         let buffer_size = 2;
-        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
             BackpressureMode::SpecCompliant,
@@ -5448,9 +5080,8 @@ mod backpressure_tee_tests {
     async fn test_buffer_limit_enforcement() {
         let data: Vec<i32> = (1..=8).collect();
         let buffer_size = 1;
-        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let source_stream =
+            ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
         let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
             BackpressureMode::SlowestConsumer,
@@ -5526,7 +5157,7 @@ mod spawn_variant_tests {
         }
 
         let data = test_data();
-        let source_stream = ReadableStream::from_iter(data.clone().into_iter(), spawn_fn);
+        let source_stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(spawn_fn);
 
         // Tee with shared spawn function
         let (stream1, stream2) = source_stream.tee_with_spawn_ref(&spawn_fn);
