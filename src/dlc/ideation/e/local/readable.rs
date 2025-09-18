@@ -656,9 +656,10 @@ where
     backpressure_mode: BackpressureMode,
     branch1_pending_count: Option<Rc<AtomicUsize>>,
     branch2_pending_count: Option<Rc<AtomicUsize>>,
-    max_buffer_per_branch: usize,
 
     backpressure_signal: Option<AsyncSignal>,
+    branch1_high_water_mark: usize,
+    branch2_high_water_mark: usize,
 }
 
 impl<T, Source, StreamType, LockState> TeeCoordinator<T, Source, StreamType, LockState>
@@ -695,20 +696,23 @@ where
             .unwrap()
             .load(Ordering::SeqCst);
 
+        let branch1_hwm = self.branch1_high_water_mark;
+        let branch2_hwm = self.branch2_high_water_mark;
+
         match self.backpressure_mode {
             BackpressureMode::Unbounded => branch1_active || branch2_active,
             BackpressureMode::SlowestConsumer => {
-                let b1_ok = !branch1_active || branch1_pending < self.max_buffer_per_branch;
-                let b2_ok = !branch2_active || branch2_pending < self.max_buffer_per_branch;
+                let b1_ok = !branch1_active || branch1_pending < branch1_hwm;
+                let b2_ok = !branch2_active || branch2_pending < branch2_hwm;
                 b1_ok && b2_ok
             }
             BackpressureMode::Aggregate => {
                 let total = branch1_pending + branch2_pending;
-                total < (self.max_buffer_per_branch * 2)
+                total < (branch1_hwm + branch2_hwm)
             }
             BackpressureMode::SpecCompliant => {
-                let b1_can = !branch1_active || branch1_pending < self.max_buffer_per_branch;
-                let b2_can = !branch2_active || branch2_pending < self.max_buffer_per_branch;
+                let b1_can = !branch1_active || branch1_pending < branch1_hwm;
+                let b2_can = !branch2_active || branch2_pending < branch2_hwm;
                 b1_can || b2_can
             }
         }
@@ -720,19 +724,27 @@ where
         let branch2_active =
             !self.branch2_canceled.load(Ordering::SeqCst) && !self.branch2_tx.is_closed();
 
+        //let branch1_hwm = self.branch1_high_water_mark;
+        //let branch2_hwm = self.branch2_high_water_mark;
+
         // Try send to branch1
         if branch1_active {
-            let should_send = match self.backpressure_mode {
+            /*let should_send = match self.backpressure_mode {
                 BackpressureMode::Unbounded => true,
                 _ => {
                     // If we don't have a pending count, be permissive (shouldn't happen for non-Unbounded)
                     if let Some(p) = &self.branch1_pending_count {
-                        p.load(Ordering::SeqCst) < self.max_buffer_per_branch
+                        p.load(Ordering::SeqCst) < branch1_hwm
                     } else {
                         true
                     }
                 }
-            };
+            };*/
+            // Always send.
+            // backpressure modes should be handled by should_pull, which prevents the pull in the first place.
+            // There should not be a check here
+            // doing a check will not only be redundant, but will introduce bugs where some data is lost and cause inconsistency with the mode configurations
+            let should_send = true;
 
             if should_send {
                 if self
@@ -751,16 +763,21 @@ where
 
         // Branch2
         if branch2_active {
-            let should_send = match self.backpressure_mode {
+            /*let should_send = match self.backpressure_mode {
                 BackpressureMode::Unbounded => true,
                 _ => {
                     if let Some(p) = &self.branch2_pending_count {
-                        p.load(Ordering::SeqCst) < self.max_buffer_per_branch
+                        p.load(Ordering::SeqCst) < branch2_hwm
                     } else {
                         true
                     }
                 }
-            };
+            };*/
+            // Always send.
+            // backpressure modes should be handled by should_pull, which prevents the pull in the first place.
+            // There should not be a check here
+            // doing a check will not only be redundant, but will introduce bugs where some data is lost and cause inconsistency with the mode configurations
+            let should_send = true;
 
             if should_send {
                 if self
@@ -778,7 +795,7 @@ where
         }
     }
 
-    async fn run(mut self) {
+    async fn run(self) {
         loop {
             // termination check
             let branch1_dead =
@@ -846,11 +863,10 @@ where
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
-    coordinator: TeeCoordinator<T, Source, S, Locked>,
-    source1: TeeSource<T>,
-    source2: TeeSource<T>,
     mode: BackpressureMode,
-    max_buffer_per_branch: Option<usize>,
+    stream: ReadableStream<T, Source, S, Unlocked>,
+    branch1_strategy: Box<dyn QueuingStrategy<T>>,
+    branch2_strategy: Box<dyn QueuingStrategy<T>>,
 }
 
 impl<T, Source, S> TeeBuilder<T, Source, S>
@@ -859,13 +875,45 @@ where
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
+    fn new(stream: ReadableStream<T, Source, S, Unlocked>) -> Self {
+        Self {
+            stream,
+            mode: BackpressureMode::SpecCompliant,
+            branch1_strategy: Box::new(CountQueuingStrategy::new(1)),
+            branch2_strategy: Box::new(CountQueuingStrategy::new(1)),
+        }
+    }
+
     pub fn backpressure_mode(mut self, mode: BackpressureMode) -> Self {
         self.mode = mode;
         self
     }
 
-    pub fn max_buffer(mut self, max: usize) -> Self {
-        self.max_buffer_per_branch = Some(max);
+    /// Set queuing strategy for the first branch
+    pub fn branch1_strategy<Strategy: QueuingStrategy<T> + 'static>(
+        mut self,
+        strategy: Strategy,
+    ) -> Self {
+        self.branch1_strategy = Box::new(strategy);
+        self
+    }
+
+    /// Set queuing strategy for the second branch
+    pub fn branch2_strategy<Strategy: QueuingStrategy<T> + 'static>(
+        mut self,
+        strategy: Strategy,
+    ) -> Self {
+        self.branch2_strategy = Box::new(strategy);
+        self
+    }
+
+    /// Set the same queuing strategy for both branches
+    pub fn strategy<Strategy: QueuingStrategy<T> + 'static + Clone>(
+        mut self,
+        strategy: Strategy,
+    ) -> Self {
+        self.branch1_strategy = Box::new(strategy.clone());
+        self.branch2_strategy = Box::new(strategy);
         self
     }
 
@@ -879,19 +927,8 @@ where
         impl Future<Output = ()>, // branch1 future
         impl Future<Output = ()>, // branch2 future
     ) {
-        let TeeBuilder {
-            coordinator,
-            source1,
-            source2,
-            ..
-        } = self;
-
-        let (stream1, rfut1) = ReadableStream::builder(source1).prepare();
-        let (stream2, rfut2) = ReadableStream::builder(source2).prepare();
-
-        let coordinator_fut = coordinator.run();
-
-        (stream1, stream2, coordinator_fut, rfut1, rfut2)
+        self.stream
+            .tee_inner(self.mode, self.branch1_strategy, self.branch2_strategy)
     }
 
     /// Spawn the coordinator and both branches in a single task using owned closures
@@ -914,7 +951,7 @@ where
     }
 
     /// Spawn the coordinator and both branches in a single task using a 'static function reference.
-    pub fn spawn_ref<F>(
+    pub fn spawn_ref<F, R>(
         self,
         spawn_fn: &'static F,
     ) -> (
@@ -922,7 +959,7 @@ where
         ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
     )
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
         let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
         let fut = async move {
@@ -983,17 +1020,19 @@ where
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
-    fn tee_internal(
+    fn tee_inner(
         self,
         mode: BackpressureMode,
-        max_buffer_per_branch: Option<usize>,
+        branch1_strategy: Box<dyn QueuingStrategy<T>>,
+        branch2_strategy: Box<dyn QueuingStrategy<T>>,
     ) -> (
-        TeeCoordinator<T, Source, S, Locked>,
-        TeeSource<T>,
-        TeeSource<T>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        impl Future<Output = ()>, // coordinator future
+        impl Future<Output = ()>, // branch1 future
+        impl Future<Output = ()>, // branch2 future
     ) {
         let (_, reader) = self.get_reader();
-        let max_buffer = max_buffer_per_branch.unwrap_or(1000);
 
         let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
         let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
@@ -1012,6 +1051,9 @@ where
                 )
             };
 
+        let branch1_hwm = branch1_strategy.high_water_mark();
+        let branch2_hwm = branch2_strategy.high_water_mark();
+
         let coordinator = TeeCoordinator {
             reader,
             branch1_tx: branch1_tx.clone(),
@@ -1021,8 +1063,9 @@ where
             backpressure_mode: mode,
             branch1_pending_count: branch1_pending.clone(),
             branch2_pending_count: branch2_pending.clone(),
-            max_buffer_per_branch: max_buffer,
             backpressure_signal: backpressure_signal.clone(),
+            branch1_high_water_mark: branch1_hwm,
+            branch2_high_water_mark: branch2_hwm,
         };
 
         let source1 = TeeSource {
@@ -1041,29 +1084,16 @@ where
             backpressure_signal,
         };
 
-        (coordinator, source1, source2)
+        let (stream1, rfut1) = ReadableStream::new_inner(source1, branch1_strategy);
+        let (stream2, rfut2) = ReadableStream::new_inner(source2, branch2_strategy);
+
+        let coordinator_fut = coordinator.run();
+
+        (stream1, stream2, coordinator_fut, rfut1, rfut2)
     }
 
     pub fn tee(self) -> TeeBuilder<T, Source, S> {
-        self.tee_builder()
-    }
-
-    fn tee_builder(self) -> TeeBuilder<T, Source, S>
-    where
-        T: Clone + 'static,
-        Source: 'static,
-        S: StreamTypeMarker + 'static,
-    {
-        let (coordinator, source1, source2) =
-            self.tee_internal(BackpressureMode::SpecCompliant, Some(1000));
-
-        TeeBuilder {
-            coordinator,
-            source1,
-            source2,
-            mode: BackpressureMode::SpecCompliant,
-            max_buffer_per_branch: Some(1000),
-        }
+        TeeBuilder::new(self)
     }
 }
 
@@ -4597,7 +4627,10 @@ mod tee_tests {
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // Tee the stream
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
+        let (stream1, stream2) = source_stream
+            .tee()
+            //.backpressure_mode(BackpressureMode::Unbounded)
+            .spawn(tokio::task::spawn_local);
 
         // Get readers for both branches
         let (_, reader1) = stream1.get_reader();
@@ -4627,7 +4660,10 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
+        let (stream1, stream2) = source_stream
+            .tee()
+            //.backpressure_mode(BackpressureMode::Unbounded)
+            .spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4650,7 +4686,10 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
+        let (stream1, stream2) = source_stream
+            .tee()
+            //.backpressure_mode(BackpressureMode::Unbounded)
+            .spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4806,7 +4845,10 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
+        let (stream1, stream2) = source_stream
+            .tee()
+            //.backpressure_mode(BackpressureMode::Unbounded)
+            .spawn(tokio::task::spawn_local);
 
         // Use stream1 directly
         let (_, reader1) = stream1.get_reader();
@@ -4865,7 +4907,7 @@ mod backpressure_tee_tests {
 
         let (stream1, stream2) = source_stream
             .tee()
-            .backpressure_mode(BackpressureMode::Unbounded)
+            //.backpressure_mode(BackpressureMode::Unbounded)
             .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
@@ -4913,10 +4955,11 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
+        let strategy = CountQueuingStrategy::new(buffer_size);
         let (stream1, stream2) = source_stream
             .tee()
             .backpressure_mode(BackpressureMode::SlowestConsumer)
-            .max_buffer(buffer_size)
+            .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
@@ -4970,10 +5013,11 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
+        let strategy = CountQueuingStrategy::new(buffer_size);
         let (stream1, stream2) = source_stream
             .tee()
             .backpressure_mode(BackpressureMode::SpecCompliant)
-            .max_buffer(buffer_size)
+            .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
@@ -5033,10 +5077,11 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
+        let strategy = CountQueuingStrategy::new(buffer_size);
         let (stream1, stream2) = source_stream
             .tee()
             .backpressure_mode(BackpressureMode::SlowestConsumer)
-            .max_buffer(buffer_size)
+            .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
@@ -5102,7 +5147,10 @@ mod spawn_variant_tests {
         let source_stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(spawn_fn);
 
         // Tee with shared spawn function
-        let (stream1, stream2) = source_stream.tee().spawn_ref(&spawn_fn);
+        let (stream1, stream2) = source_stream
+            .tee()
+            //.backpressure_mode(BackpressureMode::Unbounded)
+            .spawn_ref(&spawn_fn);
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
