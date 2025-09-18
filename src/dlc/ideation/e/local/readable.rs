@@ -639,7 +639,7 @@ impl<T: 'static> ReadableSource<T> for TeeSource<T> {
     }
 }
 
-struct TeeCoordinator<T, Source, StreamType, LockState>
+pub struct TeeCoordinator<T, Source, StreamType, LockState>
 where
     T: Clone,
     StreamType: StreamTypeMarker,
@@ -840,6 +840,150 @@ where
     }
 }
 
+pub struct TeeBuilder<T, Source, S>
+where
+    T: Clone + 'static,
+    Source: 'static,
+    S: StreamTypeMarker + 'static,
+{
+    coordinator: TeeCoordinator<T, Source, S, Locked>,
+    source1: TeeSource<T>,
+    source2: TeeSource<T>,
+    mode: BackpressureMode,
+    max_buffer_per_branch: Option<usize>,
+}
+
+impl<T, Source, S> TeeBuilder<T, Source, S>
+where
+    T: Clone + 'static,
+    Source: 'static,
+    S: StreamTypeMarker + 'static,
+{
+    pub fn backpressure_mode(mut self, mode: BackpressureMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn max_buffer(mut self, max: usize) -> Self {
+        self.max_buffer_per_branch = Some(max);
+        self
+    }
+
+    /// Prepare without spawning tasks
+    pub fn prepare(
+        self,
+    ) -> (
+        TeeCoordinator<T, Source, S, Locked>,
+        TeeSource<T>,
+        TeeSource<T>,
+    ) {
+        (self.coordinator, self.source1, self.source2)
+    }
+
+    /// Spawn everything with owned closures
+    /// Spawn coordinator and both branches in a single task
+    pub fn spawn<F, R>(
+        self,
+        spawn_fn: F,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let TeeBuilder {
+            coordinator,
+            source1,
+            source2,
+            ..
+        } = self;
+
+        let (stream1, rfut1) = ReadableStream::builder(source1).prepare();
+        let (stream2, rfut2) = ReadableStream::builder(source2).prepare();
+
+        let fut = async move {
+            futures::join!(coordinator.run(), rfut1, rfut2);
+        };
+
+        spawn_fn(Box::pin(fut));
+
+        (stream1, stream2)
+    }
+
+    /// Spawn the coordinator and both branches in a single task using a 'static function reference.
+    pub fn spawn_ref<F>(
+        self,
+        spawn_fn: &'static F,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
+    {
+        let TeeBuilder {
+            coordinator,
+            source1,
+            source2,
+            ..
+        } = self;
+
+        let (stream1, rfut1) = ReadableStream::builder(source1).prepare();
+        let (stream2, rfut2) = ReadableStream::builder(source2).prepare();
+
+        let fut = async move {
+            futures::join!(coordinator.run(), rfut1, rfut2);
+        };
+
+        spawn_fn(Box::pin(fut));
+
+        (stream1, stream2)
+    }
+
+    /// Spawn each part separately with owned closures
+    pub fn spawn_parts<R1, R2, R3, F1, F2, F3>(
+        self,
+        coordinator_spawn: F1,
+        branch1_spawn: F2,
+        branch2_spawn: F3,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F1: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R1,
+        F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R2,
+        F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
+    {
+        coordinator_spawn(Box::pin(self.coordinator.run()));
+        let stream1 = ReadableStream::builder(self.source1).spawn(branch1_spawn);
+        let stream2 = ReadableStream::builder(self.source2).spawn(branch2_spawn);
+        (stream1, stream2)
+    }
+
+    /// Spawn each part separately using `'static` function references
+    pub fn spawn_parts_ref<R1, R2, R3, F1, F2, F3>(
+        self,
+        coordinator_spawn: &'static F1,
+        branch1_spawn: &'static F2,
+        branch2_spawn: &'static F3,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F1: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R1,
+        F2: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R2,
+        F3: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3,
+    {
+        coordinator_spawn(Box::pin(self.coordinator.run()));
+        let stream1 = ReadableStream::builder(self.source1).spawn_ref(branch1_spawn);
+        let stream2 = ReadableStream::builder(self.source2).spawn_ref(branch2_spawn);
+        (stream1, stream2)
+    }
+}
+
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Clone + 'static,
@@ -907,88 +1051,26 @@ where
         (coordinator, source1, source2)
     }
 
-    pub fn tee_with_spawn<C, B1, B2>(
-        self,
-        coordinator_spawn: C,
-        branch1_spawn: B1,
-        branch2_spawn: B2,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
-    where
-        C: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-        B1: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-        B2: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-    {
-        self.tee_with_options_and_spawn(
-            BackpressureMode::SpecCompliant,
-            Some(1000),
-            coordinator_spawn,
-            branch1_spawn,
-            branch2_spawn,
-        )
+    pub fn tee(self) -> TeeBuilder<T, Source, S> {
+        self.tee_builder()
     }
 
-    pub fn tee_with_options_and_spawn<C, B1, B2>(
-        self,
-        mode: BackpressureMode,
-        max_buffer_per_branch: Option<usize>,
-        coordinator_spawn: C,
-        branch1_spawn: B1,
-        branch2_spawn: B2,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
+    fn tee_builder(self) -> TeeBuilder<T, Source, S>
     where
-        C: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-        B1: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
-        B2: FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+        T: Clone + 'static,
+        Source: 'static,
+        S: StreamTypeMarker + 'static,
     {
-        let (coordinator, source1, source2) = self.tee_internal(mode, max_buffer_per_branch);
+        let (coordinator, source1, source2) =
+            self.tee_internal(BackpressureMode::SpecCompliant, Some(1000));
 
-        coordinator_spawn(Box::pin(coordinator.run()));
-
-        let stream1 = ReadableStream::builder(source1).spawn(branch1_spawn);
-        let stream2 = ReadableStream::builder(source2).spawn(branch2_spawn);
-
-        (stream1, stream2)
-    }
-
-    pub fn tee_with_spawn_ref<F>(
-        self,
-        spawn_fn: &'static F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
-    where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
-    {
-        self.tee_with_options_and_spawn_ref(BackpressureMode::SpecCompliant, Some(1000), spawn_fn)
-    }
-
-    pub fn tee_with_options_and_spawn_ref<F>(
-        self,
-        mode: BackpressureMode,
-        max_buffer_per_branch: Option<usize>,
-        spawn_fn: &'static F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
-    where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
-    {
-        let (coordinator, source1, source2) = self.tee_internal(mode, max_buffer_per_branch);
-
-        spawn_fn(Box::pin(coordinator.run()));
-
-        let stream1 = ReadableStream::builder(source1).spawn_ref(spawn_fn);
-        let stream2 = ReadableStream::builder(source2).spawn_ref(spawn_fn);
-
-        (stream1, stream2)
+        TeeBuilder {
+            coordinator,
+            source1,
+            source2,
+            mode: BackpressureMode::SpecCompliant,
+            max_buffer_per_branch: Some(1000),
+        }
     }
 }
 
@@ -4522,17 +4604,7 @@ mod tee_tests {
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // Tee the stream
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
 
         // Get readers for both branches
         let (_, reader1) = stream1.get_reader();
@@ -4562,17 +4634,7 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4595,17 +4657,7 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4632,17 +4684,7 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4674,17 +4716,7 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4717,17 +4749,7 @@ mod tee_tests {
 
         let error_stream =
             ReadableStream::builder(ErrorSource { count: 0 }).spawn(tokio::task::spawn_local);
-        let (stream1, stream2) = error_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = error_stream.tee().spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4759,30 +4781,10 @@ mod tee_tests {
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // First level tee
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
 
         // Second level tee on stream1
-        let (stream1a, stream1b) = stream1.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1a, stream1b) = stream1.tee().spawn(tokio::task::spawn_local);
 
         // Get readers
         let (_, reader1a) = stream1a.get_reader();
@@ -4811,17 +4813,7 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
 
         // Use stream1 directly
         let (_, reader1) = stream1.get_reader();
@@ -4851,17 +4843,7 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_spawn(
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
 
@@ -4888,19 +4870,10 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
-            BackpressureMode::Unbounded,
-            Some(2),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream
+            .tee()
+            .backpressure_mode(BackpressureMode::Unbounded)
+            .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
@@ -4947,19 +4920,11 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
-            BackpressureMode::SlowestConsumer,
-            Some(buffer_size),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream
+            .tee()
+            .backpressure_mode(BackpressureMode::SlowestConsumer)
+            .max_buffer(buffer_size)
+            .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
@@ -5012,19 +4977,11 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
-            BackpressureMode::SpecCompliant,
-            Some(buffer_size),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream
+            .tee()
+            .backpressure_mode(BackpressureMode::SpecCompliant)
+            .max_buffer(buffer_size)
+            .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
@@ -5083,19 +5040,11 @@ mod backpressure_tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.clone().into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee_with_options_and_spawn(
-            BackpressureMode::SlowestConsumer,
-            Some(buffer_size),
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
+        let (stream1, stream2) = source_stream
+            .tee()
+            .backpressure_mode(BackpressureMode::SlowestConsumer)
+            .max_buffer(buffer_size)
+            .spawn(tokio::task::spawn_local);
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
@@ -5160,7 +5109,7 @@ mod spawn_variant_tests {
         let source_stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(spawn_fn);
 
         // Tee with shared spawn function
-        let (stream1, stream2) = source_stream.tee_with_spawn_ref(&spawn_fn);
+        let (stream1, stream2) = source_stream.tee().spawn_ref(&spawn_fn);
 
         let (_, reader1) = stream1.get_reader();
         let (_, reader2) = stream2.get_reader();
