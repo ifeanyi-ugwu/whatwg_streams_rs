@@ -4936,7 +4936,7 @@ mod backpressure_tee_tests {
             }
         });
 
-        tokio::join!(fast_task, slow_task);
+        tokio::join!(fast_task, slow_task).0.unwrap();
 
         let fast = *fast_count.lock().unwrap();
         let slow = *slow_count.lock().unwrap();
@@ -4992,7 +4992,7 @@ mod backpressure_tee_tests {
             }
         });
 
-        tokio::join!(fast_task, slow_task);
+        tokio::join!(fast_task, slow_task).0.unwrap();
 
         let fast = fast_progress.lock().unwrap();
         let slow = slow_progress.lock().unwrap();
@@ -5050,7 +5050,7 @@ mod backpressure_tee_tests {
             }
         });
 
-        tokio::join!(fast_task, slow_task);
+        tokio::join!(fast_task, slow_task).0.unwrap();
 
         let fast = fast_progress.lock().unwrap();
         let slow = slow_progress.lock().unwrap();
@@ -5114,7 +5114,7 @@ mod backpressure_tee_tests {
             }
         });
 
-        tokio::join!(fast_task, slow_task);
+        tokio::join!(fast_task, slow_task).0.unwrap();
 
         let fast = fast_progress.lock().unwrap();
         let slow = slow_progress.lock().unwrap();
