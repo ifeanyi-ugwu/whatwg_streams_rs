@@ -537,11 +537,13 @@ pub enum BackpressureMode {
     /// - Useful when strict fairness between consumers is required.
     SlowestConsumer,
 
-    /// Pulls based on the *combined demand* of both branches.  
-    /// - If the total buffered items across both branches is under
-    ///   `2 * max_buffer_per_branch`, a pull is allowed.  
-    /// - Balances throughput and safety.  
-    /// - Allows temporary imbalance, but prevents runaway growth.
+    /// Pulls based on the *combined demand* of both branches.
+    /// - A pull is allowed if the sum of buffered items across both branches
+    ///   is less than the sum of their individual high-water marks.
+    /// - This adapts to per-branch configuration instead of using a fixed
+    ///   multiple of a single buffer size.
+    /// - Balances throughput and safety by allowing temporary imbalance,
+    ///   while preventing total buffer growth from exceeding the combined limit.
     Aggregate,
 }
 
