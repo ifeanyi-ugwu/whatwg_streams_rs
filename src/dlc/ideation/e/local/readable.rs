@@ -639,7 +639,7 @@ impl<T: 'static> ReadableSource<T> for TeeSource<T> {
     }
 }
 
-pub struct TeeCoordinator<T, Source, StreamType, LockState>
+struct TeeCoordinator<T, Source, StreamType, LockState>
 where
     T: Clone,
     StreamType: StreamTypeMarker,
@@ -869,29 +869,16 @@ where
         self
     }
 
-    /// Prepare without spawning tasks
+    /// Prepare without spawning: returns streams + futures for coordinator and branches
     pub fn prepare(
         self,
     ) -> (
-        TeeCoordinator<T, Source, S, Locked>,
-        TeeSource<T>,
-        TeeSource<T>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        impl Future<Output = ()>, // coordinator future
+        impl Future<Output = ()>, // branch1 future
+        impl Future<Output = ()>, // branch2 future
     ) {
-        (self.coordinator, self.source1, self.source2)
-    }
-
-    /// Spawn everything with owned closures
-    /// Spawn coordinator and both branches in a single task
-    pub fn spawn<F, R>(
-        self,
-        spawn_fn: F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
-    where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
-    {
         let TeeBuilder {
             coordinator,
             source1,
@@ -902,12 +889,27 @@ where
         let (stream1, rfut1) = ReadableStream::builder(source1).prepare();
         let (stream2, rfut2) = ReadableStream::builder(source2).prepare();
 
+        let coordinator_fut = coordinator.run();
+
+        (stream1, stream2, coordinator_fut, rfut1, rfut2)
+    }
+
+    /// Spawn the coordinator and both branches in a single task using owned closures
+    pub fn spawn<F, R>(
+        self,
+        spawn_fn: F,
+    ) -> (
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+    )
+    where
+        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+    {
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
         let fut = async move {
-            futures::join!(coordinator.run(), rfut1, rfut2);
+            futures::join!(coord_fut, rfut1, rfut2);
         };
-
         spawn_fn(Box::pin(fut));
-
         (stream1, stream2)
     }
 
@@ -922,26 +924,15 @@ where
     where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) + 'static,
     {
-        let TeeBuilder {
-            coordinator,
-            source1,
-            source2,
-            ..
-        } = self;
-
-        let (stream1, rfut1) = ReadableStream::builder(source1).prepare();
-        let (stream2, rfut2) = ReadableStream::builder(source2).prepare();
-
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
         let fut = async move {
-            futures::join!(coordinator.run(), rfut1, rfut2);
+            futures::join!(coord_fut, rfut1, rfut2);
         };
-
         spawn_fn(Box::pin(fut));
-
         (stream1, stream2)
     }
 
-    /// Spawn each part separately with owned closures
+    /// Spawn each part separately using owned closures
     pub fn spawn_parts<R1, R2, R3, F1, F2, F3>(
         self,
         coordinator_spawn: F1,
@@ -956,13 +947,14 @@ where
         F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R2,
         F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
     {
-        coordinator_spawn(Box::pin(self.coordinator.run()));
-        let stream1 = ReadableStream::builder(self.source1).spawn(branch1_spawn);
-        let stream2 = ReadableStream::builder(self.source2).spawn(branch2_spawn);
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
+        coordinator_spawn(Box::pin(coord_fut));
+        branch1_spawn(Box::pin(rfut1));
+        branch2_spawn(Box::pin(rfut2));
         (stream1, stream2)
     }
 
-    /// Spawn each part separately using `'static` function references
+    /// Spawn each part separately using static function references
     pub fn spawn_parts_ref<R1, R2, R3, F1, F2, F3>(
         self,
         coordinator_spawn: &'static F1,
@@ -977,9 +969,10 @@ where
         F2: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R2,
         F3: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3,
     {
-        coordinator_spawn(Box::pin(self.coordinator.run()));
-        let stream1 = ReadableStream::builder(self.source1).spawn_ref(branch1_spawn);
-        let stream2 = ReadableStream::builder(self.source2).spawn_ref(branch2_spawn);
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
+        coordinator_spawn(Box::pin(coord_fut));
+        branch1_spawn(Box::pin(rfut1));
+        branch2_spawn(Box::pin(rfut2));
         (stream1, stream2)
     }
 }
