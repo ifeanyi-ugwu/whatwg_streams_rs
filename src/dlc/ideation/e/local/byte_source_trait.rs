@@ -1,6 +1,6 @@
 use super::{super::StreamResult, readable::ReadableByteStreamController};
 
-pub trait ReadableByteSource: Sized + 'static {
+pub trait ReadableByteSource: 'static {
     fn start(
         &mut self,
         controller: &mut ReadableByteStreamController,

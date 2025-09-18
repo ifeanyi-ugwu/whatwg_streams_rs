@@ -56,7 +56,7 @@ impl StreamTypeMarker for ByteStream {
 }
 
 // ----------- Source Traits -----------
-pub trait ReadableSource<T: 'static>: Sized + 'static {
+pub trait ReadableSource<T: 'static>: 'static {
     fn start(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
