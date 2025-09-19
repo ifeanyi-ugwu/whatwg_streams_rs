@@ -1,27 +1,30 @@
-use std::{error::Error, fmt, ops::Deref, sync::Arc};
+use std::{error::Error, fmt, sync::Arc};
 
-#[derive(Clone)]
-pub struct ArcError(Arc<dyn Error + Send + Sync>);
+#[derive(Debug, Clone)]
+pub enum StreamError {
+    Canceled,
+    Aborted(Option<String>),
+    Closing,
+    Closed,
+    Other(Arc<dyn Error + Send + Sync>),
+}
 
-impl fmt::Debug for ArcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+impl StreamError {
+    /// Wrap any error type into `StreamError`
+    pub fn other<E>(e: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        StreamError::Other(Arc::new(e))
+    }
+
+    /// Wrap a boxed error
+    pub fn other_boxed(e: Box<dyn Error + Send + Sync>) -> Self {
+        StreamError::Other(e.into())
     }
 }
 
-impl fmt::Display for ArcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl Error for ArcError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl From<&str> for ArcError {
+impl From<&str> for StreamError {
     fn from(s: &str) -> Self {
         #[derive(Debug)]
         struct SimpleError(String);
@@ -31,120 +34,25 @@ impl From<&str> for ArcError {
             }
         }
         impl Error for SimpleError {}
-
-        ArcError(Arc::new(SimpleError(s.to_string())))
-    }
-}
-
-impl From<String> for ArcError {
-    fn from(s: String) -> Self {
-        ArcError::from(s.as_str())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct OtherError(pub Arc<dyn Error + Send + Sync>);
-
-impl fmt::Display for OtherError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl Error for OtherError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.0.source()
-    }
-}
-
-impl Deref for OtherError {
-    type Target = Arc<dyn Error + Send + Sync>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl OtherError {
-    pub fn new<E>(e: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        OtherError(Arc::new(e))
-    }
-}
-
-impl From<std::io::Error> for OtherError {
-    fn from(e: std::io::Error) -> Self {
-        OtherError(Arc::new(e))
-    }
-}
-
-macro_rules! impl_from_error_for_other {
-    ($($error_type:ty),* $(,)?) => {
-        $(
-            impl From<$error_type> for OtherError {
-                fn from(e: $error_type) -> Self {
-                    OtherError(Arc::new(e))
-                }
-            }
-        )*
-    };
-}
-
-#[derive(Debug, Clone)]
-pub enum StreamError {
-    Canceled,
-    Aborted(Option<String>),
-    Closing,
-    Closed,
-    Custom(ArcError),
-    Other(OtherError),
-}
-
-impl From<ArcError> for StreamError {
-    fn from(e: ArcError) -> Self {
-        StreamError::Custom(e)
+        StreamError::Other(Arc::new(SimpleError(s.to_string())))
     }
 }
 
 impl From<String> for StreamError {
     fn from(s: String) -> Self {
-        StreamError::Custom(ArcError::from(s))
-    }
-}
-
-impl From<&str> for StreamError {
-    fn from(s: &str) -> Self {
-        StreamError::Custom(ArcError::from(s))
+        StreamError::from(s.as_str())
     }
 }
 
 impl From<std::io::Error> for StreamError {
     fn from(e: std::io::Error) -> Self {
-        StreamError::Custom(ArcError(Arc::new(e)))
-    }
-}
-
-impl From<OtherError> for StreamError {
-    fn from(e: OtherError) -> Self {
-        StreamError::Other(e)
+        StreamError::Other(Arc::new(e))
     }
 }
 
 impl From<Box<dyn Error + Send + Sync>> for StreamError {
     fn from(e: Box<dyn Error + Send + Sync>) -> Self {
-        StreamError::Other(OtherError(e.into()))
-    }
-}
-
-impl StreamError {
-    pub fn other<E: Error + Send + Sync + 'static>(e: E) -> Self {
-        StreamError::Other(OtherError::new(e))
-    }
-
-    pub fn other_boxed(e: Box<dyn Error + Send + Sync>) -> Self {
-        StreamError::Other(OtherError(e.into()))
+        StreamError::Other(e.into())
     }
 }
 
@@ -173,7 +81,7 @@ macro_rules! impl_stream_error_from {
         $(
             impl From<$error_type> for $crate::dlc::ideation::e::send::error::StreamError {
                 fn from(e: $error_type) -> Self {
-                    $crate::dlc::ideation::e::send::error::StreamError::Other($crate::dlc::ideation::e::send::error::OtherError::new(e))
+                    $crate::dlc::ideation::e::send::error::StreamError::Other(std::sync::Arc::new(e))
                 }
             }
         )*
@@ -188,7 +96,6 @@ impl fmt::Display for StreamError {
             StreamError::Aborted(None) => write!(f, "Stream was aborted"),
             StreamError::Closing => write!(f, "Stream is closing"),
             StreamError::Closed => write!(f, "Stream is closed"),
-            StreamError::Custom(err) => write!(f, "{}", err),
             StreamError::Other(err) => write!(f, "{}", err),
         }
     }
@@ -197,8 +104,7 @@ impl fmt::Display for StreamError {
 impl Error for StreamError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            StreamError::Custom(err) => Some(&*err.0),
-            StreamError::Other(err) => Some(&**err),
+            StreamError::Other(err) => Some(err.as_ref()),
             _ => None,
         }
     }
@@ -225,8 +131,7 @@ mod tests {
         }
         impl Error for CustomError {}
 
-        let other_err = OtherError::new(CustomError);
-        let _: StreamError = other_err.into();
+        let _: StreamError = StreamError::other(CustomError);
     }
 
     #[test]
@@ -235,7 +140,7 @@ mod tests {
             Err("stream error".into())
         }
 
-        returns_stream_error()?;
+        returns_stream_error()?; // `?` works
         Ok(())
     }
 
@@ -256,7 +161,7 @@ mod tests {
             fn might_fail() -> Result<(), UserCustomError> {
                 Err(UserCustomError("something went wrong".to_string()))
             }
-            might_fail()?; // works directly
+            might_fail()?; // works via macro
             Ok(())
         }
 
@@ -285,7 +190,7 @@ mod tests {
 
         might_fail_json().map_err(StreamError::other_boxed)?;
         might_fail_custom().map_err(StreamError::other)?;
-        might_fail_json()?;
+        might_fail_json()?; // works via From<Box<dyn Error>>
 
         Ok(())
     }
