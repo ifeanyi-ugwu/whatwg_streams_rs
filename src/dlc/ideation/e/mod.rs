@@ -19,6 +19,7 @@ pub trait QueuingStrategy<T> {
 }
 
 /// Count-based strategy
+#[derive(Clone)]
 pub struct CountQueuingStrategy {
     high_water_mark: usize,
 }
@@ -40,6 +41,7 @@ impl<T> QueuingStrategy<T> for CountQueuingStrategy {
 }
 
 /// Byte length strategy for types with known byte sizes
+#[derive(Clone)]
 pub struct ByteLengthQueuingStrategy {
     high_water_mark: usize,
 }
