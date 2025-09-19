@@ -407,7 +407,7 @@ where
     {
         let options = options.unwrap_or_default();
         let (_, writer) = destination.get_writer()?;
-        let (_stream, reader) = self.get_reader();
+        let (_stream, reader) = self.get_reader()?;
 
         let pipe_loop = async {
             loop {
@@ -922,13 +922,16 @@ where
     /// Prepare without spawning: returns streams + futures for coordinator and branches
     pub fn prepare(
         self,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        impl Future<Output = ()>, // coordinator future
-        impl Future<Output = ()>, // branch1 future
-        impl Future<Output = ()>, // branch2 future
-    ) {
+    ) -> Result<
+        (
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            impl Future<Output = ()>, // coordinator future
+            impl Future<Output = ()>, // branch1 future
+            impl Future<Output = ()>, // branch2 future
+        ),
+        StreamError,
+    > {
         self.stream
             .tee_inner(self.mode, self.branch1_strategy, self.branch2_strategy)
     }
@@ -937,38 +940,44 @@ where
     pub fn spawn<F, R>(
         self,
         spawn_fn: F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
+    ) -> Result<
+        (
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ),
+        StreamError,
+    >
     where
         F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         let fut = async move {
             futures::join!(coord_fut, rfut1, rfut2);
         };
         spawn_fn(Box::pin(fut));
-        (stream1, stream2)
+        Ok((stream1, stream2))
     }
 
     /// Spawn the coordinator and both branches in a single task using a 'static function reference.
     pub fn spawn_ref<F, R>(
         self,
         spawn_fn: &'static F,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
+    ) -> Result<
+        (
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ),
+        StreamError,
+    >
     where
         F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         let fut = async move {
             futures::join!(coord_fut, rfut1, rfut2);
         };
         spawn_fn(Box::pin(fut));
-        (stream1, stream2)
+        Ok((stream1, stream2))
     }
 
     /// Spawn each part separately using owned closures
@@ -977,20 +986,23 @@ where
         coordinator_spawn: F1,
         branch1_spawn: F2,
         branch2_spawn: F3,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
+    ) -> Result<
+        (
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ),
+        StreamError,
+    >
     where
         F1: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R1,
         F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R2,
         F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
     {
-        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         coordinator_spawn(Box::pin(coord_fut));
         branch1_spawn(Box::pin(rfut1));
         branch2_spawn(Box::pin(rfut2));
-        (stream1, stream2)
+        Ok((stream1, stream2))
     }
 
     /// Spawn each part separately using static function references
@@ -999,20 +1011,23 @@ where
         coordinator_spawn: &'static F1,
         branch1_spawn: &'static F2,
         branch2_spawn: &'static F3,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-    )
+    ) -> Result<
+        (
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+        ),
+        StreamError,
+    >
     where
         F1: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R1,
         F2: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R2,
         F3: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3,
     {
-        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare();
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         coordinator_spawn(Box::pin(coord_fut));
         branch1_spawn(Box::pin(rfut1));
         branch2_spawn(Box::pin(rfut2));
-        (stream1, stream2)
+        Ok((stream1, stream2))
     }
 }
 
@@ -1027,14 +1042,17 @@ where
         mode: BackpressureMode,
         branch1_strategy: Box<dyn QueuingStrategy<T>>,
         branch2_strategy: Box<dyn QueuingStrategy<T>>,
-    ) -> (
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
-        impl Future<Output = ()>, // coordinator future
-        impl Future<Output = ()>, // branch1 future
-        impl Future<Output = ()>, // branch2 future
-    ) {
-        let (_, reader) = self.get_reader();
+    ) -> Result<
+        (
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
+            impl Future<Output = ()>, // coordinator future
+            impl Future<Output = ()>, // branch1 future
+            impl Future<Output = ()>, // branch2 future
+        ),
+        StreamError,
+    > {
+        let (_, reader) = self.get_reader()?;
 
         let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
         let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
@@ -1091,7 +1109,7 @@ where
 
         let coordinator_fut = coordinator.run();
 
-        (stream1, stream2, coordinator_fut, rfut1, rfut2)
+        Ok((stream1, stream2, coordinator_fut, rfut1, rfut2))
     }
 
     pub fn tee(self) -> TeeBuilder<T, Source, S> {
@@ -1310,11 +1328,20 @@ where
 {
     pub fn get_reader(
         self,
-    ) -> (
-        ReadableStream<T, Source, StreamType, Locked>,
-        ReadableStreamDefaultReader<T, Source, StreamType, Locked>,
-    ) {
-        self.locked.store(true, Ordering::SeqCst);
+    ) -> Result<
+        (
+            ReadableStream<T, Source, StreamType, Locked>,
+            ReadableStreamDefaultReader<T, Source, StreamType, Locked>,
+        ),
+        StreamError,
+    > {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(StreamError::Custom("Stream already locked".into()));
+        }
 
         let locked_stream = ReadableStream {
             command_tx: self.command_tx.clone(),
@@ -1344,7 +1371,7 @@ where
             _phantom: PhantomData,
         });
 
-        (locked_stream, reader)
+        Ok((locked_stream, reader))
     }
 }
 
@@ -2322,7 +2349,7 @@ mod tests_old {
         let data = vec![1, 2, 3];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         // Read all items
         assert_eq!(reader.read().await.unwrap(), Some(1));
@@ -2338,7 +2365,7 @@ mod tests_old {
         let stream = ReadableStream::from_iterator(empty_data.into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         // Should immediately return None for empty iterator
         assert_eq!(reader.read().await.unwrap(), None);
@@ -2353,7 +2380,7 @@ mod tests_old {
         let data = vec![1, 2, 3, 4, 5];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         // Read one item
         assert_eq!(reader.read().await.unwrap(), Some(1));
@@ -2409,7 +2436,7 @@ mod tests_old {
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         // Read data
         /*if let Some(chunk) = reader.read().await.unwrap() {
@@ -2562,7 +2589,7 @@ mod tests_old {
         }
 
         let stream = ReadableStream::builder(ErrorSource).spawn(tokio::task::spawn_local);
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         // Should get the error
         match reader.read().await {
@@ -2580,7 +2607,7 @@ mod tests_old {
 
         assert!(!stream.locked()); // Initially unlocked
 
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
         // Stream is now locked (we can't directly test this on locked_stream)
 
         // Release the lock
@@ -2595,7 +2622,7 @@ mod tests_old {
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (_locked_stream, _reader1) = stream.get_reader();
+        let (_locked_stream, _reader1) = stream.get_reader().unwrap();
         // At this point, trying to get another reader from the original stream
         // would require the stream to be unlocked first
         // This test demonstrates the lock mechanism working
@@ -2618,7 +2645,7 @@ mod tests {
         let stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Sequential reads should return items in order
         for expected in data {
@@ -2634,7 +2661,7 @@ mod tests {
         let data = vec![1, 2, 3];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Stream starts readable
         assert!(!reader.0.closed.load(std::sync::atomic::Ordering::SeqCst));
@@ -2654,7 +2681,7 @@ mod tests {
         let stream = ReadableStream::from_iterator(empty.into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Should immediately return None and be closed
         assert_eq!(reader.read().await.unwrap(), None);
@@ -2672,7 +2699,7 @@ mod tests {
         // Initially unlocked
         assert!(!stream.locked());
 
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
         // Note: We can't test locked() on the original stream since it's moved
 
         // Release lock
@@ -2688,7 +2715,7 @@ mod tests {
         let locked_ref = Rc::clone(&stream.locked);
 
         {
-            let (_locked_stream, _reader) = stream.get_reader();
+            let (_locked_stream, _reader) = stream.get_reader().unwrap();
             // Reader is alive, stream should be locked
         } // Reader drops here
 
@@ -2703,7 +2730,7 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Read partial data
         assert_eq!(reader.read().await.unwrap(), Some(1));
@@ -2723,7 +2750,7 @@ mod tests {
         let data = vec![1, 2, 3];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Cancel without reason should work
         reader.cancel(None).await.unwrap();
@@ -2766,7 +2793,7 @@ mod tests {
         let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // First read succeeds
         assert_eq!(reader.read().await.unwrap(), Some(42));
@@ -2790,7 +2817,7 @@ mod tests {
 
         let readable_stream =
             ReadableStream::from_stream(async_stream).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = readable_stream.get_reader();
+        let (_locked, reader) = readable_stream.get_reader().unwrap();
 
         // Should read all items from async stream
         for expected in items {
@@ -2807,7 +2834,7 @@ mod tests {
         let stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, _reader) = stream.get_reader();
+        let (_locked, _reader) = stream.get_reader().unwrap();
 
         // Test that our ReadableStream implements futures::Stream
         // Note: This test demonstrates the trait is implemented
@@ -2915,7 +2942,7 @@ mod tests {
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Collect ALL data from the stream
         let mut all_data = Vec::new();
@@ -3010,7 +3037,7 @@ mod tests {
         let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Read all items
         assert_eq!(reader.read().await.unwrap(), Some(1));
@@ -3050,7 +3077,7 @@ mod tests {
         let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // First read succeeds
         assert_eq!(reader.read().await.unwrap(), Some("valid item".to_string()));
@@ -3069,7 +3096,7 @@ mod tests {
         let data: Vec<i32> = (0..10).collect();
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Multiple concurrent read attempts - only one should succeed at a time
         let read1 = reader.read();
@@ -3088,7 +3115,7 @@ mod tests {
         let data = vec![1];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Start waiting for close
         let close_future = reader.closed();
@@ -3114,7 +3141,7 @@ mod tests {
         let stream = ReadableStream::from_iterator(large_data.into_iter()).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         let mut actual_sum = 0;
         while let Some(item) = reader.read().await.unwrap() {
@@ -3170,7 +3197,7 @@ mod tests {
         let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some(10));
         assert_eq!(reader.read().await.unwrap(), Some(20));
@@ -3208,7 +3235,7 @@ mod tests {
         let stream = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked_stream, reader) = stream.get_reader();
+        let (_locked_stream, reader) = stream.get_reader().unwrap();
 
         // Give the stream task a moment to call start() and fail
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -4126,7 +4153,7 @@ mod tests {
         let stream = ReadableStream::builder_bytes(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Give the stream task time to call start
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4187,7 +4214,7 @@ mod tests {
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Give the stream task time to call start and fail
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4290,7 +4317,7 @@ mod tests {
         let stream = ReadableStream::builder_bytes(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = stream.get_reader();
+        let (_locked, reader) = stream.get_reader().unwrap();
 
         // Immediately try to read - this should block waiting for start
         let read_future = reader.read();
@@ -4353,7 +4380,7 @@ mod builder_tests {
     async fn test_builder_spawn() {
         let source = TestSource::new(vec!["hello".to_string(), "world".to_string()]);
         let stream = ReadableStream::builder(source).spawn(tokio::task::spawn_local);
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("hello".to_string()));
         assert_eq!(reader.read().await.unwrap(), Some("world".to_string()));
@@ -4368,7 +4395,7 @@ mod builder_tests {
         // Spawn the task manually
         tokio::task::spawn_local(fut);
 
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("test".to_string()));
         assert_eq!(reader.read().await.unwrap(), None);
@@ -4382,7 +4409,7 @@ mod builder_tests {
     async fn test_builder_spawn_ref() {
         let source = TestSource::new(vec!["reference".to_string()]);
         let stream = ReadableStream::builder(source).spawn_ref(&spawn_local_fn);
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("reference".to_string()));
         assert_eq!(reader.read().await.unwrap(), None);
@@ -4396,7 +4423,7 @@ mod builder_tests {
             .strategy(custom_strategy)
             .spawn(tokio::task::spawn_local);
 
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("custom".to_string()));
         assert_eq!(reader.read().await.unwrap(), None);
@@ -4406,7 +4433,7 @@ mod builder_tests {
     async fn test_from_vec_builder() {
         let data = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let stream = ReadableStreamBuilder::from_vec(data).spawn(tokio::task::spawn_local);
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("a".to_string()));
         assert_eq!(reader.read().await.unwrap(), Some("b".to_string()));
@@ -4419,7 +4446,7 @@ mod builder_tests {
         let numbers = vec![1, 2, 3];
         let stream = ReadableStreamBuilder::from_iterator(numbers.into_iter())
             .spawn(tokio::task::spawn_local);
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some(1));
         assert_eq!(reader.read().await.unwrap(), Some(2));
@@ -4432,7 +4459,7 @@ mod builder_tests {
         let async_stream = futures::stream::iter(vec!["x", "y", "z"]);
         let stream =
             ReadableStreamBuilder::from_stream(async_stream).spawn(tokio::task::spawn_local);
-        let (_, reader) = stream.get_reader();
+        let (_, reader) = stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("x"));
         assert_eq!(reader.read().await.unwrap(), Some("y"));
@@ -4491,7 +4518,7 @@ mod pipe_through_tests {
         let result_stream = source_stream
             .pipe_through(transform, None)
             .spawn(tokio::task::spawn_local);
-        let (_locked, reader) = result_stream.get_reader();
+        let (_locked, reader) = result_stream.get_reader().unwrap();
 
         // Read results
         let result1 = timeout(Duration::from_secs(1), reader.read())
@@ -4523,7 +4550,7 @@ mod pipe_through_tests {
         let result_stream = source_stream.pipe_through(transform, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = result_stream.get_reader();
+        let (_locked, reader) = result_stream.get_reader().unwrap();
 
         // Should get doubled values
         assert_eq!(reader.read().await.unwrap(), Some(2));
@@ -4544,7 +4571,7 @@ mod pipe_through_tests {
         let result_stream = source_stream.pipe_through(transform, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = result_stream.get_reader();
+        let (_locked, reader) = result_stream.get_reader().unwrap();
 
         // Should immediately return None
         assert_eq!(reader.read().await.unwrap(), None);
@@ -4572,7 +4599,7 @@ mod pipe_through_tests {
             .spawn(|fut| {
                 tokio::task::spawn_local(fut);
             });
-        let (_locked, reader) = result_stream.get_reader();
+        let (_locked, reader) = result_stream.get_reader().unwrap();
 
         // Should get quadrupled values
         assert_eq!(reader.read().await.unwrap(), Some(4)); // 1 * 2 * 2
@@ -4603,7 +4630,7 @@ mod pipe_through_tests {
             .spawn(|fut| {
                 tokio::task::spawn_local(fut);
             });
-        let (_locked, reader) = result_stream.get_reader();
+        let (_locked, reader) = result_stream.get_reader().unwrap();
 
         assert_eq!(reader.read().await.unwrap(), Some("TEST".to_string()));
         assert_eq!(reader.read().await.unwrap(), None);
@@ -4637,7 +4664,7 @@ mod pipe_through_tests {
         let result_stream = source_stream.pipe_through(transform, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
-        let (_locked, reader) = result_stream.get_reader();
+        let (_locked, reader) = result_stream.get_reader().unwrap();
 
         // Should get first two values
         //assert_eq!(reader.read().await.unwrap(), Some(1));
@@ -4699,11 +4726,12 @@ mod tee_tests {
         let (stream1, stream2) = source_stream
             .tee()
             //.backpressure_mode(BackpressureMode::Unbounded)
-            .spawn(tokio::task::spawn_local);
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
 
         // Get readers for both branches
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Both branches should get the same data
         assert_eq!(reader1.read().await.unwrap(), Some(1));
@@ -4732,9 +4760,10 @@ mod tee_tests {
         let (stream1, stream2) = source_stream
             .tee()
             //.backpressure_mode(BackpressureMode::Unbounded)
-            .spawn(tokio::task::spawn_local);
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Reader1 reads everything quickly
         assert_eq!(reader1.read().await.unwrap(), Some(1));
@@ -4758,9 +4787,10 @@ mod tee_tests {
         let (stream1, stream2) = source_stream
             .tee()
             //.backpressure_mode(BackpressureMode::Unbounded)
-            .spawn(tokio::task::spawn_local);
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Read first item from both
         assert_eq!(reader1.read().await.unwrap(), Some(1));
@@ -4785,9 +4815,9 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local).unwrap();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Read first item from both
         assert_eq!(reader1.read().await.unwrap(), Some(1));
@@ -4817,9 +4847,9 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local).unwrap();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Both should immediately return None
         assert_eq!(reader1.read().await.unwrap(), None);
@@ -4850,9 +4880,9 @@ mod tee_tests {
 
         let error_stream =
             ReadableStream::builder(ErrorSource { count: 0 }).spawn(tokio::task::spawn_local);
-        let (stream1, stream2) = error_stream.tee().spawn(tokio::task::spawn_local);
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (stream1, stream2) = error_stream.tee().spawn(tokio::task::spawn_local).unwrap();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Both should get the data before error
         assert_eq!(reader1.read().await.unwrap(), Some(0));
@@ -4882,15 +4912,15 @@ mod tee_tests {
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         // First level tee
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local).unwrap();
 
         // Second level tee on stream1
-        let (stream1a, stream1b) = stream1.tee().spawn(tokio::task::spawn_local);
+        let (stream1a, stream1b) = stream1.tee().spawn(tokio::task::spawn_local).unwrap();
 
         // Get readers
-        let (_, reader1a) = stream1a.get_reader();
-        let (_, reader1b) = stream1b.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1a) = stream1a.get_reader().unwrap();
+        let (_, reader1b) = stream1b.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // All should get the same data
         assert_eq!(reader1a.read().await.unwrap(), Some(1));
@@ -4917,14 +4947,15 @@ mod tee_tests {
         let (stream1, stream2) = source_stream
             .tee()
             //.backpressure_mode(BackpressureMode::Unbounded)
-            .spawn(tokio::task::spawn_local);
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
 
         // Use stream1 directly
-        let (_, reader1) = stream1.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
 
         // Pipe stream2 through a transform (if you have transforms implemented)
         // For now, just read from stream2 directly
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         // Both should work independently
         assert_eq!(reader1.read().await.unwrap(), Some(1));
@@ -4947,9 +4978,9 @@ mod tee_tests {
         let source_stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
-        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local);
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (stream1, stream2) = source_stream.tee().spawn(tokio::task::spawn_local).unwrap();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         assert_eq!(reader1.read().await.unwrap(), Some("hello".to_string()));
         assert_eq!(reader2.read().await.unwrap(), Some("hello".to_string()));
@@ -4977,10 +5008,11 @@ mod backpressure_tee_tests {
         let (stream1, stream2) = source_stream
             .tee()
             //.backpressure_mode(BackpressureMode::Unbounded)
-            .spawn(tokio::task::spawn_local);
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
 
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         let fast_count = Rc::new(Mutex::new(0));
         let slow_count = Rc::new(Mutex::new(0));
@@ -5029,10 +5061,11 @@ mod backpressure_tee_tests {
             .tee()
             .backpressure_mode(BackpressureMode::SlowestConsumer)
             .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
 
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         let fast_progress = Rc::new(Mutex::new(Vec::new()));
         let slow_progress = Rc::new(Mutex::new(Vec::new()));
@@ -5087,10 +5120,11 @@ mod backpressure_tee_tests {
             .tee()
             .backpressure_mode(BackpressureMode::SpecCompliant)
             .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
 
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         let fast_progress = Rc::new(Mutex::new(Vec::new()));
         let slow_progress = Rc::new(Mutex::new(Vec::new()));
@@ -5151,10 +5185,11 @@ mod backpressure_tee_tests {
             .tee()
             .backpressure_mode(BackpressureMode::SlowestConsumer)
             .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
+            .spawn(tokio::task::spawn_local)
+            .unwrap();
 
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         let fast_progress = Rc::new(Mutex::new(Vec::new()));
         let slow_progress = Rc::new(Mutex::new(Vec::new()));
@@ -5219,10 +5254,11 @@ mod spawn_variant_tests {
         let (stream1, stream2) = source_stream
             .tee()
             //.backpressure_mode(BackpressureMode::Unbounded)
-            .spawn_ref(&spawn_fn);
+            .spawn_ref(&spawn_fn)
+            .unwrap();
 
-        let (_, reader1) = stream1.get_reader();
-        let (_, reader2) = stream2.get_reader();
+        let (_, reader1) = stream1.get_reader().unwrap();
+        let (_, reader2) = stream2.get_reader().unwrap();
 
         for expected in &data {
             assert_eq!(reader1.read().await.unwrap(), Some(*expected));

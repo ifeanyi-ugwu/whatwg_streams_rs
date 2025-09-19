@@ -516,7 +516,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         // Write some data
         writer.write("hello".to_string()).await.unwrap();
@@ -550,7 +550,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         // Write numbers
         writer.write(5).await.unwrap();
@@ -572,7 +572,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         // Write mix of odd and even numbers
         writer.write(1).await.unwrap(); // odd - should pass
@@ -596,7 +596,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         // Write data that will cause an error
         writer.write(1).await.unwrap();
@@ -622,7 +622,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         // Close immediately without writing
         writer.close().await.unwrap();
@@ -638,7 +638,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         // Write multiple items before reading any
         writer.write(1).await.unwrap();
@@ -660,7 +660,7 @@ mod tests {
             TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         writer.write("hello".to_string()).await.unwrap();
 
@@ -682,7 +682,7 @@ mod tests {
             TransformStream::builder(IdentityTransformer::new()).spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         let numbers = vec![1, 2, 3, 4, 5];
 
@@ -719,7 +719,7 @@ mod builder_tests {
 
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         writer.write(1).await.unwrap();
         writer.write(2).await.unwrap();
@@ -740,7 +740,7 @@ mod builder_tests {
 
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         writer.write(3).await.unwrap();
         writer.write(4).await.unwrap();
@@ -762,7 +762,7 @@ mod builder_tests {
 
         let (readable, writable) = stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         writer.write(2).await.unwrap();
         writer.close().await.unwrap();
@@ -781,7 +781,7 @@ mod builder_tests {
 
         let (readable, writable) = stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         writer.write(3).await.unwrap();
         writer.close().await.unwrap();
@@ -800,7 +800,7 @@ mod builder_tests {
 
         let (readable, writable) = stream.split();
         let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
+        let (_, reader) = readable.get_reader().unwrap();
 
         writer.write(4).await.unwrap();
         writer.close().await.unwrap();
