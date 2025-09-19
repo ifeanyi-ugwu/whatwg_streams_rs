@@ -1099,28 +1099,91 @@ where
     }
 }
 
+pub struct PipeBuilder<T, O, Source, S>
+where
+    S: StreamTypeMarker,
+{
+    source_stream: ReadableStream<T, Source, S, Unlocked>,
+    transform: TransformStream<T, O>,
+    options: Option<StreamPipeOptions>,
+}
+
+impl<T, O, Source, S> PipeBuilder<T, O, Source, S>
+where
+    T: 'static,
+    O: 'static,
+    Source: 'static,
+    S: StreamTypeMarker + 'static,
+{
+    pub fn new(
+        source_stream: ReadableStream<T, Source, S, Unlocked>,
+        transform: TransformStream<T, O>,
+        options: Option<StreamPipeOptions>,
+    ) -> Self {
+        Self {
+            source_stream,
+            transform,
+            options,
+        }
+    }
+
+    /// Prepare without spawning: returns the readable and the unspawned pipe future
+    pub fn prepare(
+        self,
+    ) -> (
+        ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
+        Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>,
+    ) {
+        let (readable, writable) = self.transform.split();
+
+        let pipe_future =
+            Box::pin(async move { self.source_stream.pipe_to(&writable, self.options).await });
+
+        (readable, pipe_future)
+    }
+
+    /// Spawn the pipeline with an owned spawner closure
+    pub fn spawn<SpawnFn, R>(
+        self,
+        spawn_fn: SpawnFn,
+    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
+    where
+        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
+    {
+        let (readable, pipe_future) = self.prepare();
+        spawn_fn(pipe_future);
+        readable
+    }
+
+    /// Spawn the pipeline with a static function reference
+    pub fn spawn_ref<SpawnFn, R>(
+        self,
+        spawn_fn: &'static SpawnFn,
+    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
+    where
+        SpawnFn: Fn(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
+    {
+        let (readable, pipe_future) = self.prepare();
+        spawn_fn(pipe_future);
+        readable
+    }
+}
+
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: 'static,
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
-    pub fn pipe_through_with_spawn<O: 'static, SpawnFn, R>(
+    pub fn pipe_through<O>(
         self,
         transform: TransformStream<T, O>,
         options: Option<StreamPipeOptions>,
-        spawn: SpawnFn,
-    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
+    ) -> PipeBuilder<T, O, Source, S>
     where
-        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
+        O: 'static,
     {
-        let (readable, writable) = transform.split();
-
-        let pipe_future = Box::pin(async move { self.pipe_to(&writable, options).await });
-
-        spawn(pipe_future);
-
-        readable
+        PipeBuilder::new(self, transform, options)
     }
 }
 
@@ -4425,8 +4488,9 @@ mod pipe_through_tests {
             TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
 
         // Pipe through
-        let result_stream =
-            source_stream.pipe_through_with_spawn(transform, None, tokio::task::spawn_local);
+        let result_stream = source_stream
+            .pipe_through(transform, None)
+            .spawn(tokio::task::spawn_local);
         let (_locked, reader) = result_stream.get_reader();
 
         // Read results
@@ -4456,7 +4520,7 @@ mod pipe_through_tests {
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let transform = TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
-        let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
+        let result_stream = source_stream.pipe_through(transform, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = result_stream.get_reader();
@@ -4477,7 +4541,7 @@ mod pipe_through_tests {
 
         let transform =
             TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn_local);
-        let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
+        let result_stream = source_stream.pipe_through(transform, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = result_stream.get_reader();
@@ -4496,16 +4560,18 @@ mod pipe_through_tests {
         // First transform: double
         let transform1 =
             TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
-        let intermediate_stream = source_stream.pipe_through_with_spawn(transform1, None, |fut| {
+        let intermediate_stream = source_stream.pipe_through(transform1, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
 
         // Second transform: double again
         let transform2 =
             TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
-        let result_stream = intermediate_stream.pipe_through_with_spawn(transform2, None, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+        let result_stream = intermediate_stream
+            .pipe_through(transform2, None)
+            .spawn(|fut| {
+                tokio::task::spawn_local(fut);
+            });
         let (_locked, reader) = result_stream.get_reader();
 
         // Should get quadrupled values
@@ -4532,8 +4598,9 @@ mod pipe_through_tests {
             signal: None,
         };
 
-        let result_stream =
-            source_stream.pipe_through_with_spawn(transform, Some(options), |fut| {
+        let result_stream = source_stream
+            .pipe_through(transform, Some(options))
+            .spawn(|fut| {
                 tokio::task::spawn_local(fut);
             });
         let (_locked, reader) = result_stream.get_reader();
@@ -4567,7 +4634,7 @@ mod pipe_through_tests {
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
 
         let transform = TransformStream::builder(ErrorTransformer).spawn(tokio::task::spawn_local);
-        let result_stream = source_stream.pipe_through_with_spawn(transform, None, |fut| {
+        let result_stream = source_stream.pipe_through(transform, None).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
         let (_locked, reader) = result_stream.get_reader();
