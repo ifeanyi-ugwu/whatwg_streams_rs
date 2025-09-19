@@ -1,4 +1,5 @@
-use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked, errors::StreamError};
+use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked};
+use super::error::StreamError;
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -88,7 +89,7 @@ impl<T, Sink, S> WritableStream<T, Sink, S> {
             .read()
             .ok()
             .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            .unwrap_or_else(|| "Stream is errored".into())
     }
 }
 
@@ -111,11 +112,11 @@ where
                 completion: tx,
             })
             .await
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
 
         // Await the completion of the abort operation
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Abort operation canceled".into())))
+            .unwrap_or_else(|_| Err("Abort operation canceled".into()))
     }
 
     pub async fn close(&self) -> StreamResult<()> {
@@ -125,10 +126,9 @@ where
             .clone()
             .send(StreamCommand::Close { completion: tx })
             .await
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Close canceled".into())))
+        rx.await.unwrap_or_else(|_| Err("Close canceled".into()))
     }
 }
 
@@ -152,7 +152,7 @@ where
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(StreamError::Custom("Stream already locked".into()));
+            return Err("Stream already locked".into());
         }
 
         let locked = WritableStream {
@@ -348,9 +348,9 @@ where
         // Check if backpressure is active - Sink contract says start_send should only
         // be called after poll_ready returns Ready(Ok(()))
         if self.backpressure.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom(
+            return Err(
                 "start_send called while backpressure is active - call poll_ready first".into(),
-            ));
+            );
         }
 
         let (tx, _rx) = oneshot::channel();
@@ -359,7 +359,7 @@ where
                 chunk: item,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
 
         // For the Sink trait, we return immediately after enqueueing.
         // The actual write completion is handled asynchronously by the stream task.
@@ -377,7 +377,7 @@ where
                     Ok(guard) => guard.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                opt_err.unwrap_or_else(|| "Stream is errored".into())
             };
             return Poll::Ready(Err(error));
         }
@@ -390,7 +390,7 @@ where
                 .unbounded_send(StreamCommand::Flush { completion: tx })
                 .is_err()
             {
-                return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+                return Poll::Ready(Err("Stream task dropped".into()));
             }
 
             *this.flush_receiver = Some(rx);
@@ -405,12 +405,12 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     *this.flush_receiver = None;
-                    Poll::Ready(Err(StreamError::Custom("Flush operation canceled".into())))
+                    Poll::Ready(Err("Flush operation canceled".into()))
                 }
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            Poll::Ready(Err(StreamError::Custom("Flush receiver missing".into())))
+            Poll::Ready(Err("Flush receiver missing".into()))
         }
     }
 
@@ -430,7 +430,7 @@ where
                     Ok(guard) => guard.clone(),
                     Err(poisoned) => poisoned.into_inner().clone(),
                 };
-                opt_err.unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+                opt_err.unwrap_or_else(|| "Stream is errored".into())
             };
             return Poll::Ready(Err(error));
         }
@@ -443,7 +443,7 @@ where
                 .unbounded_send(StreamCommand::Close { completion: tx })
                 .is_err()
             {
-                return Poll::Ready(Err(StreamError::Custom("Stream task dropped".into())));
+                return Poll::Ready(Err("Stream task dropped".into()));
             }
             *this.close_receiver = Some(rx);
         }
@@ -457,12 +457,12 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     *this.close_receiver = None;
-                    Poll::Ready(Err(StreamError::Custom("Close operation canceled".into())))
+                    Poll::Ready(Err("Close operation canceled".into()))
                 }
                 Poll::Pending => Poll::Pending,
             }
         } else {
-            Poll::Ready(Err(StreamError::Custom("Close receiver missing".into())))
+            Poll::Ready(Err("Close receiver missing".into()))
         }
     }
 }
@@ -560,7 +560,7 @@ where
                         StreamError::Closed => {
                             IoError::new(ErrorKind::BrokenPipe, "Stream is closed")
                         }
-                        StreamError::Custom(_) => {
+                        StreamError::Other(_) => {
                             IoError::new(ErrorKind::Other, stream_err.to_string())
                         }
                     };
@@ -759,14 +759,14 @@ fn process_command<T, Sink>(
                 return;
             }
             if inner.state == StreamState::Closed {
-                //let _ = completion.send(Err(StreamError::Custom("Stream is closed".into())));
+                //let _ = completion.send(Err(StreamError::Other("Stream is closed".into())));
                 let _ = completion.send(Err(StreamError::Closed));
                 return;
             }
             // NEW: Also reject writes if close has been requested (stream is closing)
             // This matches the spec: "During this time any further attempts to write will fail"
             if inner.close_requested {
-                /*let _ = completion.send(Err(StreamError::Custom(
+                /*let _ = completion.send(Err(StreamError::Other(
                     "Cannot write to stream: close in progress".into()
                 )));*/
                 let _ = completion.send(Err(StreamError::Closing));
@@ -962,13 +962,13 @@ async fn stream_task<T, Sink>(
                 match inflight_op {
                     InFlight::Write { completion, .. } => {
                         if let Some(sender) = completion.take() {
-                            //let _ = sender.send(Err(StreamError::Custom("Stream aborted".into())));
+                            //let _ = sender.send(Err(StreamError::Other("Stream aborted".into())));
                             let _ = sender.send(Err(StreamError::Aborted(None)));
                         }
                     }
                     InFlight::Close { completions, .. } => {
                         for sender in completions.drain(..) {
-                            //let _ = sender.send(Err(StreamError::Custom("Stream aborted".into())));
+                            //let _ = sender.send(Err(StreamError::Other("Stream aborted".into())));
                             let _ = sender.send(Err(StreamError::Aborted(None)));
                         }
                     }
@@ -1055,9 +1055,7 @@ async fn stream_task<T, Sink>(
                         abort_handle: None, // Remove this entirely
                     });
                 } else {
-                    let _ = pw
-                        .completion_tx
-                        .send(Err(StreamError::Custom("Sink missing".into())));
+                    let _ = pw.completion_tx.send(Err("Sink missing".into()));
                     inner.state = StreamState::Errored;
                 }
             }
@@ -1273,7 +1271,7 @@ where
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()));
+            .map_err(|_| StreamError::from("Stream task dropped"));
 
         // Return a future that handles the completion waiting
         async move {
@@ -1281,8 +1279,7 @@ where
             enqueue_result?;
 
             // Then wait for the write to complete
-            rx.await
-                .unwrap_or_else(|_| Err(StreamError::Custom("Write canceled".into())))
+            rx.await.unwrap_or_else(|_| Err("Write canceled".into()))
         }
     }
 
@@ -1388,7 +1385,7 @@ where
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))
+            .map_err(|_| StreamError::from("Stream task dropped"))
     }
 
     /// Close the stream asynchronously
@@ -1400,10 +1397,9 @@ where
             .clone()
             .send(StreamCommand::Close { completion: tx })
             .await
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Close canceled".into())))
+        rx.await.unwrap_or_else(|_| Err("Close canceled".into()))
     }
 
     /// Abort the stream asynchronously with an optional reason
@@ -1418,10 +1414,9 @@ where
                 completion: tx,
             })
             .await
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Abort canceled".into())))
+        rx.await.unwrap_or_else(|_| Err("Abort canceled".into()))
     }
 
     /// Get the desired size synchronously (how much data the stream can accept)
@@ -1520,7 +1515,7 @@ impl<T, Sink> WritableStreamInner<T, Sink> {
             .read()
             .ok()
             .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            .unwrap_or_else(|| "Stream is errored".into())
     }
 
     fn set_stored_error(&self, err: StreamError) {
@@ -1752,7 +1747,7 @@ where
             return Poll::Ready(Err(self.writer.stream.get_stored_error()));
         }
         if self.writer.stream.closed.load(Ordering::SeqCst) {
-            //return Poll::Ready(Err(StreamError::Custom("Stream is closed".into())));
+            //return Poll::Ready(Err(StreamError::Other("Stream is closed".into())));
             return Poll::Ready(Ok(()));
         }
         if !self.writer.stream.backpressure.load(Ordering::SeqCst) {
@@ -2157,7 +2152,7 @@ mod tests {
         let write_future = stream.get_writer();
 
         match write_future {
-            Err(e) => assert!(matches!(e, StreamError::Custom(_))),
+            Err(e) => assert!(matches!(e, StreamError::Other(_))),
             Ok(_) => panic!("Acquired second writer while stream is locked!"),
         }
 
@@ -2173,7 +2168,7 @@ mod tests {
         use futures::Future;
         use std::sync::Mutex;
 
-        // Custom sink that simulates slow writes by never resolving immediately
+        // Other sink that simulates slow writes by never resolving immediately
         struct SlowSink {
             calls: Rc<Mutex<usize>>,
             unblock_notify: Rc<tokio::sync::Notify>,
@@ -2628,7 +2623,7 @@ mod tests {
                 let flag = self.error_flag.clone();
                 async move {
                     *flag.lock().unwrap() = true;
-                    Err(StreamError::Custom("write failure".into()))
+                    Err("write failure".into())
                 }
             }
 
@@ -2636,7 +2631,7 @@ mod tests {
                 let flag = self.error_flag.clone();
                 async move {
                     *flag.lock().unwrap() = true;
-                    Err(StreamError::Custom("close failure".into()))
+                    Err("close failure".into())
                 }
             }
 
@@ -2647,7 +2642,7 @@ mod tests {
                 let flag = self.error_flag.clone();
                 async move {
                     *flag.lock().unwrap() = true;
-                    Err(StreamError::Custom("abort failure".into()))
+                    Err("abort failure".into())
                 }
             }
         }
@@ -3010,9 +3005,9 @@ mod sink_integration_tests {
             if let Some(fail_on) = self.fail_on_write {
                 if current_count >= fail_on {
                     self.log_operation(&format!("write failed on item {}", current_count + 1));
-                    return Err(StreamError::Custom(
+                    return Err(
                         format!("Intentional write failure on item {}", current_count + 1).into(),
-                    ));
+                    );
                 }
             }
 
@@ -3027,7 +3022,7 @@ mod sink_integration_tests {
 
             if self.fail_on_close {
                 self.log_operation("close failed");
-                return Err(StreamError::Custom("Intentional close failure".into()));
+                return Err("Intentional close failure".into());
             }
 
             self.log_operation("close completed");
@@ -3040,7 +3035,7 @@ mod sink_integration_tests {
 
             if self.fail_on_abort {
                 self.log_operation("abort failed");
-                return Err(StreamError::Custom("Intentional abort failure".into()));
+                return Err("Intentional abort failure".into());
             }
 
             self.log_operation("abort completed");
@@ -3635,9 +3630,9 @@ mod async_write_integration_tests {
             if let Some(fail_on) = self.fail_on_write {
                 if current_writes > fail_on {
                     self.log_operation("write failed");
-                    return Err(StreamError::Custom(
+                    return Err(
                         format!("Intentional write failure on write {}", current_writes).into(),
-                    ));
+                    );
                 }
             }
 
@@ -3651,7 +3646,7 @@ mod async_write_integration_tests {
             self.log_operation("close called");
             if self.fail_on_close {
                 self.log_operation("close failed");
-                return Err(StreamError::Custom("Intentional close failure".into()));
+                return Err("Intentional close failure".into());
             }
             self.log_operation("close completed");
             Ok(())
@@ -4190,7 +4185,7 @@ mod writable_builder_tests_old {
     }
 
     #[localtest_macros::localset_test]
-    fn test_builder_with_custom_strategy() {
+    fn test_builder_with_other_strategy() {
         let (sink, _) = RecordingSink::new();
 
         let stream = WritableStreamBuilder::new(sink)
@@ -4328,19 +4323,16 @@ mod writable_builder_tests {
             &mut self,
             chunk: String,
             _controller: &mut super::WritableStreamDefaultController,
-        ) -> Result<(), super::super::super::errors::StreamError> {
+        ) -> Result<(), StreamError> {
             self.written_data.borrow_mut().push(chunk);
             Ok(())
         }
 
-        async fn close(self) -> Result<(), super::super::super::errors::StreamError> {
+        async fn close(self) -> Result<(), StreamError> {
             Ok(())
         }
 
-        async fn abort(
-            &mut self,
-            _reason: Option<String>,
-        ) -> Result<(), super::super::super::errors::StreamError> {
+        async fn abort(&mut self, _reason: Option<String>) -> Result<(), StreamError> {
             Ok(())
         }
     }

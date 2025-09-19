@@ -1,5 +1,6 @@
-use super::super::{CountQueuingStrategy, QueuingStrategy, Unlocked, errors::StreamError};
+use super::super::{CountQueuingStrategy, QueuingStrategy, Unlocked};
 use super::{
+    error::StreamError,
     readable::{DefaultStream, ReadableSource, ReadableStream, ReadableStreamDefaultController},
     writable::{WritableSink, WritableStream, WritableStreamDefaultController},
 };
@@ -133,8 +134,7 @@ impl<O> TransformStreamDefaultController<O> {
     /// Closes the readable side and errors the writable side of the stream
     pub fn terminate(&self) -> StreamResult<()> {
         self.readable_controller.close()?;
-        self.writable_controller
-            .error(StreamError::Custom("Terminated".into()));
+        self.writable_controller.error("Terminated".into());
         Ok(())
     }
 
@@ -218,10 +218,10 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Transform stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Transform stream task dropped"))?;
 
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Write operation canceled".into())))
+            .unwrap_or_else(|_| Err("Write operation canceled".into()))
     }
 
     async fn close(self) -> StreamResult<()> {
@@ -229,10 +229,10 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
 
         self.transform_tx
             .unbounded_send(TransformCommand::Close { completion: tx })
-            .map_err(|_| StreamError::Custom("Transform stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Transform stream task dropped"))?;
 
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Close operation canceled".into())))
+            .unwrap_or_else(|_| Err("Close operation canceled".into()))
     }
 
     async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
@@ -243,10 +243,10 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
                 reason,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Transform stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Transform stream task dropped"))?;
 
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Abort operation canceled".into())))
+            .unwrap_or_else(|_| Err("Abort operation canceled".into()))
     }
 }
 
@@ -294,8 +294,7 @@ async fn transform_task<I, O, T>(
             }
 
             TransformCommand::Abort { reason, completion } => {
-                let error =
-                    StreamError::Custom(reason.unwrap_or("Transform stream aborted".into()).into());
+                let error = StreamError::Aborted(reason);
                 let _ = controller.error(error.clone());
                 let _ = completion.send(Err(error));
                 break;
@@ -501,7 +500,7 @@ mod tests {
             controller: &mut TransformStreamDefaultController<i32>,
         ) -> impl Future<Output = StreamResult<()>> {
             if chunk == 3 {
-                future::ready(Err(StreamError::Custom("Cannot process 3".into())))
+                future::ready(Err("Cannot process 3".into()))
             } else {
                 let result = controller.enqueue(chunk);
                 future::ready(result)

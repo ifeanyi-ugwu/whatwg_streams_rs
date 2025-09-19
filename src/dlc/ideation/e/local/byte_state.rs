@@ -1,5 +1,7 @@
-use super::super::errors::StreamError;
-use super::{byte_source_trait::ReadableByteSource, readable::ReadableByteStreamController};
+use super::{
+    byte_source_trait::ReadableByteSource, error::StreamError,
+    readable::ReadableByteStreamController,
+};
 use futures::future::poll_fn;
 use parking_lot::Mutex;
 use std::{
@@ -86,7 +88,7 @@ where
                 .error
                 .lock()
                 .clone()
-                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                .unwrap_or_else(|| "Stream errored".into());
             return Poll::Ready(Err(error));
         }
 
@@ -396,7 +398,7 @@ where
                     .error
                     .lock()
                     .clone()
-                    .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                    .unwrap_or_else(|| "Stream errored".into());
                 return Poll::Ready(Err(error));
             }
 

@@ -5,3 +5,5 @@ mod macros;
 pub mod readable;
 pub mod transform;
 pub mod writable;
+
+pub type StreamResult<T> = Result<T, error::StreamError>;
