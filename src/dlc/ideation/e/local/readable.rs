@@ -2343,7 +2343,7 @@ mod tests_old {
     use super::*;
 
     // Test 1: Basic iterator source functionality
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_iterator_source_basic() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2358,7 +2358,7 @@ mod tests_old {
     }
 
     // Test 2: Stream closes properly when iterator is exhausted
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_stream_closes_on_iterator_end() {
         let empty_data: Vec<i32> = vec![];
         let stream = ReadableStream::from_iterator(empty_data.into_iter()).spawn(|fut| {
@@ -2374,7 +2374,7 @@ mod tests_old {
     }
 
     // Test 3: Cancel functionality works
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_cancel_stream() {
         let data = vec![1, 2, 3, 4, 5];
         let stream =
@@ -2395,7 +2395,7 @@ mod tests_old {
     }
 
     // Test 4: Byte stream basic functionality
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_byte_stream_basic() {
         struct SimpleByteSource {
             data: Vec<u8>,
@@ -2455,7 +2455,7 @@ mod tests_old {
     }
 
     // Test 5: BYOB reader functionality
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn _test_byob_reader() {
         struct ChunkedByteSource {
             chunks: Vec<Vec<u8>>,
@@ -2514,7 +2514,7 @@ mod tests_old {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_byob_reader() {
         struct ChunkedByteSource {
             chunks: Vec<Vec<u8>>,
@@ -2573,7 +2573,7 @@ mod tests_old {
     }
 
     // Test 6: Error propagation
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_error_propagation() {
         struct ErrorSource;
 
@@ -2598,7 +2598,7 @@ mod tests_old {
     }
 
     // Test 7: Reader lock/unlock behavior
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_reader_lock_unlock() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2615,7 +2615,7 @@ mod tests_old {
     }
 
     // Test 8: Multiple readers (should fail)
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_cannot_get_multiple_readers() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2638,7 +2638,7 @@ mod tests {
 
     // ========== Core Stream Behavior Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_basic_stream_read_sequence() {
         let data = vec![1, 2, 3, 4, 5];
         let stream = ReadableStream::from_iterator(data.clone().into_iter()).spawn(|fut| {
@@ -2655,7 +2655,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_stream_state_transitions() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2674,7 +2674,7 @@ mod tests {
         assert!(reader.0.closed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_empty_stream_immediate_close() {
         let empty: Vec<i32> = vec![];
         let stream = ReadableStream::from_iterator(empty.into_iter()).spawn(|fut| {
@@ -2689,7 +2689,7 @@ mod tests {
 
     // ========== Lock Mechanism Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_stream_locking_behavior() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2706,7 +2706,7 @@ mod tests {
         assert!(!unlocked_stream.locked());
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_reader_auto_unlock_on_drop() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2724,7 +2724,7 @@ mod tests {
 
     // ========== Cancellation Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_stream_cancellation() {
         let data = vec![1, 2, 3, 4, 5];
         let stream =
@@ -2744,7 +2744,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_cancel_without_reason() {
         let data = vec![1, 2, 3];
         let stream =
@@ -2760,7 +2760,7 @@ mod tests {
 
     // ========== Error Handling Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_source_error_propagation() {
         struct ErroringSource {
             call_count: std::cell::RefCell<usize>,
@@ -2809,7 +2809,7 @@ mod tests {
 
     // ========== Integration Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_from_async_stream_integration() {
         let items = vec![10, 20, 30];
         let async_stream = stream::iter(items.clone());
@@ -2825,7 +2825,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_futures_stream_trait_integration() {
         use futures::StreamExt;
 
@@ -2840,7 +2840,7 @@ mod tests {
         // Actual polling would require more complex setup
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_async_read_trait_integration() {
         use futures::io::AsyncReadExt;
 
@@ -2884,7 +2884,7 @@ mod tests {
 
     // ========== Byte Stream Specific Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_byte_stream_basic_functionality() {
         struct ChunkedByteSource {
             chunks: Vec<Vec<u8>>,
@@ -2953,7 +2953,7 @@ mod tests {
         assert_eq!(all_data, b"hello world");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_byob_reader_functionality() {
         struct SingleChunkByteSource {
             data: Vec<u8>,
@@ -3003,7 +3003,7 @@ mod tests {
 
     // ========== Controller Behavior Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_controller_close_behavior() {
         struct ControlledSource {
             items: Vec<i32>,
@@ -3047,7 +3047,7 @@ mod tests {
         reader.closed().await.unwrap();
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_controller_error_behavior() {
         struct ErrorAfterItemsSource {
             sent_items: std::cell::RefCell<bool>,
@@ -3090,7 +3090,7 @@ mod tests {
 
     // ========== Concurrency and Timing Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_concurrent_reads() {
         let data: Vec<i32> = (0..10).collect();
         let stream =
@@ -3109,7 +3109,7 @@ mod tests {
         assert!(result2.is_ok());
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_reader_closed_notification() {
         let data = vec![1];
         let stream =
@@ -3132,7 +3132,7 @@ mod tests {
 
     // ========== Memory and Resource Tests ==========
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_large_stream_handling() {
         let large_data: Vec<i32> = (0..1000).collect();
         let expected_sum: i32 = large_data.iter().sum();
@@ -3150,7 +3150,7 @@ mod tests {
         assert_eq!(actual_sum, expected_sum);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_push_based_stream() {
         use std::sync::Mutex;
 
@@ -3206,7 +3206,7 @@ mod tests {
         reader.closed().await.unwrap();
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_start_method_error_puts_stream_in_errored_state() {
         struct FailingStartSource;
 
@@ -3260,7 +3260,7 @@ mod tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_basic_pipe_to() {
         use std::sync::Mutex;
 
@@ -3316,7 +3316,7 @@ mod tests {
         assert_eq!(written, data);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_to_destination_write_error() {
         use std::sync::Mutex;
 
@@ -3474,7 +3474,7 @@ mod tests {
         );*/
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_to_source_error() {
         use std::sync::Mutex;
 
@@ -3610,7 +3610,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_to_prevent_options() {
         use std::sync::Mutex;
 
@@ -3911,7 +3911,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     //#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pipe_to_abort_signal() {
         use std::sync::Mutex;
@@ -4078,7 +4078,7 @@ mod tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_start_called_before_pull_operations() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -4175,7 +4175,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_start_error_prevents_operations() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -4252,7 +4252,7 @@ mod tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_start_blocks_immediate_reads() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::sync::Barrier;
@@ -4371,7 +4371,7 @@ mod builder_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn() {
         let source = TestSource::new(vec!["hello".to_string(), "world".to_string()]);
         let stream = ReadableStream::builder(source).spawn(tokio::task::spawn_local);
@@ -4382,7 +4382,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_prepare() {
         let source = TestSource::new(vec!["test".to_string()]);
         let (stream, fut) = ReadableStream::builder(source).prepare();
@@ -4400,7 +4400,7 @@ mod builder_tests {
         tokio::task::spawn_local(fut);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_ref() {
         let source = TestSource::new(vec!["reference".to_string()]);
         let stream = ReadableStream::builder(source).spawn_ref(&spawn_local_fn);
@@ -4410,7 +4410,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_with_custom_strategy() {
         let source = TestSource::new(vec!["custom".to_string()]);
         let custom_strategy = CountQueuingStrategy::new(5);
@@ -4424,7 +4424,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_from_vec_builder() {
         let data = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let stream = ReadableStreamBuilder::from_vec(data).spawn(tokio::task::spawn_local);
@@ -4436,7 +4436,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_from_iterator_builder() {
         let numbers = vec![1, 2, 3];
         let stream = ReadableStreamBuilder::from_iterator(numbers.into_iter())
@@ -4449,7 +4449,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_from_stream_builder() {
         let async_stream = futures::stream::iter(vec!["x", "y", "z"]);
         let stream =
@@ -4498,7 +4498,7 @@ mod pipe_through_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_through_basic() {
         // Create source stream
         let data = vec!["hello".to_string(), "world".to_string()];
@@ -4535,7 +4535,7 @@ mod pipe_through_tests {
         assert_eq!(result3, None); // Stream closed
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_through_numbers() {
         let data = vec![1, 2, 3, 4];
         let source_stream =
@@ -4555,7 +4555,7 @@ mod pipe_through_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_through_empty_stream() {
         let data: Vec<String> = vec![];
         let source_stream =
@@ -4572,7 +4572,7 @@ mod pipe_through_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_through_chained() {
         // Test chaining multiple transforms
         let data = vec![1, 2, 3];
@@ -4604,7 +4604,7 @@ mod pipe_through_tests {
     }
 
     // Test with pipe options
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_through_with_options() {
         let data = vec!["test".to_string()];
         let source_stream =
@@ -4632,7 +4632,7 @@ mod pipe_through_tests {
     }
 
     // Test error handling in pipe_through
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_pipe_through_error_handling() {
         struct ErrorTransformer;
 
@@ -4710,7 +4710,7 @@ mod tee_tests {
     use super::*;
     use std::time::Duration;
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_basic() {
         // Create source stream
         let data = vec![1, 2, 3, 4];
@@ -4746,7 +4746,7 @@ mod tee_tests {
         assert_eq!(reader2.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_different_read_speeds() {
         let data = vec![1, 2, 3];
         let source_stream =
@@ -4773,7 +4773,7 @@ mod tee_tests {
         assert_eq!(reader2.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_one_branch_cancel() {
         let data = vec![1, 2, 3, 4];
         let source_stream =
@@ -4804,7 +4804,7 @@ mod tee_tests {
         assert_eq!(reader2.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_both_branches_cancel() {
         let data = vec![1, 2, 3, 4];
         let source_stream =
@@ -4836,7 +4836,7 @@ mod tee_tests {
         // but if both readers are canceled, the coordinator should stop
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_empty_stream() {
         let data: Vec<i32> = vec![];
         let source_stream =
@@ -4851,7 +4851,7 @@ mod tee_tests {
         assert_eq!(reader2.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_error_propagation() {
         // Create a stream that will error
         struct ErrorSource {
@@ -4899,7 +4899,7 @@ mod tee_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_chained() {
         // Test tee of a tee (multiple levels)
         let data = vec![1, 2];
@@ -4932,7 +4932,7 @@ mod tee_tests {
         assert_eq!(reader2.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_with_pipe_operations() {
         // Test that tee branches can be used in pipe operations
         let data = vec![1, 2, 3];
@@ -4966,7 +4966,7 @@ mod tee_tests {
         assert_eq!(reader2.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_string_data() {
         // Test with string data to ensure cloning works for different types
         let data = vec!["hello".to_string(), "world".to_string()];
@@ -4994,7 +4994,7 @@ mod backpressure_tee_tests {
     use std::sync::Mutex;
     use tokio::time::{Duration, sleep};
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_spec_compliant_fast_reader_not_throttled() {
         let data: Vec<i32> = (1..=10).collect();
         let source_stream =
@@ -5044,7 +5044,7 @@ mod backpressure_tee_tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_slowest_consumer_fast_reader_throttled() {
         let data: Vec<i32> = (1..=10).collect();
         let buffer_size = 2;
@@ -5103,7 +5103,7 @@ mod backpressure_tee_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_independent_mode_separate_limits() {
         let data: Vec<i32> = (1..=10).collect();
         let buffer_size = 2;
@@ -5168,7 +5168,7 @@ mod backpressure_tee_tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_buffer_limit_enforcement() {
         let data: Vec<i32> = (1..=8).collect();
         let buffer_size = 1;
@@ -5236,7 +5236,7 @@ mod spawn_variant_tests {
         vec![1, 2, 3, 4, 5]
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_tee_with_spawn_ref_completes() {
         fn spawn_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
             tokio::task::spawn_local(fut);

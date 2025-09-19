@@ -508,7 +508,7 @@ mod tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_basic_transform() {
         let transformer = UppercaseTransformer;
         let transform_stream =
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(result3, None); // Stream closed
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_numeric_transform() {
         let transformer = DoubleTransformer;
         let transform_stream =
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_filtering_transform() {
         let transformer = OddFilterTransformer;
         let transform_stream =
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_transform_error_handling() {
         let transformer = ErrorOnThreeTransformer;
         let transform_stream =
@@ -614,7 +614,7 @@ mod tests {
         assert!(read_result.is_err());
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_empty_stream() {
         let transformer = UppercaseTransformer;
         let transform_stream =
@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_multiple_writes_before_read() {
         let transformer = DoubleTransformer;
         let transform_stream =
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_abort_stream() {
         let transformer = UppercaseTransformer;
         let transform_stream =
@@ -675,7 +675,7 @@ mod tests {
         assert!(read_result.is_err());
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_identity_transform_default() {
         let transform_stream =
             TransformStream::builder(IdentityTransformer::new()).spawn(tokio::task::spawn_local);
@@ -711,7 +711,7 @@ mod builder_tests {
     use super::tests::*;
     use super::*;
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn() {
         let transform_stream =
             TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
@@ -729,7 +729,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_parts() {
         let transform_stream = TransformStream::builder(DoubleTransformer).spawn_parts(
             tokio::task::spawn_local, // readable
@@ -750,7 +750,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_prepare() {
         let (stream, rfut, wfut, tfut) = TransformStream::builder(DoubleTransformer).prepare();
 
@@ -774,7 +774,7 @@ mod builder_tests {
         tokio::task::spawn_local(fut);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_ref() {
         let stream = TransformStream::builder(DoubleTransformer).spawn_ref(&spawn_local_fn);
 
@@ -789,7 +789,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_parts_ref() {
         let stream = TransformStream::builder(DoubleTransformer).spawn_parts_ref(
             &spawn_local_fn,

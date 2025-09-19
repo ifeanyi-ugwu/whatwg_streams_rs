@@ -1947,7 +1947,7 @@ mod tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn basic_write_test() {
         let local = tokio::task::LocalSet::new();
 
@@ -1977,7 +1977,7 @@ mod tests {
 
     //#[tokio::test(flavor = "current_thread")]
     //#[crate::localtest]
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn tokio_spawn_basic_write_test() {
         let sink = CountingSink::new();
         let strategy = CountQueuingStrategy::new(2);
@@ -1999,7 +1999,7 @@ mod tests {
         assert_eq!(sink.get_count(), 2);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn basic_write_close_test() {
         use std::sync::Mutex;
 
@@ -2049,7 +2049,7 @@ mod tests {
         assert_eq!(sink.get_count(), 2);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn close_abort_error_test() {
         use std::sync::Mutex;
 
@@ -2137,7 +2137,7 @@ mod tests {
         assert!(close_result.is_err());
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn lock_acquire_release_test() {
         let sink = CountingSink::new();
         let strategy = CountQueuingStrategy::new(10);
@@ -2163,7 +2163,7 @@ mod tests {
         let (_locked_stream2, _writer2) = stream.get_writer().expect("get_writer again");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn backpressure_behavior() {
         use futures::Future;
         use std::sync::Mutex;
@@ -2306,7 +2306,7 @@ mod tests {
     }
 
     //spec compliance
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn ready_future_resolves_only_after_backpressure_clears() {
         use std::sync::Mutex;
 
@@ -2466,7 +2466,7 @@ mod tests {
     //     }
     // }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn desired_size_returns_none_when_closed_or_errored() {
         // Setup dummy sink
         #[derive(Clone, Default)]
@@ -2506,7 +2506,7 @@ mod tests {
     }
 
     //proper spec compliance
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_writer_locking_exclusivity() {
         let sink = DummySink;
         let strategy = CountQueuingStrategy::new(10);
@@ -2531,7 +2531,7 @@ mod tests {
         drop(writer2);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_desired_size_after_close_and_error() {
         let sink = DummySink;
         let strategy = CountQueuingStrategy::new(10);
@@ -2560,7 +2560,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_close_and_abort() {
         let sink = DummySink;
         let strategy = CountQueuingStrategy::new(10);
@@ -2592,7 +2592,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_sink_error_propagates_to_stream() {
         use std::sync::Mutex;
 
@@ -2679,7 +2679,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_ready_and_closed_wakers_behavior() {
         use std::sync::Mutex;
         use tokio::sync::Notify;
@@ -2796,7 +2796,7 @@ mod tests {
         );
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_lock_acquisition_release() {
         let stream = WritableStream::builder(DummySink)
             .strategy(CountQueuingStrategy::new(10))
@@ -2822,7 +2822,7 @@ mod tests {
         drop(writer2);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_close_and_closed_future() {
         let stream = WritableStream::builder(DummySink)
             .strategy(CountQueuingStrategy::new(10))
@@ -2845,7 +2845,7 @@ mod tests {
         assert!(write_err.is_err(), "write after close must fail");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn write_when_ready_test() {
         use std::sync::Mutex;
 
@@ -3064,7 +3064,7 @@ mod sink_integration_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_basic_sink_operations() {
         let sink = TestSink::new("basic");
         let strategy = TestQueuingStrategy::new(5);
@@ -3107,7 +3107,7 @@ mod sink_integration_tests {
         assert!(log.contains(&"basic: close completed".to_string()));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_backpressure_handling() {
         let sink = TestSink::new("backpressure").with_write_delay(Duration::from_millis(10));
         let strategy = TestQueuingStrategy::new(2); // Small buffer
@@ -3138,7 +3138,7 @@ mod sink_integration_tests {
         assert_eq!(received, vec!["item1", "item2", "item3"]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_concurrent_writes() {
         use tokio::sync::Mutex;
 
@@ -3196,7 +3196,7 @@ mod sink_integration_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_write_failure_handling() {
         let sink = TestSink::new("write_fail").with_write_failure(2); // Fail on 3rd write (index 2)
         let strategy = TestQueuingStrategy::new(5);
@@ -3227,7 +3227,7 @@ mod sink_integration_tests {
         assert_eq!(received, vec!["item1", "item2"]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_close_failure_handling() {
         let sink = TestSink::new("close_fail").with_close_failure();
         let strategy = TestQueuingStrategy::new(5);
@@ -3249,7 +3249,7 @@ mod sink_integration_tests {
         assert_eq!(received, vec!["item1", "item2"]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_operations_after_close() {
         let sink = TestSink::new("after_close");
         let strategy = TestQueuingStrategy::new(5);
@@ -3271,7 +3271,7 @@ mod sink_integration_tests {
         assert_eq!(received, vec!["item1"]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_abort_operation() {
         let sink = TestSink::new("abort_test");
         let strategy = TestQueuingStrategy::new(5);
@@ -3307,7 +3307,7 @@ mod sink_integration_tests {
         assert_eq!(received, vec!["item1", "item2"]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_multiple_close_calls() {
         let sink = TestSink::new("multi_close");
         let strategy = TestQueuingStrategy::new(5);
@@ -3333,7 +3333,7 @@ mod sink_integration_tests {
         assert_eq!(close_count, 1);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_flush_behavior() {
         let sink = TestSink::new("flush_test").with_write_delay(Duration::from_millis(50));
         let strategy = TestQueuingStrategy::new(5);
@@ -3367,7 +3367,7 @@ mod sink_integration_tests {
         sink_handle.close().await.unwrap();
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_stream_integration() {
         let sink = TestSink::new("stream_integration");
         let strategy = TestQueuingStrategy::new(3);
@@ -3388,7 +3388,7 @@ mod sink_integration_tests {
         assert_eq!(received, vec!["a", "b", "c", "d", "e"]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_timeout_behavior() {
         let sink = TestSink::new("timeout_test").with_write_delay(Duration::from_millis(50));
         let strategy = TestQueuingStrategy::new(1);
@@ -3415,7 +3415,7 @@ mod sink_integration_tests {
     }
 
     // Stress test for robustness
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn _test_high_volume_writes() {
         use tokio::sync::Mutex;
 
@@ -3468,7 +3468,7 @@ mod sink_integration_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_high_volume_writes() {
         use tokio::sync::Mutex;
 
@@ -3660,7 +3660,7 @@ mod async_write_integration_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_basic_async_write_operations() {
         let sink = BytesSink::new("basic");
         let strategy = TestQueuingStrategy::new(5);
@@ -3687,7 +3687,7 @@ mod async_write_integration_tests {
         assert!(log.iter().any(|entry| entry.contains("close completed")));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_empty_writes() {
         let sink = BytesSink::new("empty");
         let strategy = TestQueuingStrategy::new(5);
@@ -3707,7 +3707,7 @@ mod async_write_integration_tests {
         assert_eq!(received, "test");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_large_writes() {
         let sink = BytesSink::new("large");
         let strategy = TestQueuingStrategy::new(10);
@@ -3728,7 +3728,7 @@ mod async_write_integration_tests {
         stream.close().await.unwrap();
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_multiple_small_writes() {
         let sink = BytesSink::new("multi");
         let strategy = TestQueuingStrategy::new(5);
@@ -3750,7 +3750,7 @@ mod async_write_integration_tests {
         stream.close().await.unwrap();
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_write_error_handling() {
         let sink = BytesSink::new("error").with_write_failure(2);
         let strategy = TestQueuingStrategy::new(5);
@@ -3774,7 +3774,7 @@ mod async_write_integration_tests {
         assert_eq!(received, "write1write2");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_write_after_close() {
         let sink = BytesSink::new("closed");
         let strategy = TestQueuingStrategy::new(5);
@@ -3798,7 +3798,7 @@ mod async_write_integration_tests {
         assert_eq!(received, "before_close");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_backpressure_with_async_write() {
         let sink = BytesSink::new("backpressure").with_write_delay(Duration::from_millis(50));
         let strategy = TestQueuingStrategy::new(2); // Small buffer
@@ -3824,7 +3824,7 @@ mod async_write_integration_tests {
         assert_eq!(received, "chunk0chunk1chunk2chunk3chunk4");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_partial_writes() {
         let sink = BytesSink::new("partial");
         let strategy = TestQueuingStrategy::new(5);
@@ -3854,7 +3854,7 @@ mod async_write_integration_tests {
         assert_eq!(received, "Hello, World!");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_flush_waits_for_queued_writes() {
         use futures::io::AsyncWriteExt;
         use std::sync::Mutex;
@@ -3942,7 +3942,7 @@ mod async_write_integration_tests {
         assert_eq!(sink.get_received_string(), "firstsecondthird");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_concurrent_async_writes() {
         use tokio::sync::Mutex;
 
@@ -3987,7 +3987,7 @@ mod async_write_integration_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_timeout_behavior() {
         let sink = BytesSink::new("timeout").with_write_delay(Duration::from_millis(50));
         let strategy = TestQueuingStrategy::new(1);
@@ -4008,7 +4008,7 @@ mod async_write_integration_tests {
         assert_eq!(received, "slow_data");
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_io_error_kinds() {
         // Test different error conditions produce appropriate IoError kinds
 
@@ -4046,7 +4046,7 @@ mod async_write_integration_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_binary_data() {
         let sink = BytesSink::new("binary");
         let strategy = TestQueuingStrategy::new(5);
@@ -4063,7 +4063,7 @@ mod async_write_integration_tests {
         assert_eq!(received, binary_data);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_write_all_vs_write() {
         let sink = BytesSink::new("write_comparison");
         let strategy = TestQueuingStrategy::new(5);
@@ -4162,7 +4162,7 @@ mod writable_builder_tests_old {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_basic_builder() {
         let (sink, ops) = RecordingSink::new();
 
@@ -4184,7 +4184,7 @@ mod writable_builder_tests_old {
         assert!(operations.contains(&"close".to_string()));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_builder_with_other_strategy() {
         let (sink, _) = RecordingSink::new();
 
@@ -4197,7 +4197,7 @@ mod writable_builder_tests_old {
         assert_eq!(stream.high_water_mark.load(Ordering::SeqCst), 8);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_builder_with_custom_spawn() {
         let (sink, ops) = RecordingSink::new();
 
@@ -4222,7 +4222,7 @@ mod writable_builder_tests_old {
         assert!(operations.contains(&"write: spawned".to_string()));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_static_builder_method() {
         let (sink, ops) = RecordingSink::new();
 
@@ -4240,7 +4240,7 @@ mod writable_builder_tests_old {
         assert!(operations.contains(&"write: static".to_string()));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_enqueue_method() {
         let (sink, ops) = RecordingSink::new();
         let stream = WritableStreamBuilder::new(sink).spawn(|fut| {
@@ -4261,7 +4261,7 @@ mod writable_builder_tests_old {
         assert!(operations.contains(&"write: forget".to_string()));
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_enqueue_error_handling() {
         let (sink, _) = RecordingSink::new();
         let stream = WritableStreamBuilder::new(sink).spawn(|fut| {
@@ -4279,7 +4279,7 @@ mod writable_builder_tests_old {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     fn test_builder_chaining() {
         let (sink, ops) = RecordingSink::new();
 
@@ -4337,7 +4337,7 @@ mod writable_builder_tests {
         }
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
@@ -4353,7 +4353,7 @@ mod writable_builder_tests {
         assert_eq!(*data, vec!["hello".to_string(), "world".to_string()]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_prepare() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
@@ -4376,7 +4376,7 @@ mod writable_builder_tests {
         tokio::task::spawn_local(fut);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_ref() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
@@ -4391,7 +4391,7 @@ mod writable_builder_tests {
         assert_eq!(*data, vec!["reference".to_string()]);
     }
 
-    #[localtest_macros::localset_test]
+    #[tokio_localset_test::localset_test]
     async fn test_builder_with_custom_strategy() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
