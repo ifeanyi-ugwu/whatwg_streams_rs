@@ -1264,10 +1264,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
     pub(crate) fn new_inner(
         source: Source,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
-    ) -> (Self, impl Future<Output = ()>)
-    where
-        Source: ReadableSource<T>,
-    {
+    ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
         let queue_total_size = Rc::new(AtomicUsize::new(0));
