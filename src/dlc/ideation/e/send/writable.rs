@@ -180,25 +180,10 @@ where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
-    /// Create a new WritableStream and spawn a dedicated thread for the stream task.
-    ///
-    /// For custom executor control, use [`new_with_spawn()`] instead.
-    pub fn new(sink: Sink, strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>) -> Self {
-        Self::new_with_spawn(sink, strategy, |fut| {
-            std::thread::spawn(move || {
-                futures::executor::block_on(fut);
-            });
-        })
-    }
-
-    pub fn new_with_spawn<F>(
+    pub(crate) fn new_inner(
         sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>,
-        spawn_fn: F,
-    ) -> Self
-    where
-        F: FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static,
-    {
+        strategy: Box<dyn QueuingStrategy<T> + Send + 'static>,
+    ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = Arc::new(AtomicUsize::new(strategy.high_water_mark()));
         let stored_error = Arc::new(RwLock::new(None));
@@ -245,9 +230,7 @@ where
             ctrl_rx,
         );
 
-        spawn_fn(Box::pin(fut));
-
-        Self {
+        let stream = Self {
             command_tx,
             backpressure,
             closed,
@@ -263,7 +246,9 @@ where
             write_receiver: None,
             pending_write_len: None,
             controller: controller.into(),
-        }
+        };
+
+        (stream, fut)
     }
 }
 
@@ -1491,7 +1476,7 @@ struct WritableStreamInner<T, Sink> {
     state: StreamState,
     queue: VecDeque<PendingWrite<T>>,
     queue_total_size: usize,
-    strategy: Box<dyn QueuingStrategy<T> + Send + Sync + 'static>,
+    strategy: Box<dyn QueuingStrategy<T> + Send + 'static>,
     sink: Option<Sink>,
 
     backpressure: bool,
@@ -1861,23 +1846,11 @@ impl WakerSet {
 pub struct WritableStreamBuilder<T, Sink>
 where
     T: Send + 'static,
-    Sink: WritableSink<T> + Send + 'static,
+    Sink: WritableSink<T> + 'static,
 {
     sink: Sink,
-    strategy: Option<Box<dyn QueuingStrategy<T> + Send + Sync + 'static>>,
-    spawn_config: WritableSpawnConfig,
+    strategy: Box<dyn QueuingStrategy<T> + Send>,
     _phantom: PhantomData<T>,
-}
-
-pub enum WritableSpawnConfig {
-    DefaultThread,
-    CustomSpawn(Box<dyn FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static>),
-}
-
-impl Default for WritableSpawnConfig {
-    fn default() -> Self {
-        WritableSpawnConfig::DefaultThread
-    }
 }
 
 impl<T, Sink> WritableStreamBuilder<T, Sink>
@@ -1885,59 +1858,65 @@ where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
-    pub fn new(sink: Sink) -> Self {
+    fn new(sink: Sink) -> Self {
         Self {
             sink,
-            strategy: None,
-            spawn_config: WritableSpawnConfig::DefaultThread,
+            strategy: Box::new(CountQueuingStrategy::new(1)),
             _phantom: PhantomData,
         }
     }
 
-    pub fn with_strategy<S>(mut self, strategy: S) -> Self
+    pub fn strategy<S: QueuingStrategy<T> + Send + 'static>(mut self, s: S) -> Self {
+        self.strategy = Box::new(s);
+        self
+    }
+
+    /// Return stream + future without spawning
+    pub fn prepare(self) -> (WritableStream<T, Sink, Unlocked>, impl Future<Output = ()>) {
+        WritableStream::new_inner(self.sink, self.strategy)
+    }
+
+    /// Spawn with an owned spawner function
+    pub fn spawn<F, R>(self, spawn_fn: F) -> WritableStream<T, Sink, Unlocked>
     where
-        S: QueuingStrategy<T> + Send + Sync + 'static,
+        F: FnOnce(futures::future::BoxFuture<'static, ()>) -> R,
     {
-        self.strategy = Some(Box::new(strategy));
-        self
+        let (stream, fut) = self.prepare();
+        spawn_fn(Box::pin(fut));
+        stream
     }
 
-    pub fn with_spawn<F>(mut self, spawn_fn: F) -> Self
+    /// Spawn using a static spawner function reference
+    pub fn spawn_ref<F, R>(self, spawn_fn: &'static F) -> WritableStream<T, Sink, Unlocked>
     where
-        F: FnOnce(futures::future::BoxFuture<'static, ()>) + Send + Sync + 'static,
+        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
     {
-        self.spawn_config = WritableSpawnConfig::CustomSpawn(Box::new(spawn_fn));
-        self
-    }
-
-    pub fn with_thread_spawn(mut self) -> Self {
-        self.spawn_config = WritableSpawnConfig::DefaultThread;
-        self
-    }
-
-    pub fn build(self) -> WritableStream<T, Sink, Unlocked> {
-        let strategy: Box<dyn QueuingStrategy<T> + Send + Sync> = self
-            .strategy
-            .unwrap_or_else(|| Box::new(CountQueuingStrategy::new(1)));
-
-        match self.spawn_config {
-            WritableSpawnConfig::DefaultThread => WritableStream::new(self.sink, strategy),
-            WritableSpawnConfig::CustomSpawn(spawn_fn) => {
-                WritableStream::new_with_spawn(self.sink, strategy, spawn_fn)
-            }
-        }
+        let (stream, fut) = self.prepare();
+        spawn_fn(Box::pin(fut));
+        stream
     }
 }
 
-// Add static constructor method to existing WritableStream
 impl<T, Sink> WritableStream<T, Sink, Unlocked>
 where
     T: Send + 'static,
     Sink: WritableSink<T> + Send + 'static,
 {
+    /// Returns a builder for this writable stream
     pub fn builder(sink: Sink) -> WritableStreamBuilder<T, Sink> {
         WritableStreamBuilder::new(sink)
     }
+}
+
+use futures::executor::block_on;
+use futures::future::BoxFuture;
+use std::thread;
+
+/// Spawns a future on a dedicated OS thread and runs it to completion.
+pub fn spawn_on_thread(fut: BoxFuture<'static, ()>) {
+    thread::spawn(move || {
+        block_on(fut);
+    });
 }
 
 #[cfg(test)]
@@ -1985,7 +1964,9 @@ mod tests {
         let sink = CountingSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(2));
 
-        let stream = WritableStream::new(sink.clone(), strategy);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(spawn_on_thread);
         /*let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
             tokio::spawn(fut);
         });*/
@@ -2005,12 +1986,13 @@ mod tests {
     #[tokio::test]
     async fn tokio_spawn_basic_write_test() {
         let sink = CountingSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(2));
 
         // Using your executor injection idea - spawn stream task via Tokio's runtime:
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |future| {
-            tokio::spawn(future);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(2))
+            .spawn(|future| {
+                tokio::spawn(future);
+            });
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Write data chunks asynchronously
@@ -2061,7 +2043,9 @@ mod tests {
 
         let sink = CountingSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(10));
-        let stream = WritableStream::new(sink.clone(), strategy);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         writer.write(vec![1]).await.expect("write 1");
@@ -2130,7 +2114,9 @@ mod tests {
 
         let sink = TestSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(1));
-        let stream = WritableStream::new(sink.clone(), strategy);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(spawn_on_thread);
 
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
@@ -2159,7 +2145,9 @@ mod tests {
     async fn lock_acquire_release_test() {
         let sink = CountingSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(10));
-        let stream = WritableStream::new(sink.clone(), strategy);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(spawn_on_thread);
 
         // Get first writer (locks stream)
         let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
@@ -2232,9 +2220,10 @@ mod tests {
 
         // Use a low water mark to force backpressure quickly
         let (sink, unblock_notify) = SlowSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(1));
 
-        let stream = WritableStream::new(sink, strategy);
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(1))
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
@@ -2366,8 +2355,9 @@ mod tests {
 
         // Use HWM = 1 to trigger backpressure with 2 queued writes
         let (sink, notify) = BlockSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(1usize));
-        let stream = WritableStream::new(sink, strategy);
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(1usize))
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
         let writer = Arc::new(writer);
 
@@ -2493,9 +2483,10 @@ mod tests {
             }
         }
 
-        let strategy = Box::new(CountQueuingStrategy::new(10));
         let sink = DummySink::default();
-        let stream = WritableStream::new(sink, strategy);
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         // Immediately close the stream by sending Close command through writer
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
@@ -2518,8 +2509,9 @@ mod tests {
     #[tokio::test]
     async fn test_writer_locking_exclusivity() {
         let sink = DummySink;
-        let strategy = Box::new(CountQueuingStrategy::new(10));
-        let stream = WritableStream::new(sink, strategy);
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
 
@@ -2541,8 +2533,9 @@ mod tests {
     #[tokio::test]
     async fn test_desired_size_after_close_and_error() {
         let sink = DummySink;
-        let strategy = Box::new(CountQueuingStrategy::new(10));
-        let stream = WritableStream::new(sink, strategy);
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         writer.close().await.expect("close");
@@ -2568,8 +2561,9 @@ mod tests {
     #[tokio::test]
     async fn test_close_and_abort() {
         let sink = DummySink;
-        let strategy = Box::new(CountQueuingStrategy::new(10));
-        let stream = WritableStream::new(sink, strategy);
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Close stream - closed future resolves ok
@@ -2579,7 +2573,9 @@ mod tests {
         assert!(closed_res.is_ok(), "closed future must resolve after close");
 
         // Abort an opened stream errors correctly
-        let stream2 = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
+        let stream2 = WritableStream::builder(DummySink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
         let (_locked_stream2, writer2) = stream2.get_writer().expect("get_writer");
         writer2
             .abort(Some("reason".to_string()))
@@ -2650,7 +2646,9 @@ mod tests {
 
         let sink = FailingSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(10));
-        let stream = WritableStream::new(sink.clone(), strategy);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(spawn_on_thread);
 
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
@@ -2726,11 +2724,10 @@ mod tests {
         }
 
         let (sink, notify) = SlowSink::new();
-        let strategy = Box::new(CountQueuingStrategy::new(1));
         //let stream = WritableStream::new(sink, strategy);
-        let stream = WritableStream::new_with_spawn(sink, strategy, |future| {
-            tokio::spawn(future);
-        });
+        let stream = WritableStream::builder(sink)
+            .strategy(CountQueuingStrategy::new(1))
+            .spawn(tokio::spawn);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         let writer = Arc::new(writer);
@@ -2797,7 +2794,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_lock_acquisition_release() {
-        let stream = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
+        let stream = WritableStream::builder(DummySink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         // Acquire first writer lock
         let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
@@ -2819,7 +2818,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_and_closed_future() {
-        let stream = WritableStream::new(DummySink, Box::new(CountQueuingStrategy::new(10)));
+        let stream = WritableStream::builder(DummySink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         writer.close().await.expect("close");
@@ -2873,7 +2874,9 @@ mod tests {
 
         let sink = CountingSink::new();
         let strategy = Box::new(CountQueuingStrategy::new(2));
-        let stream = WritableStream::new(sink.clone(), strategy);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(spawn_on_thread);
         let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
 
         // Use enqueue_when_ready to write multiple chunks, which waits for readiness before writing.
@@ -3057,9 +3060,9 @@ mod sink_integration_tests {
     async fn test_basic_sink_operations() {
         let sink = TestSink::new("basic");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3100,9 +3103,9 @@ mod sink_integration_tests {
     async fn test_backpressure_handling() {
         let sink = TestSink::new("backpressure");
         let strategy = Box::new(TestQueuingStrategy::new(2)); // Small buffer
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3129,9 +3132,9 @@ mod sink_integration_tests {
 
         let sink = TestSink::new("concurrent").with_write_delay(Duration::from_millis(10));
         let strategy = Box::new(TestQueuingStrategy::new(10));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         /*let mut sink_handle = stream;
 
@@ -3185,9 +3188,9 @@ mod sink_integration_tests {
     async fn test_write_failure_handling() {
         let sink = TestSink::new("write_fail").with_write_failure(2); // Fail on 3rd write (index 2)
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3216,9 +3219,9 @@ mod sink_integration_tests {
     async fn test_close_failure_handling() {
         let sink = TestSink::new("close_fail").with_close_failure();
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3238,9 +3241,9 @@ mod sink_integration_tests {
     async fn test_operations_after_close() {
         let sink = TestSink::new("after_close");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3260,9 +3263,9 @@ mod sink_integration_tests {
     async fn test_abort_operation() {
         let sink = TestSink::new("abort_test");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Get a writer to test abort
         let (_locked_stream, writer) = stream.get_writer().unwrap();
@@ -3293,9 +3296,9 @@ mod sink_integration_tests {
     async fn test_multiple_close_calls() {
         let sink = TestSink::new("multi_close");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3319,9 +3322,9 @@ mod sink_integration_tests {
     async fn test_flush_behavior() {
         let sink = TestSink::new("flush_test").with_write_delay(Duration::from_millis(50));
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3353,9 +3356,9 @@ mod sink_integration_tests {
     async fn test_stream_integration() {
         let sink = TestSink::new("stream_integration");
         let strategy = Box::new(TestQueuingStrategy::new(3));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3374,9 +3377,9 @@ mod sink_integration_tests {
     async fn test_timeout_behavior() {
         let sink = TestSink::new("timeout_test").with_write_delay(Duration::from_secs(2));
         let strategy = Box::new(TestQueuingStrategy::new(1));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let mut sink_handle = stream;
 
@@ -3403,9 +3406,9 @@ mod sink_integration_tests {
 
         let sink = TestSink::new("high_volume");
         let strategy = Box::new(TestQueuingStrategy::new(10));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         //let mut sink_handle = stream;
         let sink_handle = Arc::new(Mutex::new(stream));
@@ -3592,9 +3595,9 @@ mod async_write_integration_tests {
     async fn test_basic_async_write_operations() {
         let sink = BytesSink::new("basic");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Test writing some data
         let data1 = b"Hello, ";
@@ -3619,9 +3622,9 @@ mod async_write_integration_tests {
     async fn test_empty_writes() {
         let sink = BytesSink::new("empty");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Empty write should return Ok(0) immediately
         let result = stream.write(&[]).await.unwrap();
@@ -3639,9 +3642,9 @@ mod async_write_integration_tests {
     async fn test_large_writes() {
         let sink = BytesSink::new("large");
         let strategy = Box::new(TestQueuingStrategy::new(10));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Write large data
         let large_data = vec![b'X'; 10000];
@@ -3660,9 +3663,9 @@ mod async_write_integration_tests {
     async fn test_multiple_small_writes() {
         let sink = BytesSink::new("multi");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Write multiple small chunks
         for i in 0..10 {
@@ -3682,9 +3685,9 @@ mod async_write_integration_tests {
     async fn test_write_error_handling() {
         let sink = BytesSink::new("error").with_write_failure(2);
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // First two writes should succeed
         stream.write_all(b"write1").await.unwrap();
@@ -3706,9 +3709,9 @@ mod async_write_integration_tests {
     async fn test_write_after_close() {
         let sink = BytesSink::new("closed");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Write some data and close
         stream.write_all(b"before_close").await.unwrap();
@@ -3730,9 +3733,9 @@ mod async_write_integration_tests {
     async fn test_backpressure_with_async_write() {
         let sink = BytesSink::new("backpressure").with_write_delay(Duration::from_millis(50));
         let strategy = Box::new(TestQueuingStrategy::new(2)); // Small buffer
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let start = std::time::Instant::now();
 
@@ -3756,9 +3759,9 @@ mod async_write_integration_tests {
     async fn test_partial_writes() {
         let sink = BytesSink::new("partial");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let data = b"Hello, World!";
 
@@ -3824,9 +3827,9 @@ mod async_write_integration_tests {
 
         let sink = FlushTestSink::new(Duration::from_millis(100));
         let strategy = Box::new(TestQueuingStrategy::new(10));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Wrap in Arc<AsyncMutex<>> so multiple tasks can use it without borrow checker conflicts
         let stream = Arc::new(AsyncMutex::new(stream));
@@ -3876,9 +3879,9 @@ mod async_write_integration_tests {
 
         let sink = BytesSink::new("concurrent");
         let strategy = Box::new(TestQueuingStrategy::new(10));
-        let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let stream = Arc::new(Mutex::new(stream));
         let mut handles = Vec::new();
@@ -3919,9 +3922,9 @@ mod async_write_integration_tests {
     async fn test_timeout_behavior() {
         let sink = BytesSink::new("timeout").with_write_delay(Duration::from_secs(2));
         let strategy = Box::new(TestQueuingStrategy::new(1));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // This should timeout because write takes 2 seconds
         let result = timeout(Duration::from_millis(500), stream.write_all(b"slow_data")).await;
@@ -3944,9 +3947,9 @@ mod async_write_integration_tests {
         {
             let sink = BytesSink::new("closed_error");
             let strategy = Box::new(TestQueuingStrategy::new(5));
-            let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-                tokio::spawn(fut);
-            });
+            let mut stream = WritableStream::builder(sink.clone())
+                .strategy(*strategy)
+                .spawn(tokio::spawn);
 
             stream.close().await.unwrap();
 
@@ -3961,9 +3964,9 @@ mod async_write_integration_tests {
         {
             let sink = BytesSink::new("error_state").with_write_failure(0);
             let strategy = Box::new(TestQueuingStrategy::new(5));
-            let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-                tokio::spawn(fut);
-            });
+            let mut stream = WritableStream::builder(sink.clone())
+                .strategy(*strategy)
+                .spawn(tokio::spawn);
 
             // First write should fail and put stream in error state
             let _ = stream.write_all(b"data").await;
@@ -3980,9 +3983,9 @@ mod async_write_integration_tests {
     async fn test_binary_data() {
         let sink = BytesSink::new("binary");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         // Write binary data with null bytes and high values
         let binary_data = vec![0u8, 1, 255, 128, 0, 42, 255];
@@ -3997,9 +4000,9 @@ mod async_write_integration_tests {
     async fn test_write_all_vs_write() {
         let sink = BytesSink::new("write_comparison");
         let strategy = Box::new(TestQueuingStrategy::new(5));
-        let mut stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::spawn(fut);
-        });
+        let mut stream = WritableStream::builder(sink.clone())
+            .strategy(*strategy)
+            .spawn(tokio::spawn);
 
         let data = b"Hello, World!";
 
@@ -4097,7 +4100,7 @@ mod writable_builder_tests {
     fn test_basic_builder() {
         let (sink, ops) = RecordingSink::new();
 
-        let stream = WritableStreamBuilder::new(sink).build();
+        let stream = WritableStreamBuilder::new(sink).spawn(spawn_on_thread);
         let (_, writer) = stream.get_writer().unwrap();
 
         block_on(async {
@@ -4120,8 +4123,8 @@ mod writable_builder_tests {
         let (sink, _) = RecordingSink::new();
 
         let stream = WritableStreamBuilder::new(sink)
-            .with_strategy(CountQueuingStrategy::new(8))
-            .build();
+            .strategy(CountQueuingStrategy::new(8))
+            .spawn(spawn_on_thread);
 
         assert_eq!(stream.high_water_mark.load(Ordering::SeqCst), 8);
     }
@@ -4133,14 +4136,10 @@ mod writable_builder_tests {
         let spawn_called = Arc::new(Mutex::new(false));
         let spawn_called_clone = Arc::clone(&spawn_called);
 
-        let stream = WritableStreamBuilder::new(sink)
-            .with_spawn(move |fut| {
-                *spawn_called_clone.lock().unwrap() = true;
-                std::thread::spawn(move || {
-                    futures::executor::block_on(fut);
-                });
-            })
-            .build();
+        let stream = WritableStreamBuilder::new(sink).spawn(move |fut| {
+            *spawn_called_clone.lock().unwrap() = true;
+            spawn_on_thread(fut)
+        });
 
         thread::sleep(Duration::from_millis(10));
         assert!(*spawn_called.lock().unwrap());
@@ -4160,7 +4159,7 @@ mod writable_builder_tests {
     fn test_static_builder_method() {
         let (sink, ops) = RecordingSink::new();
 
-        let stream = WritableStream::builder(sink).build();
+        let stream = WritableStream::builder(sink).spawn(spawn_on_thread);
 
         let (_, writer) = stream.get_writer().unwrap();
         block_on(async {
@@ -4176,7 +4175,7 @@ mod writable_builder_tests {
     #[test]
     fn test_enqueue_method() {
         let (sink, ops) = RecordingSink::new();
-        let stream = WritableStreamBuilder::new(sink).build();
+        let stream = WritableStreamBuilder::new(sink).spawn(spawn_on_thread);
         let (_, writer) = stream.get_writer().unwrap();
 
         block_on(async {
@@ -4197,7 +4196,7 @@ mod writable_builder_tests {
     #[test]
     fn test_enqueue_error_handling() {
         let (sink, _) = RecordingSink::new();
-        let stream = WritableStreamBuilder::new(sink).build();
+        let stream = WritableStreamBuilder::new(sink).spawn(spawn_on_thread);
         let (_, writer) = stream.get_writer().unwrap();
 
         block_on(async {
@@ -4217,9 +4216,8 @@ mod writable_builder_tests {
         let (sink, ops) = RecordingSink::new();
 
         let stream = WritableStreamBuilder::new(sink)
-            .with_strategy(CountQueuingStrategy::new(4))
-            .with_thread_spawn()
-            .build();
+            .strategy(CountQueuingStrategy::new(4))
+            .spawn(spawn_on_thread);
 
         let (_, writer) = stream.get_writer().unwrap();
         block_on(async {

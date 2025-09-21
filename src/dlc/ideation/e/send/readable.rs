@@ -2925,7 +2925,10 @@ mod tests_old {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{readable::ReadableByteSource, writable::WritableStreamDefaultController};
+    use super::super::{
+        readable::ReadableByteSource,
+        writable::{WritableStreamDefaultController, spawn_on_thread},
+    };
     use super::*;
     use futures::stream;
     use std::time::Duration;
@@ -3572,8 +3575,9 @@ mod tests {
 
         // Create a writable sink that records chunks
         let sink = CountingSink::new();
-        let writable =
-            super::WritableStream::new(sink.clone(), Box::new(CountQueuingStrategy::new(10)));
+        let writable = super::WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         // Pipe the readable into the writable
         readable.pipe_to(&writable, None).await.expect("pipe_to");
@@ -3701,10 +3705,9 @@ mod tests {
         let readable = super::ReadableStream::new_default(source, None);
 
         let sink = FailingWriteSink::new(2); // Fail after 2 successful writes
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         // Test: pipe_to should return error when destination write fails
         let pipe_result = readable.pipe_to(&writable, None).await;
@@ -3844,10 +3847,9 @@ mod tests {
         let readable = super::ReadableStream::new_default(source, None);
 
         let sink = TrackingSink::new();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         // Test: pipe_to should return error when source errors
         let pipe_result = readable.pipe_to(&writable, None).await;
@@ -4017,10 +4019,9 @@ mod tests {
         let source = TestSource::new(data.clone());
         let readable = super::ReadableStream::new_default(source.clone(), None);
         let sink = TestSink::new();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let result = readable.pipe_to(&writable, None).await;
         assert!(result.is_ok(), "Normal pipe should succeed");
@@ -4037,10 +4038,9 @@ mod tests {
         let source = TestSource::new(data.clone());
         let readable = super::ReadableStream::new_default(source, None);
         let sink = TestSink::new();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let options = super::StreamPipeOptions {
             prevent_close: true,
@@ -4059,10 +4059,9 @@ mod tests {
         let source = TestSource::new(data).with_error_after(1);
         let readable = super::ReadableStream::new_default(source.clone(), None);
         let sink = TestSink::new();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let options = super::StreamPipeOptions {
             prevent_cancel: true,
@@ -4086,10 +4085,9 @@ mod tests {
         let source = TestSource::new(data).with_error_after(1);
         let readable = super::ReadableStream::new_default(source.clone(), None);
         let sink = TestSink::new();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let options = super::StreamPipeOptions {
             prevent_cancel: false,
@@ -4116,10 +4114,9 @@ mod tests {
         let source = TestSource::new(data);
         let readable = super::ReadableStream::new_default(source.clone(), None);
         let sink = TestSink::new().with_error();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let options = super::StreamPipeOptions {
             prevent_abort: true,
@@ -4146,10 +4143,9 @@ mod tests {
         let source = TestSource::new(data);
         let readable = super::ReadableStream::new_default(source.clone(), None);
         let sink = TestSink::new().with_error();
-        let writable = super::WritableStream::new(
-            sink.clone(),
-            Box::new(super::CountQueuingStrategy::new(10)),
-        );
+        let writable = WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(spawn_on_thread);
 
         let options = super::StreamPipeOptions {
             prevent_abort: false,
@@ -4275,13 +4271,9 @@ mod tests {
             sink.clone(),
             Box::new(crate::dlc::ideation::d::CountQueuingStrategy::new(10)),
         );*/
-        let writable = super::WritableStream::new_with_spawn(
-            sink.clone(),
-            Box::new(CountQueuingStrategy::new(10)),
-            |fut| {
-                tokio::spawn(fut);
-            },
-        );
+        let writable = super::WritableStream::builder(sink.clone())
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::spawn);
 
         // Create abort controller and signal
         let (abort_handle, abort_registration) = futures_util::stream::AbortHandle::new_pair();

@@ -1,7 +1,7 @@
 use super::super::{CountQueuingStrategy, QueuingStrategy, Unlocked, errors::StreamError};
 use super::{
     readable::{DefaultStream, ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    writable::{WritableSink, WritableStream, WritableStreamDefaultController},
+    writable::{WritableSink, WritableStream, WritableStreamDefaultController, spawn_on_thread},
 };
 use futures::{
     channel::{
@@ -69,7 +69,9 @@ impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
 
         // Create the streams - they handle their own queuing
         let readable = ReadableStream::new_with_strategy(readable_source, readable_strategy);
-        let writable = WritableStream::new(writable_sink, Box::new(writable_strategy));
+        let writable = WritableStream::builder(writable_sink)
+            .strategy(writable_strategy)
+            .spawn(spawn_on_thread);
 
         // Spawn the transform task
         let readable_controller = readable.controller.clone();
