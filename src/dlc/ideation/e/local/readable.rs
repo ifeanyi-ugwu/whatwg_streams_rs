@@ -1325,7 +1325,7 @@ where
     StreamType: StreamTypeMarker,
 {
     pub fn get_reader(
-        self,
+        &self,
     ) -> Result<
         (
             ReadableStream<T, Source, StreamType, Locked>,
@@ -1356,15 +1356,15 @@ where
         };
 
         let reader = ReadableStreamDefaultReader::new(ReadableStream {
-            command_tx: self.command_tx,
-            queue_total_size: self.queue_total_size,
-            high_water_mark: self.high_water_mark,
-            desired_size: self.desired_size,
-            closed: self.closed,
-            errored: self.errored,
-            locked: self.locked,
-            stored_error: self.stored_error,
-            controller: self.controller,
+            command_tx: self.command_tx.clone(),
+            queue_total_size: self.queue_total_size.clone(),
+            high_water_mark: self.high_water_mark.clone(),
+            desired_size: self.desired_size.clone(),
+            closed: self.closed.clone(),
+            errored: self.errored.clone(),
+            locked: self.locked.clone(),
+            stored_error: self.stored_error.clone(),
+            controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
         });
@@ -1379,12 +1379,21 @@ where
     Source: ReadableByteSource,
 {
     pub fn get_byob_reader(
-        self,
-    ) -> (
-        ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
-        ReadableStreamBYOBReader<Source, Locked>,
-    ) {
-        self.locked.store(true, Ordering::SeqCst);
+        &self,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
+            ReadableStreamBYOBReader<Source, Locked>,
+        ),
+        StreamError,
+    > {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(StreamError::from("Stream already locked"));
+        }
 
         let locked_stream = ReadableStream {
             command_tx: self.command_tx.clone(),
@@ -1401,20 +1410,20 @@ where
         };
 
         let reader = ReadableStreamBYOBReader::new(ReadableStream {
-            command_tx: self.command_tx,
-            queue_total_size: self.queue_total_size,
-            high_water_mark: self.high_water_mark,
-            desired_size: self.desired_size,
-            closed: self.closed,
-            errored: self.errored,
-            locked: self.locked,
-            stored_error: self.stored_error,
-            controller: self.controller,
+            command_tx: self.command_tx.clone(),
+            queue_total_size: self.queue_total_size.clone(),
+            high_water_mark: self.high_water_mark.clone(),
+            desired_size: self.desired_size.clone(),
+            closed: self.closed.clone(),
+            errored: self.errored.clone(),
+            locked: self.locked.clone(),
+            stored_error: self.stored_error.clone(),
+            controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
         });
 
-        (locked_stream, reader)
+        Ok((locked_stream, reader))
     }
 }
 
@@ -2496,7 +2505,7 @@ mod tests_old {
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
-        let (_locked_stream, byob_reader) = stream.get_byob_reader();
+        let (_locked_stream, byob_reader) = stream.get_byob_reader().unwrap();
 
         let mut buffer = [0u8; 10];
 
@@ -2555,7 +2564,7 @@ mod tests_old {
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
-        let (_locked_stream, byob_reader) = stream.get_byob_reader();
+        let (_locked_stream, byob_reader) = stream.get_byob_reader().unwrap();
 
         let mut buffer = [0u8; 10];
 
@@ -2983,7 +2992,7 @@ mod tests {
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
-        let (_locked, byob_reader) = stream.get_byob_reader();
+        let (_locked, byob_reader) = stream.get_byob_reader().unwrap();
 
         let mut buffer = [0u8; 20];
 
