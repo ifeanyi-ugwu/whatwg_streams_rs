@@ -68,7 +68,9 @@ impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
         let writable_sink = TransformWritableSink::new(transform_tx);
 
         // Create the streams - they handle their own queuing
-        let readable = ReadableStream::new_with_strategy(readable_source, readable_strategy);
+        let readable = ReadableStream::builder(readable_source)
+            .strategy(readable_strategy)
+            .spawn(spawn_on_thread);
         let writable = WritableStream::builder(writable_sink)
             .strategy(writable_strategy)
             .spawn(spawn_on_thread);
