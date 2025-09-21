@@ -1889,7 +1889,7 @@ where
     /// Spawn using a static spawner function reference
     pub fn spawn_ref<F, R>(self, spawn_fn: &'static F) -> WritableStream<T, Sink, Unlocked>
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: Fn(futures::future::BoxFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
