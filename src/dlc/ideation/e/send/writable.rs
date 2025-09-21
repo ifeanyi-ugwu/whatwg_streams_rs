@@ -54,7 +54,6 @@ pub enum StreamCommand<T> {
     },
 }
 
-/// Public handle, clonable, holds task command sender and atomic flags
 #[pin_project]
 pub struct WritableStream<T, Sink, S = Unlocked> {
     command_tx: UnboundedSender<StreamCommand<T>>,
