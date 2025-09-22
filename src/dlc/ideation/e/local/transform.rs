@@ -39,30 +39,6 @@ pub struct TransformStream<I, O> {
 }
 
 impl<I: 'static, O: 'static> TransformStream<I, O> {
-    /// Get the readable side
-    pub fn readable(
-        self,
-    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked> {
-        self.readable
-    }
-
-    /// Get the writable side  
-    pub fn writable(self) -> WritableStream<I, TransformWritableSink<I>, Unlocked> {
-        self.writable
-    }
-
-    /// Split into both sides
-    pub fn split(
-        self,
-    ) -> (
-        ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
-        WritableStream<I, TransformWritableSink<I>, Unlocked>,
-    ) {
-        (self.readable, self.writable)
-    }
-}
-
-impl<I: 'static, O: 'static> TransformStream<I, O> {
     /// Internal builder that wires everything up but does not spawn anything.
     fn new_inner<T>(
         transformer: T,
@@ -99,6 +75,28 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
             writable_fut,
             transform_fut,
         )
+    }
+
+    /// Get the readable side
+    pub fn readable(
+        self,
+    ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked> {
+        self.readable
+    }
+
+    /// Get the writable side  
+    pub fn writable(self) -> WritableStream<I, TransformWritableSink<I>, Unlocked> {
+        self.writable
+    }
+
+    /// Split into both sides
+    pub fn split(
+        self,
+    ) -> (
+        ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
+        WritableStream<I, TransformWritableSink<I>, Unlocked>,
+    ) {
+        (self.readable, self.writable)
     }
 }
 
