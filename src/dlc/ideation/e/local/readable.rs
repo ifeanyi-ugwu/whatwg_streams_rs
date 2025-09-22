@@ -1151,12 +1151,11 @@ where
         self,
     ) -> (
         ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
-        Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>,
+        impl Future<Output = StreamResult<()>>,
     ) {
         let (readable, writable) = self.transform.split();
 
-        let pipe_future =
-            Box::pin(async move { self.source_stream.pipe_to(&writable, self.options).await });
+        let pipe_future = async move { self.source_stream.pipe_to(&writable, self.options).await };
 
         (readable, pipe_future)
     }
@@ -1170,7 +1169,7 @@ where
         SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
     {
         let (readable, pipe_future) = self.prepare();
-        spawn_fn(pipe_future);
+        spawn_fn(Box::pin(pipe_future));
         readable
     }
 
@@ -1183,7 +1182,7 @@ where
         SpawnFn: Fn(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
     {
         let (readable, pipe_future) = self.prepare();
-        spawn_fn(pipe_future);
+        spawn_fn(Box::pin(pipe_future));
         readable
     }
 }
