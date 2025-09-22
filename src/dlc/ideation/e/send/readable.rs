@@ -499,38 +499,6 @@ where
     {
         self.pipe_to_inner(destination, options).await
     }
-
-    pub fn pipe_to_threaded<Sink>(
-        self,
-        destination: WritableStream<T, Sink>,
-        options: Option<StreamPipeOptions>,
-    ) -> std::thread::JoinHandle<StreamResult<()>>
-    where
-        Sink: WritableSink<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        std::thread::spawn(move || {
-            futures::executor::block_on(
-                async move { self.pipe_to_inner(&destination, options).await },
-            )
-        })
-    }
-
-    /*pub fn pipe_to_with_spawn<Sink, SpawnFn, Fut>(
-        self,
-        destination: WritableStream<T, Sink>,
-        options: Option<StreamPipeOptions>,
-        spawn: SpawnFn,
-    ) -> Fut
-    where
-        Sink: WritableSink<T> + Send + Sync + 'static,
-        T: Send + Sync + 'static,
-        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
-        Fut: Future<Output = StreamResult<()>> + 'static,
-    {
-        let fut = Box::pin(async move { self.pipe_to_inner(&destination, options).await });
-        spawn(fut)
-    }*/
 }
 
 // ===== Tee implementation =====
@@ -1264,45 +1232,6 @@ where
         O: Send + 'static + Sync,
     {
         PipeBuilder::new(self, transform, options)
-    }
-}
-
-impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
-where
-    T: Send + Sync + 'static,
-    Source: Send + Sync + 'static,
-    S: StreamTypeMarker + Sync,
-{
-    pub fn _pipe_to_with_spawn<Sink, SpawnFn, Fut>(
-        self,
-        destination: WritableStream<T, Sink>,
-        options: Option<StreamPipeOptions>,
-        spawn: SpawnFn,
-    ) -> Fut
-    where
-        Sink: WritableSink<T> + Send + Sync + 'static,
-        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
-        Fut: Future<Output = StreamResult<()>> + 'static,
-    {
-        let fut: Pin<Box<dyn Future<Output = StreamResult<()>> + Send>> =
-            Box::pin(async move { self.pipe_to_inner(&destination, options).await });
-
-        spawn(fut)
-    }
-
-    pub fn pipe_to_with_spawn<Sink, SpawnFn, Fut>(
-        self,
-        destination: WritableStream<T, Sink>,
-        options: Option<StreamPipeOptions>,
-        spawn: SpawnFn,
-    ) -> Fut
-    where
-        Sink: WritableSink<T> + Send + Sync + 'static,
-        SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>) -> Fut,
-        Fut: Future + 'static,
-    {
-        let fut = Box::pin(async move { self.pipe_to_inner(&destination, options).await });
-        spawn(fut)
     }
 }
 
@@ -4131,8 +4060,9 @@ mod tests {
         tokio::spawn(async move { readable.pipe_to(&writable, Some(pipe_options)).await });*/
         //let handle = readable.pipe_to_threaded(writable, Some(pipe_options));
         //let handle = readable.pipe_to_with_spawn(writable, Some(pipe_options), tokio::spawn);
-        let handle = readable
-            .pipe_to_with_spawn(writable, Some(pipe_options), |fut| tokio::task::spawn(fut));
+        let pipe_handle = tokio::task::spawn({
+            async move { readable.pipe_to(&writable, Some(pipe_options)).await }
+        });
 
         // Let it start processing, then abort after a short delay
         sleep(Duration::from_millis(150)).await; // Allow 2-3 chunks to be written
@@ -4140,9 +4070,7 @@ mod tests {
         abort_handle.abort();
 
         // Wait for the pipe operation to complete
-        //let pipe_result = pipe_handle.await.unwrap();
-        //let pipe_result = handle.join().unwrap();
-        let pipe_result = handle.await.unwrap();
+        let pipe_result = pipe_handle.await.unwrap();
 
         // Verify the pipe operation was aborted
         assert!(pipe_result.is_err());
