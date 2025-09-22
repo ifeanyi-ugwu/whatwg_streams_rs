@@ -2,6 +2,8 @@
 name = "whatwg_streams"
 version = "0.1.0-alpha.1"
 edition = "2024"
+description = "whatwg_streams for rust"
+license = "MIT"
 
 [dependencies]
 async-channel = "2.5.0"
