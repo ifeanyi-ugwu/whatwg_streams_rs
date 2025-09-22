@@ -42,7 +42,7 @@ pub struct DefaultStream;
 pub struct ByteStream;
 
 // ----------- Stream Type Marker Trait -----------
-pub trait StreamTypeMarker: Send + Sync + 'static {
+pub trait StreamTypeMarker: Send + 'static {
     type Controller<T: Send + 'static>: Send + Sync + Clone + 'static;
 }
 
@@ -359,7 +359,7 @@ where
     pub(crate) controller: Arc<StreamType::Controller<T>>,
     //byte_state: Option<Arc<ByteStreamState<Source>>>,
     pub(crate) byte_state: Option<Arc<dyn ByteStreamStateInterface + Send + Sync>>,
-    _phantom: PhantomData<(T, Source, StreamType, LockState)>,
+    _phantom: PhantomData<fn() -> (T, Source, LockState)>,
 }
 
 impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
@@ -900,9 +900,9 @@ where
 
 impl<T, Source, S> TeeBuilder<T, Source, S>
 where
-    T: Clone + Send + 'static + Sync,
-    Source: Send + 'static + Sync,
-    S: StreamTypeMarker + Send + 'static + Sync,
+    T: Clone + Send + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker + Send + 'static,
 {
     fn new(stream: ReadableStream<T, Source, S, Unlocked>) -> Self {
         Self {
@@ -1060,9 +1060,9 @@ where
 
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
-    T: Send + Clone + 'static + Sync,
-    Source: Send + 'static + Sync,
-    S: StreamTypeMarker + Send + Sync,
+    T: Send + Clone + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker + Send + 'static,
 {
     fn tee_inner(
         self,
@@ -1158,10 +1158,10 @@ where
 
 impl<T, O, Source, S> PipeBuilder<T, O, Source, S>
 where
-    T: Send + 'static + Sync,
-    O: Send + 'static + Sync,
-    Source: Send + 'static + Sync,
-    S: StreamTypeMarker + Send + 'static + Sync,
+    T: Send + 'static,
+    O: Send + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker + Send + 'static,
 {
     pub fn new(
         source_stream: ReadableStream<T, Source, S, Unlocked>,
@@ -1180,12 +1180,11 @@ where
         self,
     ) -> (
         ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
-        Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'static>>,
+        impl Future<Output = StreamResult<()>>,
     ) {
         let (readable, writable) = self.transform.split();
 
-        let pipe_future =
-            Box::pin(async move { self.source_stream.pipe_to(&writable, self.options).await });
+        let pipe_future = async move { self.source_stream.pipe_to(&writable, self.options).await };
 
         (readable, pipe_future)
     }
@@ -1199,7 +1198,7 @@ where
         SpawnFn: FnOnce(Pin<Box<dyn Future<Output = StreamResult<()>> + Send + 'static>>) -> R,
     {
         let (readable, pipe_future) = self.prepare();
-        spawn_fn(pipe_future);
+        spawn_fn(Box::pin(pipe_future));
         readable
     }
 
@@ -1212,16 +1211,16 @@ where
         SpawnFn: Fn(Pin<Box<dyn Future<Output = StreamResult<()>> + 'static>>) -> R,
     {
         let (readable, pipe_future) = self.prepare();
-        spawn_fn(pipe_future);
+        spawn_fn(Box::pin(pipe_future));
         readable
     }
 }
 
 impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
-    T: Send + 'static + Sync,
-    Source: Send + 'static + Sync,
-    S: StreamTypeMarker + Send + 'static + Sync,
+    T: Send + 'static,
+    Source: Send + 'static,
+    S: StreamTypeMarker + Send + 'static,
 {
     pub fn pipe_through<O>(
         self,
@@ -1229,7 +1228,7 @@ where
         options: Option<StreamPipeOptions>,
     ) -> PipeBuilder<T, O, Source, S>
     where
-        O: Send + 'static + Sync,
+        O: Send + 'static,
     {
         PipeBuilder::new(self, transform, options)
     }
