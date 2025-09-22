@@ -4761,7 +4761,7 @@ mod pipe_through_tests {
         let source_stream = ReadableStream::from_iterator(data.into_iter()).spawn(tokio::spawn);
 
         // Create transform
-        let transform = TransformStream::new(UppercaseTransformer);
+        let transform = TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn);
 
         // Pipe through
         let result_stream = source_stream
@@ -4794,7 +4794,7 @@ mod pipe_through_tests {
         let data = vec![1, 2, 3, 4];
         let source_stream = ReadableStream::from_iterator(data.into_iter()).spawn(tokio::spawn);
 
-        let transform = TransformStream::new(DoubleTransformer);
+        let transform = TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn);
         let result_stream = source_stream
             .pipe_through(transform, None)
             .spawn(tokio::spawn);
@@ -4813,7 +4813,7 @@ mod pipe_through_tests {
         let data: Vec<String> = vec![];
         let source_stream = ReadableStream::from_iterator(data.into_iter()).spawn(tokio::spawn);
 
-        let transform = TransformStream::new(UppercaseTransformer);
+        let transform = TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn);
         let result_stream = source_stream
             .pipe_through(transform, None)
             .spawn(tokio::spawn);
@@ -4830,13 +4830,13 @@ mod pipe_through_tests {
         let source_stream = ReadableStream::from_iterator(data.into_iter()).spawn(tokio::spawn);
 
         // First transform: double
-        let transform1 = TransformStream::new(DoubleTransformer);
+        let transform1 = TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn);
         let intermediate_stream = source_stream
             .pipe_through(transform1, None)
             .spawn(tokio::spawn);
 
         // Second transform: double again
-        let transform2 = TransformStream::new(DoubleTransformer);
+        let transform2 = TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn);
         let result_stream = intermediate_stream
             .pipe_through(transform2, None)
             .spawn(tokio::spawn);
@@ -4855,7 +4855,7 @@ mod pipe_through_tests {
         let data = vec!["test".to_string()];
         let source_stream = ReadableStream::from_iterator(data.into_iter()).spawn(tokio::spawn);
 
-        let transform = TransformStream::new(UppercaseTransformer);
+        let transform = TransformStream::builder(UppercaseTransformer).spawn(tokio::task::spawn);
 
         let options = StreamPipeOptions {
             prevent_close: false,
@@ -4896,7 +4896,7 @@ mod pipe_through_tests {
         let data = vec![1, 2, 3, 4];
         let source_stream = ReadableStream::from_iterator(data.into_iter()).spawn(tokio::spawn);
 
-        let transform = TransformStream::new(ErrorTransformer);
+        let transform = TransformStream::builder(ErrorTransformer).spawn(tokio::task::spawn);
         let result_stream = source_stream
             .pipe_through(transform, None)
             .spawn(tokio::spawn);

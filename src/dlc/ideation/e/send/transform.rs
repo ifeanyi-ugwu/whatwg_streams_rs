@@ -38,54 +38,41 @@ pub struct TransformStream<I, O: Send + 'static> {
 }
 
 impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
-    /// Create a new TransformStream with default strategies
-    pub fn new<T>(transformer: T) -> Self
-    where
-        T: Transformer<I, O> + Send + 'static,
-    {
-        let default_writable = CountQueuingStrategy::new(1);
-        let default_readable = CountQueuingStrategy::new(1);
-        Self::new_with_strategies(transformer, default_writable, default_readable)
-    }
-
-    /// Create a new TransformStream with custom strategies
-    pub fn new_with_strategies<T, WS, RS>(
+    fn new_inner<T>(
         transformer: T,
-        writable_strategy: WS,
-        readable_strategy: RS,
-    ) -> Self
+        writable_strategy: Box<dyn QueuingStrategy<I> + Send>,
+        readable_strategy: Box<dyn QueuingStrategy<O> + Send>,
+    ) -> (
+        Self,
+        impl Future<Output = ()>, // readable task
+        impl Future<Output = ()>, // writable task
+        impl Future<Output = ()>, // transform task
+    )
     where
-        T: Transformer<I, O> + Send + 'static,
-        WS: QueuingStrategy<I> + Send + Sync + 'static,
-        RS: QueuingStrategy<O> + Send + Sync + 'static,
+        T: Transformer<I, O> + 'static,
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
 
-        // Create the readable source (minimal, just needs to exist)
         let readable_source = TransformReadableSource::new();
-
-        // Create the writable sink that sends data to be transformed
         let writable_sink = TransformWritableSink::new(transform_tx);
 
-        // Create the streams - they handle their own queuing
-        let readable = ReadableStream::builder(readable_source)
-            .strategy(readable_strategy)
-            .spawn(spawn_on_thread);
-        let writable = WritableStream::builder(writable_sink)
-            .strategy(writable_strategy)
-            .spawn(spawn_on_thread);
+        let (readable, readable_fut) =
+            ReadableStream::new_inner(readable_source, readable_strategy);
+        let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
 
-        // Spawn the transform task
-        let readable_controller = readable.controller.clone();
-        let writable_controller = writable.controller.clone();
-        let controller =
-            TransformStreamDefaultController::new(readable_controller, writable_controller);
+        let controller = TransformStreamDefaultController::new(
+            readable.controller.clone(),
+            writable.controller.clone(),
+        );
 
-        std::thread::spawn(move || {
-            futures::executor::block_on(transform_task(transformer, transform_rx, controller));
-        });
+        let transform_fut = transform_task(transformer, transform_rx, controller);
 
-        TransformStream { readable, writable }
+        (
+            TransformStream { readable, writable },
+            readable_fut,
+            writable_fut,
+            transform_fut,
+        )
     }
 
     /// Get the readable side
@@ -108,29 +95,6 @@ impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
         WritableStream<I, TransformWritableSink<I>, Unlocked>,
     ) {
         (self.readable, self.writable)
-    }
-}
-
-/// Creates a new `TransformStream` that acts as an **identity transform**,
-/// passing chunks from the writable side directly to the readable side
-/// without modification.
-///
-/// This provides a convenient way to create a pair of connected
-/// readable and writable streams for tasks like piping or buffering.
-///
-/// # Panics
-/// This method does not panic.
-///
-/// # Example
-/// ```rust
-/// use crate::transform::TransformStream;
-///
-/// let transform_stream = TransformStream::<String, String>::default();
-/// let (readable, writable) = transform_stream.split();
-/// ```
-impl<T: Send + 'static> Default for TransformStream<T, T> {
-    fn default() -> Self {
-        Self::new(IdentityTransformer::new())
     }
 }
 
@@ -363,6 +327,118 @@ impl<T: Send + 'static> Transformer<T, T> for IdentityTransformer<T> {
     }
 }
 
+pub struct TransformStreamBuilder<I, O, T> {
+    transformer: T,
+    writable_strategy: Box<dyn QueuingStrategy<I> + Send>,
+    readable_strategy: Box<dyn QueuingStrategy<O> + Send>,
+}
+
+impl<I: Send + 'static, O: Send + 'static, T: Transformer<I, O> + 'static>
+    TransformStreamBuilder<I, O, T>
+{
+    fn new(transformer: T) -> Self {
+        Self {
+            transformer,
+            writable_strategy: Box::new(CountQueuingStrategy::new(1)),
+            readable_strategy: Box::new(CountQueuingStrategy::new(1)),
+        }
+    }
+
+    pub fn writable_strategy<S: QueuingStrategy<I> + Send + 'static>(mut self, s: S) -> Self {
+        self.writable_strategy = Box::new(s);
+        self
+    }
+
+    pub fn readable_strategy<S: QueuingStrategy<O> + Send + 'static>(mut self, s: S) -> Self {
+        self.readable_strategy = Box::new(s);
+        self
+    }
+
+    /// Return stream + futures without spawning
+    pub fn prepare(
+        self,
+    ) -> (
+        TransformStream<I, O>,
+        impl Future<Output = ()>,
+        impl Future<Output = ()>,
+        impl Future<Output = ()>,
+    ) {
+        TransformStream::new_inner(
+            self.transformer,
+            self.writable_strategy,
+            self.readable_strategy,
+        )
+    }
+
+    /// Spawn bundled into one task
+    pub fn spawn<F, R>(self, spawn_fn: F) -> TransformStream<I, O>
+    where
+        F: FnOnce(futures::future::BoxFuture<'static, ()>) -> R,
+    {
+        let (stream, rfut, wfut, tfut) = self.prepare();
+        let fut = async move {
+            futures::join!(rfut, wfut, tfut);
+        };
+        spawn_fn(Box::pin(fut));
+        stream
+    }
+
+    /// Spawn using a static function reference
+    pub fn spawn_ref<F, R>(self, spawn_fn: &'static F) -> TransformStream<I, O>
+    where
+        F: Fn(futures::future::BoxFuture<'static, ()>) -> R,
+    {
+        let (stream, rfut, wfut, tfut) = self.prepare();
+        let fut = async move {
+            futures::join!(rfut, wfut, tfut);
+        };
+        spawn_fn(Box::pin(fut));
+        stream
+    }
+
+    /// Spawn each part separately
+    pub fn spawn_parts<F1, F2, F3, R1, R2, R3>(
+        self,
+        rf: F1,
+        wf: F2,
+        tf: F3,
+    ) -> TransformStream<I, O>
+    where
+        F1: FnOnce(futures::future::BoxFuture<'static, ()>) -> R1,
+        F2: FnOnce(futures::future::BoxFuture<'static, ()>) -> R2,
+        F3: FnOnce(futures::future::BoxFuture<'static, ()>) -> R3,
+    {
+        let (stream, rfut, wfut, tfut) = self.prepare();
+        rf(Box::pin(rfut));
+        wf(Box::pin(wfut));
+        tf(Box::pin(tfut));
+        stream
+    }
+
+    /// Spawn each part separately using static function references
+    pub fn spawn_parts_ref<R1, R2, R3>(
+        self,
+        rf: &'static (dyn Fn(futures::future::BoxFuture<'static, ()>) -> R1),
+        wf: &'static (dyn Fn(futures::future::BoxFuture<'static, ()>) -> R2),
+        tf: &'static (dyn Fn(futures::future::BoxFuture<'static, ()>) -> R3),
+    ) -> TransformStream<I, O> {
+        let (stream, rfut, wfut, tfut) = self.prepare();
+        rf(Box::pin(rfut));
+        wf(Box::pin(wfut));
+        tf(Box::pin(tfut));
+        stream
+    }
+}
+
+impl<I: Send + 'static, O: Send + 'static> TransformStream<I, O> {
+    /// Returns a builder for this transform stream
+    pub fn builder<T: Transformer<I, O> + 'static>(
+        transformer: T,
+    ) -> TransformStreamBuilder<I, O, T> {
+        TransformStreamBuilder::new(transformer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_transform() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -470,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn test_numeric_transform() {
         let transformer = DoubleTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -491,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn test_filtering_transform() {
         let transformer = OddFilterTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -514,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn test_transform_error_handling() {
         let transformer = ErrorOnThreeTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -539,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_stream() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -554,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_writes_before_read() {
         let transformer = DoubleTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -575,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn test_abort_stream() {
         let transformer = UppercaseTransformer;
-        let transform_stream = TransformStream::new(transformer);
+        let transform_stream = TransformStream::builder(transformer).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -596,7 +672,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_identity_transform_default() {
-        let transform_stream = TransformStream::<i32, i32>::default();
+        let transform_stream =
+            TransformStream::builder(IdentityTransformer::new()).spawn(tokio::task::spawn);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
