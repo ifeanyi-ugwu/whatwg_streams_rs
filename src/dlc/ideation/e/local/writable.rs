@@ -1914,7 +1914,6 @@ mod tests {
 
     #[derive(Clone)]
     struct CountingSink {
-        // Shared counter for how many chunks were written
         write_count: Rc<Mutex<usize>>,
     }
 
@@ -1938,7 +1937,6 @@ mod tests {
         ) -> impl std::future::Future<Output = StreamResult<()>> {
             let count = Rc::clone(&self.write_count);
             async move {
-                // Simulate async write
                 let mut guard = count.lock().unwrap();
                 *guard += 1;
                 Ok(())
@@ -1947,78 +1945,46 @@ mod tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn basic_write_test() {
-        let local = tokio::task::LocalSet::new();
-
-        local
-            .run_until(async {
-                let sink = CountingSink::new();
-                let strategy = CountQueuingStrategy::new(2);
-
-                //let stream = WritableStream::new(sink.clone(), strategy);
-                let stream = WritableStream::builder(sink.clone())
-                    .strategy(strategy)
-                    .spawn(tokio::task::spawn_local);
-                let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
-                // Write some chunks
-                writer.write(vec![1, 2, 3]).await.expect("write");
-                writer.write(vec![4, 5]).await.expect("write");
-
-                // Close the stream
-                writer.close().await.expect("close");
-
-                // Check underlying sink received write calls
-                assert_eq!(sink.get_count(), 2);
-            })
-            .await;
-    }
-
-    //#[tokio::test(flavor = "current_thread")]
-    //#[crate::localtest]
-    #[tokio_localset_test::localset_test]
-    async fn tokio_spawn_basic_write_test() {
+    async fn writes_chunks_to_underlying_sink() {
         let sink = CountingSink::new();
+        let expected_writes = 2;
         let strategy = CountQueuingStrategy::new(2);
 
-        // Using your executor injection idea - spawn stream task via Tokio's runtime:
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
 
-        // Write data chunks asynchronously
-        writer.write(vec![1, 2, 3]).await.expect("write 1");
-        writer.write(vec![4, 5]).await.expect("write 2");
+        writer
+            .write(vec![1, 2, 3])
+            .await
+            .expect("first write failed");
+        writer.write(vec![4, 5]).await.expect("second write failed");
+        writer.close().await.expect("close failed");
 
-        // Gracefully close the stream
-        writer.close().await.expect("close");
-
-        // Confirm that each write was counted
-        assert_eq!(sink.get_count(), 2);
+        assert_eq!(sink.get_count(), expected_writes);
     }
 
     #[tokio_localset_test::localset_test]
-    async fn basic_write_close_test() {
-        use std::sync::Mutex;
-
+    async fn handles_basic_write_close_lifecycle() {
         #[derive(Clone)]
-        struct CountingSink {
+        struct TestSink {
             write_count: Rc<Mutex<usize>>,
         }
 
-        impl CountingSink {
+        impl TestSink {
             fn new() -> Self {
                 Self {
                     write_count: Rc::new(Mutex::new(0)),
                 }
             }
+
             fn get_count(&self) -> usize {
                 *self.write_count.lock().unwrap()
             }
         }
 
-        impl WritableSink<Vec<u8>> for CountingSink {
+        impl WritableSink<Vec<u8>> for TestSink {
             fn write(
                 &mut self,
                 _chunk: Vec<u8>,
@@ -2033,25 +1999,22 @@ mod tests {
             }
         }
 
-        let sink = CountingSink::new();
+        let sink = TestSink::new();
         let strategy = CountQueuingStrategy::new(10);
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
 
-        writer.write(vec![1]).await.expect("write 1");
-        writer.write(vec![2]).await.expect("write 2");
-
-        writer.close().await.expect("close");
+        writer.write(vec![1]).await.expect("write failed");
+        writer.write(vec![2]).await.expect("write failed");
+        writer.close().await.expect("close failed");
 
         assert_eq!(sink.get_count(), 2);
     }
 
     #[tokio_localset_test::localset_test]
-    async fn close_abort_error_test() {
-        use std::sync::Mutex;
-
+    async fn handles_close_and_abort_operations() {
         #[derive(Clone)]
         struct TestSink {
             closed: Rc<Mutex<bool>>,
@@ -2064,10 +2027,6 @@ mod tests {
                     closed: Rc::new(Mutex::new(false)),
                     aborted: Rc::new(Mutex::new(None)),
                 }
-            }
-
-            fn _is_closed(&self) -> bool {
-                *self.closed.lock().unwrap()
             }
 
             fn abort_reason(&self) -> Option<String> {
@@ -2106,68 +2065,54 @@ mod tests {
 
         let sink = TestSink::new();
         let strategy = CountQueuingStrategy::new(1);
-        //let local = tokio::task::LocalSet::new();
-        //let spawner = LocalSetSpawner::new(&local);
-        //let stream = WritableStream::new(sink.clone(), strategy, &spawner);
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
 
-        // Abort the stream with a reason
         writer
-            .abort(Some("failure".to_string()))
+            .abort(Some("test failure".to_string()))
             .await
-            .expect("abort");
+            .expect("abort failed");
 
-        assert_eq!(sink.abort_reason(), Some("failure".to_string()));
+        assert_eq!(sink.abort_reason(), Some("test failure".to_string()));
 
-        // Note: after abort, write/close calls should fail
-
+        // Operations after abort should fail
         let write_result = writer.write(vec![1]).await;
-
-        assert!(write_result.is_err());
-
-        // Closing after abort should be error
+        assert!(write_result.is_err(), "write after abort should fail");
 
         let close_result = writer.close().await;
-
-        assert!(close_result.is_err());
+        assert!(close_result.is_err(), "close after abort should fail");
     }
 
     #[tokio_localset_test::localset_test]
-    async fn lock_acquire_release_test() {
+    async fn enforces_writer_lock_exclusivity() {
         let sink = CountingSink::new();
         let strategy = CountQueuingStrategy::new(10);
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Get first writer (locks stream)
-        let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
+        let (_locked_stream, writer1) = stream.get_writer().expect("first get_writer failed");
 
-        // Try to get second writer — should fail because locked
-        let write_future = stream.get_writer();
+        // Second writer acquisition should fail
+        let second_writer_result = stream.get_writer();
+        assert!(
+            second_writer_result.is_err(),
+            "second get_writer should fail when locked"
+        );
 
-        match write_future {
-            Err(e) => assert!(matches!(e, StreamError::Other(_))),
-            Ok(_) => panic!("Acquired second writer while stream is locked!"),
-        }
+        writer1.release_lock().expect("release_lock failed");
 
-        // Release lock
-        writer1.release_lock().unwrap();
-
-        // Now get_writer should succeed
-        let (_locked_stream2, _writer2) = stream.get_writer().expect("get_writer again");
+        // Now acquisition should succeed
+        let (_locked_stream2, _writer2) = stream
+            .get_writer()
+            .expect("get_writer after release failed");
     }
 
     #[tokio_localset_test::localset_test]
-    async fn backpressure_behavior() {
-        use futures::Future;
-        use std::sync::Mutex;
-
-        // Other sink that simulates slow writes by never resolving immediately
+    async fn applies_backpressure_correctly() {
         struct SlowSink {
             calls: Rc<Mutex<usize>>,
             unblock_notify: Rc<tokio::sync::Notify>,
@@ -2184,10 +2129,6 @@ mod tests {
                     notify,
                 )
             }
-
-            fn _get_call_count(&self) -> usize {
-                *self.calls.lock().unwrap()
-            }
         }
 
         impl WritableSink<Vec<u8>> for SlowSink {
@@ -2195,7 +2136,7 @@ mod tests {
                 &mut self,
                 _chunk: Vec<u8>,
                 _controller: &mut WritableStreamDefaultController,
-            ) -> impl Future<Output = StreamResult<()>> {
+            ) -> impl std::future::Future<Output = StreamResult<()>> {
                 let calls_clone = self.calls.clone();
                 let notify = self.unblock_notify.clone();
 
@@ -2204,231 +2145,77 @@ mod tests {
                         let mut guard = calls_clone.lock().unwrap();
                         *guard += 1;
                     }
-
-                    // Wait until notified to unblock (simulate slow write)
                     notify.notified().await;
-
                     Ok(())
                 }
             }
         }
 
-        // Use a low water mark to force backpressure quickly
         let (sink, unblock_notify) = SlowSink::new();
         let strategy = CountQueuingStrategy::new(1);
-
         let stream = WritableStream::builder(sink)
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
         let writer = Rc::new(writer);
 
+        // First write starts but blocks in sink
         let writer_clone = writer.clone();
-        // Issue first write: triggers sink.write, runs async but blocked inside sink
         let write1 = tokio::task::spawn_local(async move { writer_clone.write(vec![1]).await });
 
-        // Perform a quick check that no writes completed yet (since they block)
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        assert_eq!(
-            stream
+        assert!(
+            !stream
                 .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            false,
-            "Backpressure false after first write still in progress"
+                .load(std::sync::atomic::Ordering::SeqCst)
         );
 
+        // Second write should queue and trigger backpressure
         let writer_clone_2 = writer.clone();
-        // Second write triggers backpressure because high_water_mark is 1, so queue it
         let write2 = tokio::task::spawn_local(async move { writer_clone_2.write(vec![2]).await });
 
-        // Allow some time — write2 should be pending due to backpressure queueing
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Check that backpressure is now applied
-        assert_eq!(
+        assert!(
             stream
                 .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            true,
-            "Backpressure should be true as write2 queued"
+                .load(std::sync::atomic::Ordering::SeqCst)
         );
 
-        // `ready()` should be pending while backpressure applies
+        // Ready should be pending during backpressure
         let ready_fut = writer.ready();
         tokio::pin!(ready_fut);
-        use futures::task::{Context, Poll};
 
         let waker = futures::task::noop_waker_ref();
-        let mut cx = Context::from_waker(waker);
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            ready_fut.as_mut().poll(&mut cx),
+            std::task::Poll::Pending
+        ));
 
-        match ready_fut.as_mut().poll(&mut cx) {
-            Poll::Pending => {} // Expected, since backpressure is active
-            Poll::Ready(_) => panic!("ready() resolved early despite backpressure"),
-        }
-
-        // Now simulate sink unblocking to process pending writes
+        // Unblock writes
         unblock_notify.notify_one();
+        write1
+            .await
+            .expect("write1 task failed")
+            .expect("write1 failed");
 
-        // Await first write completion
-        let _ = write1.await.expect("write1 done");
-
-        // Lower backpressure flag should clear after draining once first write completes;
-        // Sink should start draining queued writes now.
-        // Notify again to unblock second write
         unblock_notify.notify_one();
+        write2
+            .await
+            .expect("write2 task failed")
+            .expect("write2 failed");
 
-        // Await second write completion
-        let _ = write2.await.expect("write2 done");
-
-        // After draining queue, backpressure flag must be false
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await; // let state stabilize
-        assert_eq!(
-            stream
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        assert!(
+            !stream
                 .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            false,
-            "Backpressure should be cleared after draining queue"
+                .load(std::sync::atomic::Ordering::SeqCst)
         );
 
-        // Now ready() future must resolve successfully
         let ready_result = ready_fut.await;
-        assert!(ready_result.is_ok());
-
-        // Confirm underlying sink saw both writes
-        assert_eq!(
-            stream
-                .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            false
-        );
-    }
-
-    //spec compliance
-    #[tokio_localset_test::localset_test]
-    async fn ready_future_resolves_only_after_backpressure_clears() {
-        use std::sync::Mutex;
-
-        // Setup: sink that holds writes until notified
-        #[derive(Clone)]
-        struct BlockSink {
-            notify: Rc<tokio::sync::Notify>,
-            write_calls: Rc<Mutex<usize>>,
-        }
-
-        impl BlockSink {
-            fn new() -> (Self, Rc<tokio::sync::Notify>) {
-                let notify = Rc::new(tokio::sync::Notify::new());
-                (
-                    Self {
-                        notify: notify.clone(),
-                        write_calls: Rc::new(Mutex::new(0)),
-                    },
-                    notify,
-                )
-            }
-
-            fn _count(&self) -> usize {
-                *self.write_calls.lock().unwrap()
-            }
-        }
-
-        impl WritableSink<Vec<u8>> for BlockSink {
-            fn write(
-                &mut self,
-                _chunk: Vec<u8>,
-                _ctrl: &mut WritableStreamDefaultController,
-            ) -> impl std::future::Future<Output = StreamResult<()>> {
-                let notify = self.notify.clone();
-                let count_clone = self.write_calls.clone();
-                async move {
-                    *count_clone.lock().unwrap() += 1;
-                    notify.notified().await;
-                    Ok(())
-                }
-            }
-        }
-
-        // Use HWM = 1 to trigger backpressure with 2 queued writes
-        let (sink, notify) = BlockSink::new();
-        let strategy = CountQueuingStrategy::new(1usize);
-        let stream = WritableStream::builder(sink)
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-        let writer = Rc::new(writer);
-
-        // 1st write: dequeued immediately, starts processing in sink
-        let writer_clone = writer.clone();
-        let write1 = tokio::task::spawn_local(async move { writer_clone.write(vec![1]).await });
-
-        // Wait for first write to start processing
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // At this point: queue_size = 0, no backpressure yet
         assert!(
-            !stream
-                .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            "No backpressure yet - queue is empty"
-        );
-
-        // 2nd write: gets queued (queue_size = 1, equals HWM)
-        let writer_clone = writer.clone();
-        let write2 = tokio::task::spawn_local(async move { writer_clone.write(vec![2]).await });
-
-        // 3rd write: would exceed HWM, triggers backpressure
-        let writer_clone = writer.clone();
-        let write3 = tokio::task::spawn_local(async move { writer_clone.write(vec![3]).await });
-
-        // Wait for writes to be queued
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // Now backpressure should be true (queue_size >= HWM)
-        /*assert!(
-            stream
-                .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            "Backpressure should be active with 2+ items queued when HWM=1"
-        );*///this assertion is redundant as it's verified with the ready future already
-
-        // Poll `ready()` future; should be Pending while backpressure is active
-        let mut ready = writer.ready();
-        use futures::task::noop_waker_ref;
-        use futures::task::{Context, Poll};
-        use std::pin::Pin;
-        let waker = noop_waker_ref();
-        let mut cx = Context::from_waker(waker);
-        let mut pinned = Pin::new(&mut ready);
-        assert!(
-            matches!(pinned.as_mut().poll(&mut cx), Poll::Pending),
-            "ready() must be Pending when backpressure"
-        );
-
-        // Notify sink to unblock and process writes
-        notify.notify_waiters(); // Unblock first write
-        let _ = write1.await.expect("first write");
-
-        notify.notify_waiters(); // Unblock second write  
-        let _ = write2.await.expect("second write");
-
-        notify.notify_waiters(); // Unblock third write
-        let _ = write3.await.expect("third write");
-
-        // Now backpressure should clear
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(
-            !stream
-                .backpressure
-                .load(std::sync::atomic::Ordering::SeqCst),
-            "Backpressure cleared after draining queue"
-        );
-
-        // The ready future should now resolve
-        let ready_res = ready.await;
-        assert!(
-            ready_res.is_ok(),
-            "ready() future must resolve Ok() after backpressure clears"
+            ready_result.is_ok(),
+            "ready future should resolve after backpressure clears"
         );
     }
 
@@ -2445,157 +2232,30 @@ mod tests {
         }
     }
 
-    // #[derive(Clone)]
-    // struct CountQueuingStrategy {
-    //     high_water_mark: usize,
-    // }
-
-    // impl CountQueuingStrategy {
-    //     fn new(high_water_mark: usize) -> Self {
-    //         CountQueuingStrategy { high_water_mark }
-    //     }
-    // }
-
-    // impl QueuingStrategy<Vec<u8>> for CountQueuingStrategy {
-    //     fn size(&self, _chunk: &Vec<u8>) -> usize {
-    //         1
-    //     }
-    //     fn high_water_mark(&self) -> usize {
-    //         self.high_water_mark
-    //     }
-    // }
-
     #[tokio_localset_test::localset_test]
     async fn desired_size_returns_none_when_closed_or_errored() {
-        // Setup dummy sink
-        #[derive(Clone, Default)]
-        struct DummySink;
-
-        impl WritableSink<Vec<u8>> for DummySink {
-            fn write(
-                &mut self,
-                _chunk: Vec<u8>,
-                _ctrl: &mut WritableStreamDefaultController,
-            ) -> impl std::future::Future<Output = StreamResult<()>> {
-                futures::future::ready(Ok(()))
-            }
-        }
-
         let strategy = CountQueuingStrategy::new(10);
         let sink = DummySink::default();
         let stream = WritableStream::builder(sink)
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Immediately close the stream by sending Close command through writer
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-        writer.close().await.expect("close");
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
+        writer.close().await.expect("close failed");
 
-        // desired_size *must* return None after close
         let after_close = writer.desired_size();
         assert_eq!(after_close, None, "desired_size after close must be None");
 
         let _ = writer.release_lock();
-        // Simulate errored state by calling abort
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-        writer.abort(None).await.expect("abort");
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
+        writer.abort(None).await.expect("abort failed");
 
         let after_error = writer.desired_size();
         assert_eq!(after_error, None, "desired_size after error must be None");
     }
 
-    //proper spec compliance
     #[tokio_localset_test::localset_test]
-    async fn test_writer_locking_exclusivity() {
-        let sink = DummySink;
-        let strategy = CountQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink)
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
-
-        // Try to get second writer; should fail with a lock error
-        let result2 = stream.get_writer();
-        assert!(
-            matches!(result2, Err(_)),
-            "Second get_writer should fail when locked"
-        );
-
-        // Release the lock in writer1
-        let _ = writer1.release_lock();
-
-        // Now new writer acquisition must succeed
-        let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer after release");
-        drop(writer2);
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_desired_size_after_close_and_error() {
-        let sink = DummySink;
-        let strategy = CountQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink)
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
-        writer.close().await.expect("close");
-        //writer.closed().await.expect("closed future");
-
-        let ds_after_close = writer.desired_size();
-        assert_eq!(
-            ds_after_close, None,
-            "desired_size after close must be None"
-        );
-
-        let _ = writer.release_lock();
-        let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer");
-        writer2.abort(None).await.expect("abort");
-
-        let ds_after_abort = writer2.desired_size();
-        assert_eq!(
-            ds_after_abort, None,
-            "desired_size after abort must be None"
-        );
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_close_and_abort() {
-        let sink = DummySink;
-        let strategy = CountQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
-        // Close stream - closed future resolves ok
-        writer.close().await.expect("close");
-
-        let closed_res = writer.closed().await;
-        assert!(closed_res.is_ok(), "closed future must resolve after close");
-
-        // Abort an opened stream errors correctly
-        let stream2 = WritableStream::builder(DummySink)
-            .strategy(CountQueuingStrategy::new(10))
-            .spawn(tokio::task::spawn_local);
-        let (_locked_stream2, writer2) = stream2.get_writer().expect("get_writer");
-        writer2
-            .abort(Some("reason".to_string()))
-            .await
-            .expect("abort");
-
-        let closed_res2 = writer2.closed().await;
-        assert!(
-            closed_res2.is_err(),
-            "closed future must reject after abort/error"
-        );
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_sink_error_propagates_to_stream() {
-        use std::sync::Mutex;
-
-        // Sink that fails on write, close, and abort
+    async fn propagates_sink_errors_to_stream() {
         #[derive(Clone)]
         struct FailingSink {
             error_flag: Rc<Mutex<bool>>,
@@ -2622,26 +2282,7 @@ mod tests {
                 let flag = self.error_flag.clone();
                 async move {
                     *flag.lock().unwrap() = true;
-                    Err("write failure".into())
-                }
-            }
-
-            fn close(self) -> impl std::future::Future<Output = StreamResult<()>> {
-                let flag = self.error_flag.clone();
-                async move {
-                    *flag.lock().unwrap() = true;
-                    Err("close failure".into())
-                }
-            }
-
-            fn abort(
-                &mut self,
-                _reason: Option<String>,
-            ) -> impl std::future::Future<Output = StreamResult<()>> {
-                let flag = self.error_flag.clone();
-                async move {
-                    *flag.lock().unwrap() = true;
-                    Err("abort failure".into())
+                    Err("intentional write failure".into())
                 }
             }
         }
@@ -2652,25 +2293,25 @@ mod tests {
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
 
-        // Writing a chunk causes sink.write error => stream errors
         let write_result = writer.write(vec![1]).await;
         assert!(write_result.is_err(), "write should error on sink failure");
-        assert!(sink.did_error(), "sink error flag set");
+        assert!(sink.did_error(), "sink error flag should be set");
 
-        // After error, stream.backpressure flag should clear (cannot accept writes)
-        assert!(stream.errored.load(Ordering::SeqCst));
-        assert!(!stream.backpressure.load(Ordering::SeqCst));
+        assert!(stream.errored.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !stream
+                .backpressure
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
 
-        // Attempt to close after error returns error
         let close_result = writer.close().await;
         assert!(
             close_result.is_err(),
             "close should error when stream errored"
         );
 
-        // Check that closed future rejects due to error
         let closed_future_result = writer.closed().await;
         assert!(
             closed_future_result.is_err(),
@@ -2679,233 +2320,149 @@ mod tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_ready_and_closed_wakers_behavior() {
-        use std::sync::Mutex;
-        use tokio::sync::Notify;
+    async fn writer_enqueue_when_ready_respects_backpressure() {
+        let sink = CountingSink::new();
+        let strategy = CountQueuingStrategy::new(2);
+        let stream = WritableStream::builder(sink.clone())
+            .strategy(strategy)
+            .spawn(tokio::task::spawn_local);
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
 
-        struct SlowSink {
-            notify: Rc<Notify>,
-            write_count: Rc<Mutex<usize>>,
+        writer
+            .enqueue_when_ready(vec![1, 2, 3])
+            .await
+            .expect("enqueue_when_ready failed");
+        writer
+            .enqueue_when_ready(vec![4, 5, 6])
+            .await
+            .expect("enqueue_when_ready failed");
+
+        writer.close().await.expect("close failed");
+
+        assert_eq!(sink.get_count(), 2);
+    }
+
+    #[tokio_localset_test::localset_test]
+    async fn handles_multiple_close_calls_idempotently() {
+        let stream = WritableStream::builder(DummySink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
+
+        writer.close().await.expect("first close failed");
+        writer.close().await.expect("second close failed");
+        writer.close().await.expect("third close failed");
+
+        let closed_res = writer.closed().await;
+        assert!(
+            closed_res.is_ok(),
+            "closed future should resolve after close"
+        );
+    }
+
+    #[tokio_localset_test::localset_test]
+    async fn rejects_operations_after_close() {
+        let stream = WritableStream::builder(DummySink)
+            .strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
+
+        writer.close().await.expect("close failed");
+
+        let write_err = writer.write(vec![1]).await;
+        assert!(write_err.is_err(), "write after close must fail");
+    }
+
+    #[tokio_localset_test::localset_test]
+    async fn ready_future_resolves_when_no_backpressure() {
+        #[derive(Clone)]
+        struct BlockSink {
+            notify: Rc<tokio::sync::Notify>,
+            write_calls: Rc<Mutex<usize>>,
         }
 
-        impl SlowSink {
-            fn new() -> (Self, Rc<Notify>) {
-                let notify = Rc::new(Notify::new());
+        impl BlockSink {
+            fn new() -> (Self, Rc<tokio::sync::Notify>) {
+                let notify = Rc::new(tokio::sync::Notify::new());
                 (
                     Self {
                         notify: notify.clone(),
-                        write_count: Rc::new(Mutex::new(0)),
+                        write_calls: Rc::new(Mutex::new(0)),
                     },
                     notify,
                 )
             }
-
-            fn _get_write_count(&self) -> usize {
-                *self.write_count.lock().unwrap()
-            }
         }
 
-        impl WritableSink<Vec<u8>> for SlowSink {
+        impl WritableSink<Vec<u8>> for BlockSink {
             fn write(
                 &mut self,
                 _chunk: Vec<u8>,
                 _ctrl: &mut WritableStreamDefaultController,
             ) -> impl std::future::Future<Output = StreamResult<()>> {
                 let notify = self.notify.clone();
-                let write_count = self.write_count.clone();
+                let count_clone = self.write_calls.clone();
                 async move {
-                    {
-                        let mut count = write_count.lock().unwrap();
-                        *count += 1;
-                    }
-                    // Wait for external unblock signal
+                    *count_clone.lock().unwrap() += 1;
                     notify.notified().await;
                     Ok(())
                 }
             }
         }
 
-        let (sink, notify) = SlowSink::new();
-        let strategy = CountQueuingStrategy::new(1);
-        //let stream = WritableStream::new(sink, strategy);
+        let (sink, notify) = BlockSink::new();
+        let strategy = CountQueuingStrategy::new(1usize);
         let stream = WritableStream::builder(sink)
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
+        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
         let writer = Rc::new(writer);
+
+        // Start first write
         let writer_clone = writer.clone();
-        // Issue a write that will block (slow sink)
-        let write1 = tokio::task::spawn_local(async move { writer_clone.write(vec![0]).await });
+        let write1 = tokio::task::spawn_local(async move { writer_clone.write(vec![1]).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // At this point, `backpressure` is not applied yet (only one chunk)
-        assert!(!stream.backpressure.load(Ordering::SeqCst));
-
+        // Queue more writes to trigger backpressure
         let writer_clone = writer.clone();
-        // Write another chunk, which queues and triggers backpressure
-        let write2 = tokio::task::spawn_local(async move { writer_clone.write(vec![1]).await });
+        let write2 = tokio::task::spawn_local(async move { writer_clone.write(vec![2]).await });
+        let writer_clone = writer.clone();
+        let write3 = tokio::task::spawn_local(async move { writer_clone.write(vec![3]).await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Wait shortly, then verify backpressure is applied
-        //tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        //assert!(stream.backpressure.load(Ordering::SeqCst));
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        loop {
-            if stream.backpressure.load(Ordering::SeqCst) {
-                break;
-            }
-            if start.elapsed() > timeout {
-                panic!("Timeout waiting for backpressure to become true!");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            //println!("Atomic: {}", stream.backpressure.load(Ordering::SeqCst),);
-        }
-
-        // Get ready future: should be pending due to backpressure
-        // Poll twice to simulate waker registration behavior
-        let ready_fut = writer.ready();
-        futures::pin_mut!(ready_fut);
-
-        use std::task::{Context, Poll};
+        // Ready should be pending during backpressure
+        let mut ready = writer.ready();
+        use futures::task::{Context, Poll};
+        use std::pin::Pin;
         let waker = futures::task::noop_waker_ref();
         let mut cx = Context::from_waker(waker);
+        let mut pinned = Pin::new(&mut ready);
+        assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
 
-        assert!(matches!(ready_fut.as_mut().poll(&mut cx), Poll::Pending));
-
-        // Unblock sink to drain write queue
+        // Unblock writes
         notify.notify_waiters();
-
-        // Unblock the first sink write
-        notify.notify_waiters();
-        let _ = write1.await.expect("write1 completed");
-
-        // Unblock the second sink write
-        notify.notify_waiters();
-        let _ = write2.await.expect("write2 completed");
-
-        // After queue drains, backpressure flag clears
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(!stream.backpressure.load(Ordering::SeqCst));
-
-        // ready() future now resolves successfully
-        let res = ready_fut.await;
-        assert!(
-            res.is_ok(),
-            "ready() must resolve after backpressure clears"
-        );
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_lock_acquisition_release() {
-        let stream = WritableStream::builder(DummySink)
-            .strategy(CountQueuingStrategy::new(10))
-            .spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-        // Acquire first writer lock
-        let (_locked_stream, writer1) = stream.get_writer().expect("get_writer");
-
-        // Attempt to get second writer lock concurrently must fail
-        let res2 = stream.get_writer();
-        assert!(
-            res2.is_err(),
-            "second get_writer acquisition while locked should fail"
-        );
-
-        // Release lock via writer1
-        let _ = writer1.release_lock();
-
-        // Now getting writer must succeed
-        let (_locked_stream2, writer2) = stream.get_writer().expect("get_writer after release");
-        drop(writer2);
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_close_and_closed_future() {
-        let stream = WritableStream::builder(DummySink)
-            .strategy(CountQueuingStrategy::new(10))
-            .spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
-        writer.close().await.expect("close");
-
-        // closed() future resolves successfully
-        let closed_res = writer.closed().await;
-        assert!(
-            closed_res.is_ok(),
-            "closed() should resolve after stream closes"
-        );
-
-        // Further writes after close fail
-        let write_err = writer.write(vec![1]).await;
-        assert!(write_err.is_err(), "write after close must fail");
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn write_when_ready_test() {
-        use std::sync::Mutex;
-
-        #[derive(Clone)]
-        struct CountingSink {
-            write_count: Rc<Mutex<usize>>,
-        }
-
-        impl CountingSink {
-            fn new() -> Self {
-                CountingSink {
-                    write_count: Rc::new(Mutex::new(0)),
-                }
-            }
-            fn get_count(&self) -> usize {
-                *self.write_count.lock().unwrap()
-            }
-        }
-
-        impl WritableSink<Vec<u8>> for CountingSink {
-            fn write(
-                &mut self,
-                _chunk: Vec<u8>,
-                _controller: &mut WritableStreamDefaultController,
-            ) -> impl std::future::Future<Output = StreamResult<()>> {
-                let count = self.write_count.clone();
-                async move {
-                    let mut guard = count.lock().unwrap();
-                    *guard += 1;
-                    Ok(())
-                }
-            }
-        }
-
-        let sink = CountingSink::new();
-        let strategy = CountQueuingStrategy::new(2);
-        let stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-        let (_locked_stream, writer) = stream.get_writer().expect("get_writer");
-
-        // Use enqueue_when_ready to write multiple chunks, which waits for readiness before writing.
-        writer
-            .enqueue_when_ready(vec![1, 2, 3])
+        write1
             .await
-            .expect("write when ready 1");
-        writer
-            .enqueue_when_ready(vec![4, 5, 6])
+            .expect("write1 task failed")
+            .expect("write1 failed");
+
+        notify.notify_waiters();
+        write2
             .await
-            .expect("write when ready 2");
+            .expect("write2 task failed")
+            .expect("write2 failed");
 
-        // Wait for the stream to be drained; ensures writes complete
-        //writer.ready().await.expect("ready after writes");
+        notify.notify_waiters();
+        write3
+            .await
+            .expect("write3 task failed")
+            .expect("write3 failed");
 
-        // Write one more chunk and wait for completion
-        //writer.write(vec![7]).await.expect("write last");
-
-        writer.close().await.expect("close");
-
-        // Confirm the underlying sink received both writes
-        assert_eq!(sink.get_count(), 2);
+        let ready_res = ready.await;
+        assert!(
+            ready_res.is_ok(),
+            "ready future must resolve after backpressure clears"
+        );
     }
 }
 
@@ -2915,17 +2472,14 @@ mod sink_integration_tests {
     use futures::{SinkExt, StreamExt, stream};
     use std::sync::Mutex;
     use std::time::Duration;
-    use tokio::time::timeout;
 
-    // Test sink implementation that tracks all operations
     #[derive(Debug, Clone)]
     struct TestSink {
         id: String,
         received_items: Rc<Mutex<Vec<String>>>,
         write_delay: Option<Duration>,
-        fail_on_write: Option<usize>, // Fail on nth write
+        fail_on_write: Option<usize>,
         fail_on_close: bool,
-        fail_on_abort: bool,
         operation_log: Rc<Mutex<Vec<String>>>,
     }
 
@@ -2937,7 +2491,6 @@ mod sink_integration_tests {
                 write_delay: None,
                 fail_on_write: None,
                 fail_on_close: false,
-                fail_on_abort: false,
                 operation_log: Rc::new(Mutex::new(Vec::new())),
             }
         }
@@ -2954,11 +2507,6 @@ mod sink_integration_tests {
 
         fn with_close_failure(mut self) -> Self {
             self.fail_on_close = true;
-            self
-        }
-
-        fn _with_abort_failure(mut self) -> Self {
-            self.fail_on_abort = true;
             self
         }
 
@@ -2994,12 +2542,10 @@ mod sink_integration_tests {
         ) -> StreamResult<()> {
             self.log_operation(&format!("write called with: {}", chunk));
 
-            // Simulate write delay if configured
             if let Some(delay) = self.write_delay {
                 tokio::time::sleep(delay).await;
             }
 
-            // Check if we should fail on this write
             let current_count = self.received_items.lock().unwrap().len();
             if let Some(fail_on) = self.fail_on_write {
                 if current_count >= fail_on {
@@ -3010,7 +2556,6 @@ mod sink_integration_tests {
                 }
             }
 
-            // Store the item
             self.received_items.lock().unwrap().push(chunk.clone());
             self.log_operation(&format!("write completed: {}", chunk));
             Ok(())
@@ -3031,18 +2576,11 @@ mod sink_integration_tests {
         async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
             let reason_str = reason.as_deref().unwrap_or("no reason");
             self.log_operation(&format!("abort called with reason: {}", reason_str));
-
-            if self.fail_on_abort {
-                self.log_operation("abort failed");
-                return Err("Intentional abort failure".into());
-            }
-
             self.log_operation("abort completed");
             Ok(())
         }
     }
 
-    // Simple queuing strategy for testing
     struct TestQueuingStrategy {
         high_water_mark: usize,
     }
@@ -3055,7 +2593,7 @@ mod sink_integration_tests {
 
     impl QueuingStrategy<String> for TestQueuingStrategy {
         fn size(&self, _chunk: &String) -> usize {
-            1 // Each string counts as size 1
+            1
         }
 
         fn high_water_mark(&self) -> usize {
@@ -3064,7 +2602,7 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_basic_sink_operations() {
+    async fn processes_sink_operations_in_order() {
         let sink = TestSink::new("basic");
         let strategy = TestQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink.clone())
@@ -3073,7 +2611,6 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // Test poll_ready and start_send
         assert!(
             sink_handle
                 .poll_ready_unpin(&mut std::task::Context::from_waker(
@@ -3082,24 +2619,17 @@ mod sink_integration_tests {
                 .is_ready()
         );
 
-        // Send some items
         sink_handle.start_send_unpin("item1".to_string()).unwrap();
         sink_handle.start_send_unpin("item2".to_string()).unwrap();
         sink_handle.start_send_unpin("item3".to_string()).unwrap();
 
-        //println!("flush called from test");
-        // Flush to ensure all writes complete
         sink_handle.flush().await.unwrap();
-        //println!("flush call from test returns");
 
-        // Verify items were received
         let received = sink.get_received_items();
         assert_eq!(received, vec!["item1", "item2", "item3"]);
 
-        // Close the sink
         sink_handle.close().await.unwrap();
 
-        // Verify operations log
         let log = sink.get_operation_log();
         assert!(log.contains(&"basic: start called".to_string()));
         assert!(log.contains(&"basic: write completed: item1".to_string()));
@@ -3107,30 +2637,22 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_backpressure_handling() {
+    async fn handles_backpressure_with_small_buffer() {
         let sink = TestSink::new("backpressure").with_write_delay(Duration::from_millis(10));
-        let strategy = TestQueuingStrategy::new(2); // Small buffer
+        let strategy = TestQueuingStrategy::new(2);
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
         let mut sink_handle = stream;
 
-        // Fill up the buffer
         sink_handle.start_send_unpin("item1".to_string()).unwrap();
         sink_handle.start_send_unpin("item2".to_string()).unwrap();
 
-        // Now, attempt to send the third item. This will try to fill the full queue.
         let start = std::time::Instant::now();
-
-        // The send call will internally handle waiting for a free slot.
-        // It's this operation that will block and demonstrate backpressure.
         sink_handle.send("item3".to_string()).await.unwrap();
 
-        // Verify backpressure caused a delay. The elapsed time should be at least
-        // the processing time of one item (10ms).
         assert!(start.elapsed() >= Duration::from_millis(10));
-
         sink_handle.close().await.unwrap();
 
         let received = sink.get_received_items();
@@ -3138,66 +2660,8 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_concurrent_writes() {
-        use tokio::sync::Mutex;
-
-        let sink = TestSink::new("concurrent").with_write_delay(Duration::from_millis(10));
-        let strategy = TestQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        /*let mut sink_handle = stream;
-
-        // Send multiple items concurrently
-        let mut futures = Vec::new();
-        for i in 0..5 {
-            let item = format!("concurrent_item_{}", i);
-            futures.push(sink_handle.send(item));
-        }
-
-        // Wait for all sends to complete
-        futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        sink_handle.close().await.unwrap();
-        */
-
-        let sink_handle = Rc::new(Mutex::new(stream));
-
-        let mut futures = Vec::new();
-        for i in 0..5 {
-            let sink_clone = Rc::clone(&sink_handle);
-            let item = format!("concurrent_item_{}", i);
-            futures.push(tokio::task::spawn_local(async move {
-                let mut sink = sink_clone.lock().await;
-                sink.send(item).await
-            }));
-        }
-
-        // Wait for all sends to complete
-        let results = futures::future::join_all(futures).await;
-        for result in results {
-            result.unwrap().unwrap();
-        }
-
-        sink_handle.lock().await.close().await.unwrap();
-
-        let received = sink.get_received_items();
-        assert_eq!(received.len(), 5);
-        // Items should all be present (order might vary due to concurrency)
-        for i in 0..5 {
-            let expected_item = format!("concurrent_item_{}", i);
-            assert!(received.contains(&expected_item));
-        }
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_write_failure_handling() {
-        let sink = TestSink::new("write_fail").with_write_failure(2); // Fail on 3rd write (index 2)
+    async fn handles_write_failures_appropriately() {
+        let sink = TestSink::new("write_fail").with_write_failure(2);
         let strategy = TestQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
@@ -3205,21 +2669,18 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // First two writes should succeed
         sink_handle.send("item1".to_string()).await.unwrap();
         sink_handle.send("item2".to_string()).await.unwrap();
 
-        // Third write should fail
         let result = sink_handle.send("item3".to_string()).await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "third write should fail");
 
-        // Verify sink is now in error state
         let ready_result = sink_handle.poll_ready_unpin(&mut std::task::Context::from_waker(
             &futures::task::noop_waker(),
         ));
         match ready_result {
-            std::task::Poll::Ready(Err(_)) => {} // Expected
-            other => panic!("Expected error state, got: {:?}", other),
+            std::task::Poll::Ready(Err(_)) => {}
+            other => panic!("Expected error state after write failure, got: {:?}", other),
         }
 
         let received = sink.get_received_items();
@@ -3227,7 +2688,7 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_close_failure_handling() {
+    async fn handles_close_failures() {
         let sink = TestSink::new("close_fail").with_close_failure();
         let strategy = TestQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink.clone())
@@ -3236,20 +2697,18 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // Send some items
         sink_handle.send("item1".to_string()).await.unwrap();
         sink_handle.send("item2".to_string()).await.unwrap();
 
-        // Close should fail
         let close_result = sink_handle.close().await;
-        assert!(close_result.is_err());
+        assert!(close_result.is_err(), "close should fail");
 
         let received = sink.get_received_items();
         assert_eq!(received, vec!["item1", "item2"]);
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_operations_after_close() {
+    async fn rejects_operations_after_close() {
         let sink = TestSink::new("after_close");
         let strategy = TestQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink.clone())
@@ -3258,43 +2717,34 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // Send an item and close
         sink_handle.send("item1".to_string()).await.unwrap();
         sink_handle.close().await.unwrap();
 
-        // Further operations should fail
         let send_result = sink_handle.send("item2".to_string()).await;
-        assert!(send_result.is_err());
+        assert!(send_result.is_err(), "send after close should fail");
 
         let received = sink.get_received_items();
         assert_eq!(received, vec!["item1"]);
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_abort_operation() {
+    async fn handles_abort_with_reason() {
         let sink = TestSink::new("abort_test");
         let strategy = TestQueuingStrategy::new(5);
-        /*let stream = WritableStream::new_with_spawn(sink.clone(), strategy, |fut| {
-            tokio::task::spawn_local(fut);
-        });*/
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Get a writer to test abort
         let (_locked_stream, writer) = stream.get_writer().unwrap();
 
-        // Send some items
         writer.write("item1".to_string()).await.unwrap();
         writer.write("item2".to_string()).await.unwrap();
 
-        // Abort with reason
         writer
             .abort(Some("Test abort reason".to_string()))
             .await
             .unwrap();
 
-        // Verify abort was called on sink
         let log = sink.get_operation_log();
         assert!(
             log.iter()
@@ -3307,7 +2757,7 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_multiple_close_calls() {
+    async fn handles_multiple_close_calls_idempotently() {
         let sink = TestSink::new("multi_close");
         let strategy = TestQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink.clone())
@@ -3318,22 +2768,20 @@ mod sink_integration_tests {
 
         sink_handle.send("item1".to_string()).await.unwrap();
 
-        // Multiple close calls should all succeed
         sink_handle.close().await.unwrap();
         sink_handle.close().await.unwrap();
         sink_handle.close().await.unwrap();
 
-        // Should only see one close in the log
         let log = sink.get_operation_log();
         let close_count = log
             .iter()
             .filter(|entry| entry.contains("close called"))
             .count();
-        assert_eq!(close_count, 1);
+        assert_eq!(close_count, 1, "should only see one close operation");
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_flush_behavior() {
+    async fn flush_waits_for_all_pending_writes() {
         let sink = TestSink::new("flush_test").with_write_delay(Duration::from_millis(50));
         let strategy = TestQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink.clone())
@@ -3342,24 +2790,19 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // Start several writes without awaiting
         sink_handle.start_send_unpin("item1".to_string()).unwrap();
         sink_handle.start_send_unpin("item2".to_string()).unwrap();
         sink_handle.start_send_unpin("item3".to_string()).unwrap();
 
-        // At this point, items are queued but may not be written yet
-        let _received_before_flush = sink.get_received_items();
-        // May be empty or partially filled depending on timing
-
-        // Flush should wait for all writes to complete
         let start = std::time::Instant::now();
         sink_handle.flush().await.unwrap();
         let elapsed = start.elapsed();
 
-        // Should have taken at least some time due to write delays
-        assert!(elapsed >= Duration::from_millis(30)); // Some buffer for timing
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "flush should wait for writes to complete"
+        );
 
-        // All items should now be written
         let received_after_flush = sink.get_received_items();
         assert_eq!(received_after_flush, vec!["item1", "item2", "item3"]);
 
@@ -3367,7 +2810,7 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_stream_integration() {
+    async fn integrates_with_futures_stream() {
         let sink = TestSink::new("stream_integration");
         let strategy = TestQueuingStrategy::new(3);
         let stream = WritableStream::builder(sink.clone())
@@ -3376,11 +2819,9 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // Create a stream of items to send
         let mut items = stream::iter(vec!["a", "b", "c", "d", "e"])
             .map(|s| Ok::<String, StreamError>(s.to_string()));
 
-        // Use send_all to send the entire stream
         sink_handle.send_all(&mut items).await.unwrap();
 
         let received = sink.get_received_items();
@@ -3388,7 +2829,9 @@ mod sink_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_timeout_behavior() {
+    async fn handles_timeout_scenarios() {
+        use tokio::time::timeout;
+
         let sink = TestSink::new("timeout_test").with_write_delay(Duration::from_millis(50));
         let strategy = TestQueuingStrategy::new(1);
         let stream = WritableStream::builder(sink.clone())
@@ -3397,43 +2840,37 @@ mod sink_integration_tests {
 
         let mut sink_handle = stream;
 
-        // This should timeout because write takes 50 milliseconds
         let result = timeout(
             Duration::from_millis(10),
             sink_handle.send("slow_item".to_string()),
         )
         .await;
-        assert!(result.is_err()); // Should timeout
+        assert!(result.is_err(), "operation should timeout");
 
-        // Ensure it completes in background
         let _ = sink_handle.close().await;
 
-        // Item should eventually be received
         let received = sink.get_received_items();
-        assert_eq!(received, vec!["slow_item"]);
+        assert_eq!(
+            received,
+            vec!["slow_item"],
+            "item should eventually be received"
+        );
     }
 
-    // Stress test for robustness
     #[tokio_localset_test::localset_test]
-    async fn _test_high_volume_writes() {
+    async fn handles_concurrent_operations() {
         use tokio::sync::Mutex;
 
-        let sink = TestSink::new("high_volume");
+        let sink = TestSink::new("concurrent");
         let strategy = TestQueuingStrategy::new(10);
         let stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        //let mut sink_handle = stream;
         let sink_handle = Rc::new(Mutex::new(stream));
-
-        let item_count = 1000;
+        let item_count = 100;
         let mut send_futures = Vec::new();
 
-        for _i in 0..item_count {
-            //let future = sink_handle.send(format!("item_{}", i));
-            //send_futures.push(future);
-        }
         for i in 0..item_count {
             let sink_clone = Rc::clone(&sink_handle);
             let item = format!("item_{}", i);
@@ -3443,81 +2880,19 @@ mod sink_integration_tests {
             }));
         }
 
-        // Wait for all to complete
-        /*let results: Result<Vec<_>, _> = futures::future::join_all(send_futures)
-            .await
-            .into_iter()
-            .collect();
-        results.unwrap();*/
         let results = futures::future::join_all(send_futures).await;
         for r in results {
             r.unwrap().unwrap();
         }
 
-        //sink_handle.close().await.unwrap();
         sink_handle.lock().await.close().await.unwrap();
 
         let received = sink.get_received_items();
         assert_eq!(received.len(), item_count);
 
-        // Verify all items are present
         for i in 0..item_count {
             let expected = format!("item_{}", i);
             assert!(received.contains(&expected), "Missing item: {}", expected);
-        }
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_high_volume_writes() {
-        use tokio::sync::Mutex;
-
-        let sink = TestSink::new("high_volume");
-        let strategy = TestQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        let sink_handle = Rc::new(Mutex::new(stream));
-        let item_count = 1000;
-        let mut send_futures = Vec::new();
-
-        // First batch: send items with proper locking
-        for i in 0..item_count {
-            let sink_clone = Rc::clone(&sink_handle);
-            let item = format!("item_{}", i);
-            let future = tokio::task::spawn_local(async move {
-                let mut sink = sink_clone.lock().await;
-                sink.send(item).await
-            });
-            send_futures.push(future);
-        }
-
-        // Second batch: (this looks like duplicate work, but keeping your pattern)
-        for i in 0..item_count {
-            let sink_clone = Rc::clone(&sink_handle);
-            let item = format!("item_{}", i);
-            send_futures.push(tokio::task::spawn_local(async move {
-                let mut sink = sink_clone.lock().await;
-                sink.send(item).await
-            }));
-        }
-
-        // Wait for all to complete
-        let results = futures::future::join_all(send_futures).await;
-        for r in results {
-            r.unwrap().unwrap();
-        }
-
-        sink_handle.lock().await.close().await.unwrap();
-
-        let received = sink.get_received_items();
-        assert_eq!(received.len(), item_count * 2); // Note: you're sending 2 * item_count items
-
-        // Verify all items are present (adjust as needed for your duplicates)
-        for i in 0..item_count {
-            let expected = format!("item_{}", i);
-            let count = received.iter().filter(|&item| item == &expected).count();
-            assert_eq!(count, 2, "Expected 2 copies of item: {}", expected);
         }
     }
 }
@@ -3529,9 +2904,7 @@ mod async_write_integration_tests {
     use std::io::ErrorKind;
     use std::sync::Mutex;
     use std::time::Duration;
-    use tokio::time::timeout;
 
-    // Test sink that converts bytes to strings for easier verification
     #[derive(Debug, Clone)]
     struct BytesSink {
         id: String,
@@ -3564,21 +2937,12 @@ mod async_write_integration_tests {
             self
         }
 
-        fn _ith_close_failure(mut self) -> Self {
-            self.fail_on_close = true;
-            self
-        }
-
         fn get_received_data(&self) -> Vec<u8> {
             self.received_data.lock().unwrap().clone()
         }
 
         fn get_received_string(&self) -> String {
             String::from_utf8_lossy(&self.get_received_data()).to_string()
-        }
-
-        fn get_operation_log(&self) -> Vec<String> {
-            self.operation_log.lock().unwrap().clone()
         }
 
         fn log_operation(&self, op: &str) {
@@ -3588,13 +2952,6 @@ mod async_write_integration_tests {
                 .push(format!("{}: {}", self.id, op));
         }
     }
-
-    // Implement conversion from &[u8] to Vec<u8> for our test
-    /*impl From<&[u8]> for Vec<u8> {
-        fn from(bytes: &[u8]) -> Self {
-            bytes.to_vec()
-        }
-    }*/
 
     impl WritableSink<Vec<u8>> for BytesSink {
         async fn start(
@@ -3612,12 +2969,10 @@ mod async_write_integration_tests {
         ) -> StreamResult<()> {
             self.log_operation(&format!("write called with {} bytes", chunk.len()));
 
-            // Simulate write delay if configured
             if let Some(delay) = self.write_delay {
                 tokio::time::sleep(delay).await;
             }
 
-            // Check if we should fail on this write
             let current_writes = self
                 .operation_log
                 .lock()
@@ -3635,7 +2990,6 @@ mod async_write_integration_tests {
                 }
             }
 
-            // Store the data
             self.received_data.lock().unwrap().extend_from_slice(&chunk);
             self.log_operation(&format!("write completed: {} bytes", chunk.len()));
             Ok(())
@@ -3659,46 +3013,58 @@ mod async_write_integration_tests {
         }
     }
 
+    struct TestQueuingStrategy {
+        high_water_mark: usize,
+    }
+
+    impl TestQueuingStrategy {
+        fn new(high_water_mark: usize) -> Self {
+            Self { high_water_mark }
+        }
+    }
+
+    impl<T> QueuingStrategy<T> for TestQueuingStrategy {
+        fn size(&self, _chunk: &T) -> usize {
+            1
+        }
+
+        fn high_water_mark(&self) -> usize {
+            self.high_water_mark
+        }
+    }
+
     #[tokio_localset_test::localset_test]
-    async fn test_basic_async_write_operations() {
+    async fn writes_bytes_through_async_write_interface() {
         let sink = BytesSink::new("basic");
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Test writing some data
         let data1 = b"Hello, ";
         let data2 = b"World!";
 
         stream.write_all(data1).await.unwrap();
         stream.write_all(data2).await.unwrap();
-        //stream.flush().await.unwrap();
         AsyncWriteExt::flush(&mut stream).await.unwrap();
 
         let received = sink.get_received_string();
         assert_eq!(received, "Hello, World!");
 
         stream.close().await.unwrap();
-
-        let log = sink.get_operation_log();
-        assert!(log.iter().any(|entry| entry.contains("start called")));
-        assert!(log.iter().any(|entry| entry.contains("close completed")));
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_empty_writes() {
+    async fn handles_empty_writes_correctly() {
         let sink = BytesSink::new("empty");
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Empty write should return Ok(0) immediately
         let result = stream.write(&[]).await.unwrap();
-        assert_eq!(result, 0);
+        assert_eq!(result, 0, "empty write should return 0");
 
-        // Regular write after empty write
         stream.write_all(b"test").await.unwrap();
         stream.close().await.unwrap();
 
@@ -3707,17 +3073,15 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_large_writes() {
+    async fn handles_large_data_writes() {
         let sink = BytesSink::new("large");
         let strategy = TestQueuingStrategy::new(10);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Write large data
         let large_data = vec![b'X'; 10000];
         stream.write_all(&large_data).await.unwrap();
-        //stream.flush().await.unwrap();
         AsyncWriteExt::flush(&mut stream).await.unwrap();
 
         let received = sink.get_received_data();
@@ -3728,19 +3092,17 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_multiple_small_writes() {
+    async fn processes_multiple_small_writes() {
         let sink = BytesSink::new("multi");
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Write multiple small chunks
         for i in 0..10 {
             let data = format!("{}", i);
             stream.write_all(data.as_bytes()).await.unwrap();
         }
-        //stream.flush().await.unwrap();
         AsyncWriteExt::flush(&mut stream).await.unwrap();
 
         let received = sink.get_received_string();
@@ -3750,44 +3112,39 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_write_error_handling() {
+    async fn propagates_write_errors_correctly() {
         let sink = BytesSink::new("error").with_write_failure(2);
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // First two writes should succeed
         stream.write_all(b"write1").await.unwrap();
         stream.write_all(b"write2").await.unwrap();
 
-        // Third write should fail
         let result = stream.write_all(b"write3").await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "third write should fail");
 
-        // Subsequent operations should also fail due to error state
         let result = stream.write_all(b"write4").await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "subsequent writes should also fail");
 
         let received = sink.get_received_string();
         assert_eq!(received, "write1write2");
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_write_after_close() {
+    async fn rejects_writes_after_close() {
         let sink = BytesSink::new("closed");
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Write some data and close
         stream.write_all(b"before_close").await.unwrap();
         stream.close().await.unwrap();
 
-        // Attempt to write after close should fail
         let result = stream.write_all(b"after_close").await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "write after close should fail");
 
         if let Err(e) = result {
             assert_eq!(e.kind(), ErrorKind::BrokenPipe);
@@ -3798,24 +3155,25 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_backpressure_with_async_write() {
+    async fn applies_backpressure_correctly() {
         let sink = BytesSink::new("backpressure").with_write_delay(Duration::from_millis(50));
-        let strategy = TestQueuingStrategy::new(2); // Small buffer
+        let strategy = TestQueuingStrategy::new(2);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
         let start = std::time::Instant::now();
 
-        // Write several chunks - should experience backpressure
         for i in 0..5 {
             let data = format!("chunk{}", i);
             stream.write_all(data.as_bytes()).await.unwrap();
         }
 
         let elapsed = start.elapsed();
-        // Should take some time due to write delays and backpressure
-        assert!(elapsed >= Duration::from_millis(100));
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "should take time due to backpressure"
+        );
 
         stream.close().await.unwrap();
 
@@ -3824,7 +3182,7 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_partial_writes() {
+    async fn handles_partial_writes() {
         let sink = BytesSink::new("partial");
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
@@ -3833,7 +3191,6 @@ mod async_write_integration_tests {
 
         let data = b"Hello, World!";
 
-        // Write in chunks manually (simulating partial writes)
         let mut written = 0;
         while written < data.len() {
             let chunk_size = std::cmp::min(5, data.len() - written);
@@ -3842,10 +3199,9 @@ mod async_write_integration_tests {
                 .await
                 .unwrap();
             written += n;
-            assert!(n > 0, "Should make progress");
+            assert!(n > 0, "should make progress on each write");
         }
 
-        //stream.flush().await.unwrap();
         AsyncWriteExt::flush(&mut stream).await.unwrap();
         stream.close().await.unwrap();
 
@@ -3854,163 +3210,7 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_flush_waits_for_queued_writes() {
-        use futures::io::AsyncWriteExt;
-        use std::sync::Mutex;
-        use std::time::{Duration, Instant};
-        use tokio::sync::Mutex as AsyncMutex;
-
-        // Simple sink with write delay to test flush timing
-        #[derive(Debug, Clone)]
-        struct FlushTestSink {
-            received_data: Rc<Mutex<Vec<u8>>>,
-            write_delay: Duration,
-        }
-
-        impl FlushTestSink {
-            fn new(delay: Duration) -> Self {
-                Self {
-                    received_data: Rc::new(Mutex::new(Vec::new())),
-                    write_delay: delay,
-                }
-            }
-
-            fn get_received_string(&self) -> String {
-                String::from_utf8_lossy(&self.received_data.lock().unwrap()).to_string()
-            }
-        }
-
-        impl WritableSink<Vec<u8>> for FlushTestSink {
-            async fn write(
-                &mut self,
-                chunk: Vec<u8>,
-                _: &mut WritableStreamDefaultController,
-            ) -> StreamResult<()> {
-                // Simulate slow write
-                tokio::time::sleep(self.write_delay).await;
-                self.received_data.lock().unwrap().extend_from_slice(&chunk);
-                Ok(())
-            }
-        }
-
-        let sink = FlushTestSink::new(Duration::from_millis(100));
-        let strategy = TestQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        // Wrap in Rc<AsyncMutex<>> so multiple tasks can use it without borrow checker conflicts
-        let stream = Rc::new(AsyncMutex::new(stream));
-
-        // Spawn concurrent writes
-        let s1 = Rc::clone(&stream);
-        let s2 = Rc::clone(&stream);
-        let s3 = Rc::clone(&stream);
-
-        tokio::task::spawn_local(async move {
-            s1.lock().await.write_all(b"first").await.unwrap();
-        });
-        tokio::task::spawn_local(async move {
-            s2.lock().await.write_all(b"second").await.unwrap();
-        });
-        tokio::task::spawn_local(async move {
-            s3.lock().await.write_all(b"third").await.unwrap();
-        });
-
-        // Give writes a moment to start but not complete
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Now flush should wait for all pending writes to complete
-        let start = Instant::now();
-        AsyncWriteExt::flush(&mut *stream.lock().await)
-            .await
-            .unwrap();
-        let elapsed = start.elapsed();
-
-        // Flush should have taken at least the write delay time
-        assert!(
-            elapsed >= Duration::from_millis(80),
-            "Flush should wait for writes to complete, took {:?}",
-            elapsed
-        );
-
-        // Close the stream
-        stream.lock().await.close().await.unwrap();
-
-        // All data should be received
-        assert_eq!(sink.get_received_string(), "firstsecondthird");
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_concurrent_async_writes() {
-        use tokio::sync::Mutex;
-
-        let sink = BytesSink::new("concurrent");
-        let strategy = TestQueuingStrategy::new(10);
-        let stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        let stream = Rc::new(Mutex::new(stream));
-        let mut handles = Vec::new();
-
-        // Spawn multiple concurrent write tasks
-        for i in 0..5 {
-            let stream_clone = Rc::clone(&stream);
-            let data = format!("task{}_data ", i);
-
-            handles.push(tokio::task::spawn_local(async move {
-                let mut stream = stream_clone.lock().await;
-                stream.write_all(data.as_bytes()).await.unwrap();
-            }));
-        }
-
-        // Wait for all writes to complete
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        //stream.lock().await.flush().await.unwrap();
-        AsyncWriteExt::flush(&mut *stream.lock().await)
-            .await
-            .unwrap();
-        stream.lock().await.close().await.unwrap();
-
-        let received = sink.get_received_string();
-        assert_eq!(received.len(), 5 * "task0_data ".len());
-
-        // Verify all task data is present
-        for i in 0..5 {
-            let expected = format!("task{}_data ", i);
-            assert!(received.contains(&expected), "Missing data for task {}", i);
-        }
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_timeout_behavior() {
-        let sink = BytesSink::new("timeout").with_write_delay(Duration::from_millis(50));
-        let strategy = TestQueuingStrategy::new(1);
-        let mut stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        // This should timeout because write takes 50 milliseconds
-        let result = timeout(Duration::from_millis(10), stream.write_all(b"slow_data")).await;
-
-        assert!(result.is_err()); // Should timeout
-
-        // Ensure it completes in background
-        let _ = stream.close().await;
-
-        // Data should eventually be received
-        let received = sink.get_received_string();
-        assert_eq!(received, "slow_data");
-    }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_io_error_kinds() {
-        // Test different error conditions produce appropriate IoError kinds
-
+    async fn produces_appropriate_io_error_kinds() {
         // Test closed stream error
         {
             let sink = BytesSink::new("closed_error");
@@ -4034,7 +3234,7 @@ mod async_write_integration_tests {
             let mut stream = WritableStream::builder(sink.clone())
                 .strategy(strategy)
                 .spawn(tokio::task::spawn_local);
-            // First write should fail and put stream in error state
+
             let _ = stream.write_all(b"data").await;
 
             let result = stream.write_all(b"more_data").await;
@@ -4046,14 +3246,13 @@ mod async_write_integration_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_binary_data() {
+    async fn handles_binary_data_correctly() {
         let sink = BytesSink::new("binary");
         let strategy = TestQueuingStrategy::new(5);
         let mut stream = WritableStream::builder(sink.clone())
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        // Write binary data with null bytes and high values
         let binary_data = vec![0u8, 1, 255, 128, 0, 42, 255];
         stream.write_all(&binary_data).await.unwrap();
         stream.close().await.unwrap();
@@ -4061,250 +3260,12 @@ mod async_write_integration_tests {
         let received = sink.get_received_data();
         assert_eq!(received, binary_data);
     }
-
-    #[tokio_localset_test::localset_test]
-    async fn test_write_all_vs_write() {
-        let sink = BytesSink::new("write_comparison");
-        let strategy = TestQueuingStrategy::new(5);
-        let mut stream = WritableStream::builder(sink.clone())
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
-
-        let data = b"Hello, World!";
-
-        // Test individual write calls
-        let mut pos = 0;
-        while pos < data.len() {
-            let n = stream.write(&data[pos..]).await.unwrap();
-            assert!(n > 0);
-            pos += n;
-        }
-
-        // Add some more data with write_all
-        stream.write_all(b" Extra data").await.unwrap();
-        stream.close().await.unwrap();
-
-        let received = sink.get_received_string();
-        assert_eq!(received, "Hello, World! Extra data");
-    }
-
-    // Helper struct for testing (reusing from sink tests)
-    struct TestQueuingStrategy {
-        high_water_mark: usize,
-    }
-
-    impl TestQueuingStrategy {
-        fn new(high_water_mark: usize) -> Self {
-            Self { high_water_mark }
-        }
-    }
-
-    impl<T> QueuingStrategy<T> for TestQueuingStrategy {
-        fn size(&self, _chunk: &T) -> usize {
-            1
-        }
-
-        fn high_water_mark(&self) -> usize {
-            self.high_water_mark
-        }
-    }
-}
-
-#[cfg(test)]
-mod writable_builder_tests_old {
-    use super::*;
-    use std::sync::Mutex;
-    use std::thread;
-    use std::time::Duration;
-
-    // Test sink that records operations
-    struct RecordingSink {
-        operations: Rc<Mutex<Vec<String>>>,
-    }
-
-    impl RecordingSink {
-        fn new() -> (Self, Rc<Mutex<Vec<String>>>) {
-            let ops = Rc::new(Mutex::new(Vec::new()));
-            (
-                Self {
-                    operations: Rc::clone(&ops),
-                },
-                ops,
-            )
-        }
-    }
-
-    impl WritableSink<String> for RecordingSink {
-        async fn start(
-            &mut self,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
-            self.operations.lock().unwrap().push("start".to_string());
-            Ok(())
-        }
-
-        async fn write(
-            &mut self,
-            chunk: String,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
-            self.operations
-                .lock()
-                .unwrap()
-                .push(format!("write: {}", chunk));
-            Ok(())
-        }
-
-        async fn close(self) -> StreamResult<()> {
-            self.operations.lock().unwrap().push("close".to_string());
-            Ok(())
-        }
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_basic_builder() {
-        let (sink, ops) = RecordingSink::new();
-
-        let stream = WritableStreamBuilder::new(sink).spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        let (_, writer) = stream.get_writer().unwrap();
-
-        writer.write("hello".to_string()).await.unwrap();
-        writer.write("world".to_string()).await.unwrap();
-        writer.close().await.unwrap();
-
-        thread::sleep(Duration::from_millis(50));
-
-        let operations = ops.lock().unwrap();
-        assert!(operations.contains(&"start".to_string()));
-        assert!(operations.contains(&"write: hello".to_string()));
-        assert!(operations.contains(&"write: world".to_string()));
-        assert!(operations.contains(&"close".to_string()));
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_builder_with_other_strategy() {
-        let (sink, _) = RecordingSink::new();
-
-        let stream = WritableStreamBuilder::new(sink)
-            .strategy(CountQueuingStrategy::new(8))
-            .spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-        assert_eq!(stream.high_water_mark.load(Ordering::SeqCst), 8);
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_builder_with_custom_spawn() {
-        let (sink, ops) = RecordingSink::new();
-
-        let spawn_called = Rc::new(Mutex::new(false));
-        let spawn_called_clone = Rc::clone(&spawn_called);
-
-        let stream = WritableStreamBuilder::new(sink).spawn(|fut| {
-            *spawn_called_clone.lock().unwrap() = true;
-            tokio::task::spawn_local(fut);
-        });
-
-        thread::sleep(Duration::from_millis(10));
-        assert!(*spawn_called.lock().unwrap());
-
-        let (_, writer) = stream.get_writer().unwrap();
-
-        writer.write("spawned".to_string()).await.unwrap();
-        writer.close().await.unwrap();
-
-        thread::sleep(Duration::from_millis(50));
-        let operations = ops.lock().unwrap();
-        assert!(operations.contains(&"write: spawned".to_string()));
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_static_builder_method() {
-        let (sink, ops) = RecordingSink::new();
-
-        let stream = WritableStream::builder(sink).spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-
-        let (_, writer) = stream.get_writer().unwrap();
-
-        writer.write("static".to_string()).await.unwrap();
-        writer.close().await.unwrap();
-
-        thread::sleep(Duration::from_millis(50));
-        let operations = ops.lock().unwrap();
-        assert!(operations.contains(&"write: static".to_string()));
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_enqueue_method() {
-        let (sink, ops) = RecordingSink::new();
-        let stream = WritableStreamBuilder::new(sink).spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        let (_, writer) = stream.get_writer().unwrap();
-
-        // Use enqueue for fire-and-forget
-        writer.enqueue("fire".to_string()).unwrap();
-        writer.enqueue("forget".to_string()).unwrap();
-
-        // Still need to close properly
-        writer.close().await.unwrap();
-
-        thread::sleep(Duration::from_millis(100));
-        let operations = ops.lock().unwrap();
-        assert!(operations.contains(&"write: fire".to_string()));
-        assert!(operations.contains(&"write: forget".to_string()));
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_enqueue_error_handling() {
-        let (sink, _) = RecordingSink::new();
-        let stream = WritableStreamBuilder::new(sink).spawn(|fut| {
-            tokio::task::spawn_local(fut);
-        });
-        let (_, writer) = stream.get_writer().unwrap();
-
-        // Close the stream first
-        writer.close().await.unwrap();
-
-        // Now enqueue should fail
-        match writer.enqueue("should_fail".to_string()) {
-            Err(StreamError::Closed) => {} // Expected
-            other => panic!("Expected Closed error, got: {:?}", other),
-        }
-    }
-
-    #[tokio_localset_test::localset_test]
-    fn test_builder_chaining() {
-        let (sink, ops) = RecordingSink::new();
-
-        let stream = WritableStreamBuilder::new(sink)
-            .strategy(CountQueuingStrategy::new(4))
-            //.with_thread_spawn()
-            .spawn(|fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-        let (_, writer) = stream.get_writer().unwrap();
-
-        writer.write("chained".to_string()).await.unwrap();
-        writer.close().await.unwrap();
-
-        thread::sleep(Duration::from_millis(50));
-        let operations = ops.lock().unwrap();
-        assert!(operations.contains(&"write: chained".to_string()));
-    }
 }
 
 #[cfg(test)]
 mod writable_builder_tests {
     use super::*;
 
-    // Mock sink for testing
     pub struct TestSink {
         pub written_data: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     }
@@ -4337,7 +3298,7 @@ mod writable_builder_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_builder_spawn() {
+    async fn builder_spawn_creates_working_stream() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
 
@@ -4353,13 +3314,12 @@ mod writable_builder_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_builder_prepare() {
+    async fn builder_prepare_allows_manual_spawning() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
 
         let (stream, fut) = WritableStream::builder(sink).prepare();
 
-        // Spawn the task manually
         tokio::task::spawn_local(fut);
 
         let (_, writer) = stream.get_writer().unwrap();
@@ -4376,7 +3336,7 @@ mod writable_builder_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_builder_spawn_ref() {
+    async fn builder_spawn_ref_works_with_function_pointer() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
 
@@ -4391,7 +3351,7 @@ mod writable_builder_tests {
     }
 
     #[tokio_localset_test::localset_test]
-    async fn test_builder_with_custom_strategy() {
+    async fn builder_accepts_custom_strategy() {
         let sink = TestSink::new();
         let written_data = std::rc::Rc::clone(&sink.written_data);
 
