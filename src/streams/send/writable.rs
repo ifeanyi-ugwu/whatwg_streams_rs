@@ -2,10 +2,10 @@ use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked, erro
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
+use futures::future::AbortHandle;
 use futures::future::poll_fn;
 use futures::{AsyncWrite, SinkExt, StreamExt, future};
 use futures::{channel::mpsc::UnboundedReceiver, task::AtomicWaker};
-use futures_util::future::AbortHandle;
 use pin_project::pin_project;
 use std::collections::VecDeque;
 use std::future::Future;

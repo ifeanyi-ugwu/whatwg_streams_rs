@@ -4044,7 +4044,7 @@ mod tests {
             .spawn(tokio::spawn);
 
         // Create abort controller and signal
-        let (abort_handle, abort_registration) = futures_util::stream::AbortHandle::new_pair();
+        let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
 
         // Start the pipe operation with abort signal
         let pipe_options = super::StreamPipeOptions {
