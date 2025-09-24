@@ -16,6 +16,65 @@ Add to your `Cargo.toml`:
 whatwg_streams = "0.1.0"
 ```
 
+## Runtime Agnostic
+
+This crate is **not tied to any specific async runtime**.  
+When you call `.spawn(...)`, you provide a function or closure that schedules/runs background tasks in the runtime you choose.
+
+For example:
+
+### Tokio
+
+```rust
+let stream = ReadableStream::from_vec(vec![1, 2, 3])
+    .spawn(tokio::task::spawn);
+```
+
+### async-std
+
+```rust
+let stream = ReadableStream::from_vec(vec![1, 2, 3])
+    .spawn(async_std::task::spawn);
+```
+
+### smol
+
+```rust
+let stream = ReadableStream::from_vec(vec![1, 2, 3])
+    .spawn(smol::spawn);
+```
+
+### Custom executor
+
+You can also supply your own executor/spawner.
+Here is how you might use `futures::executor::LocalPool`:
+
+```rust
+use futures::executor::LocalPool;
+use futures::task::LocalSpawnExt;
+
+let mut pool = LocalPool::new();
+let spawner = pool.spawner();
+
+let stream = ReadableStream::from_vec(vec![10, 20, 30])
+    .spawn(|fut| spawner.spawn_local(fut).unwrap());
+
+// Drive your application code on the pool
+pool.run_until(async move {
+    // Application code goes here
+    let (_, reader) = stream.get_reader().unwrap();
+
+    let mut got = Vec::new();
+    while let Some(item) = reader.read().await.expect("read failed") {
+        got.push(item);
+    }
+
+    assert_eq!(got, vec![10, 20, 30]);
+
+    // you can run other async tasks here too
+});
+```
+
 ### Basic Usage
 
 ```rust
