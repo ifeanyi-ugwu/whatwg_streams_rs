@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, rc::Rc};
+use std::{error::Error, fmt, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub enum StreamError {
@@ -6,20 +6,20 @@ pub enum StreamError {
     Aborted(Option<String>),
     Closing,
     Closed,
-    Other(Rc<dyn Error>),
+    Other(Arc<dyn Error + Send + Sync>),
 }
 
 impl StreamError {
     /// Wrap any error type into `StreamError`
     pub fn other<E>(e: E) -> Self
     where
-        E: Error + 'static,
+        E: Error + Send + Sync + 'static,
     {
-        StreamError::Other(Rc::new(e))
+        StreamError::Other(Arc::new(e))
     }
 
     /// Wrap a boxed error
-    pub fn other_boxed(e: Box<dyn Error>) -> Self {
+    pub fn other_boxed(e: Box<dyn Error + Send + Sync>) -> Self {
         StreamError::Other(e.into())
     }
 }
@@ -34,7 +34,7 @@ impl From<&str> for StreamError {
             }
         }
         impl Error for SimpleError {}
-        StreamError::Other(Rc::new(SimpleError(s.to_string())))
+        StreamError::Other(Arc::new(SimpleError(s.to_string())))
     }
 }
 
@@ -46,23 +46,42 @@ impl From<String> for StreamError {
 
 impl From<std::io::Error> for StreamError {
     fn from(e: std::io::Error) -> Self {
-        StreamError::Other(Rc::new(e))
+        StreamError::Other(Arc::new(e))
     }
 }
 
-impl From<Box<dyn Error>> for StreamError {
-    fn from(e: Box<dyn Error>) -> Self {
+impl From<Box<dyn Error + Send + Sync>> for StreamError {
+    fn from(e: Box<dyn Error + Send + Sync>) -> Self {
         StreamError::Other(e.into())
     }
 }
 
+/// Macro for users to add direct `From` implementations for their error types.
+/// This allows using `?` directly without `.map_err(StreamError::other)`.
+///
+/// # Example
+/// ```rust
+/// use your_crate::{StreamError, impl_stream_error_from};
+///
+/// impl_stream_error_from!(
+///     serde_json::Error,
+///     reqwest::Error,
+///     your_custom::Error,
+/// );
+///
+/// // Now you can use ? directly:
+/// fn example() -> Result<(), StreamError> {
+///     let data = serde_json::from_str("{}")?;  // Direct ? works!
+///     Ok(())
+/// }
+/// ```
 #[macro_export]
-macro_rules! impl_local_stream_error_from {
+macro_rules! impl_stream_error_from {
     ($($error_type:ty),* $(,)?) => {
         $(
-            impl From<$error_type> for $crate::dlc::ideation::e::local::error::StreamError {
+            impl From<$error_type> for $crate::streams::send::error::StreamError {
                 fn from(e: $error_type) -> Self {
-                    $crate::dlc::ideation::e::local::error::StreamError::Other(std::rc::Rc::new(e))
+                    $crate::streams::send::error::StreamError::Other(std::sync::Arc::new(e))
                 }
             }
         )*
@@ -136,7 +155,7 @@ mod tests {
         }
         impl Error for UserCustomError {}
 
-        impl_local_stream_error_from!(UserCustomError);
+        impl_stream_error_from!(UserCustomError);
 
         fn user_function() -> Result<(), StreamError> {
             fn might_fail() -> Result<(), UserCustomError> {
@@ -152,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_mixed_error_handling() -> Result<(), StreamError> {
-        fn might_fail_json() -> Result<(), Box<dyn Error>> {
+        fn might_fail_json() -> Result<(), Box<dyn Error + Send + Sync>> {
             Err("json parse error".into())
         }
 
@@ -171,7 +190,7 @@ mod tests {
 
         might_fail_json().map_err(StreamError::other_boxed)?;
         might_fail_custom().map_err(StreamError::other)?;
-        might_fail_json()?; // via From<Box<dyn Error>>
+        might_fail_json()?; // works via From<Box<dyn Error>>
 
         Ok(())
     }

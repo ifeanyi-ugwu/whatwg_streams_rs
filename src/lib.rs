@@ -1,5 +1,5 @@
-pub mod dlc;
-pub use dlc::ideation::e::{send::*, *};
+pub mod streams;
+pub use streams::{send::*, *};
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
