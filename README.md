@@ -75,6 +75,27 @@ pool.run_until(async move {
 });
 ```
 
+### Raw Thread Execution
+
+Streams are fully runtime-agnostic: `.spawn(...)` accepts any spawner that drives a future.
+This means you can even run a stream on a raw thread without a full async runtime:
+
+```rust
+use futures::executor::block_on;
+use whatwg_streams::ReadableStream;
+
+// Each future is driven to completion inside a separate thread
+let stream = ReadableStream::from_vec(vec![1, 2, 3])
+    .spawn(|fut| {
+        std::thread::spawn(move || {
+            block_on(fut);
+        });
+    });
+```
+
+This approach is useful for lightweight single-use threads or environments where you don’t want a full async runtime.
+For most applications, using a proper runtime like Tokio, async-std, or Smol remains recommended.
+
 ## Local Streams (non-Send)
 
 In addition to the default `send`-based API, this crate also provides a **`local`** module.
