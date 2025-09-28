@@ -88,17 +88,27 @@ This is useful if you’re using executors like `tokio::task::spawn_local` or `f
 
 ```rust
 use whatwg_streams::local::ReadableStream;
+use futures::StreamExt;
+use tokio::task::LocalSet;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let stream = ReadableStream::from_vec(vec![1, 2, 3])
-        .spawn(tokio::task::spawn_local);
+    let local = LocalSet::new();
 
-    let (_, mut reader) = stream.get_reader().unwrap();
+    local.run_until(async {
+        let stream = ReadableStream::from_vec(vec![1, 2, 3])
+            .spawn(tokio::task::spawn_local);
 
-    while let Some(item) = reader.read().await.unwrap() {
-        println!("Got: {}", item);
-    }
+        let (_, mut reader) = stream.get_reader().unwrap();
+        let mut collected = Vec::new();
+
+        while let Some(item) = reader.read().await.unwrap() {
+            collected.push(item);
+        }
+
+        assert_eq!(collected, vec![1, 2, 3]);
+        println!("Local stream read successfully!");
+    }).await;
 }
 ```
 
