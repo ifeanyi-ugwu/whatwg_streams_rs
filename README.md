@@ -75,6 +75,37 @@ pool.run_until(async move {
 });
 ```
 
+## Local Streams (non-Send)
+
+In addition to the default `send`-based API, this crate also provides a **`local`** module.
+It offers the exact same `ReadableStream`, `WritableStream`, and `TransformStream` types, but optimized for **single-threaded runtimes**:
+
+- Internally uses `Rc` instead of `Arc`.
+- Futures are **not required to be `Send`**.
+- Slightly lower overhead if you don’t need multi-threaded execution.
+
+This is useful if you’re using executors like `tokio::task::spawn_local` or `futures::executor::LocalPool`.
+
+```rust
+use whatwg_streams::local::ReadableStream;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let stream = ReadableStream::from_vec(vec![1, 2, 3])
+        .spawn(tokio::task::spawn_local);
+
+    let (_, mut reader) = stream.get_reader().unwrap();
+
+    while let Some(item) = reader.read().await.unwrap() {
+        println!("Got: {}", item);
+    }
+}
+```
+
+Both `send` and `local` modules expose the same API surface.
+Choose **`send`** (default) if you want multi-threaded flexibility,
+or **`local`** if you’re sure everything runs on a single thread.
+
 ### Basic Usage
 
 ```rust
