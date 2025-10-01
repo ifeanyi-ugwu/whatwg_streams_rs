@@ -2,7 +2,6 @@ use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked, erro
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
-use futures::future::AbortHandle;
 use futures::future::poll_fn;
 use futures::{AsyncWrite, SinkExt, StreamExt, future};
 use futures::{channel::mpsc::UnboundedReceiver, task::AtomicWaker};
@@ -862,8 +861,6 @@ enum InFlight<Sink> {
     Write {
         fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)> + Send>>,
         completion: Option<oneshot::Sender<StreamResult<()>>>,
-        chunk_size: usize,
-        abort_handle: Option<AbortHandle>,
     },
     Close {
         fut: Pin<Box<dyn Future<Output = StreamResult<()>> + Send>>,
@@ -1048,8 +1045,6 @@ async fn stream_task<T, Sink>(
                             (sink, result)
                         }),
                         completion: Some(completion),
-                        chunk_size,
-                        abort_handle: None, // Remove this entirely
                     });
                 } else {
                     let _ = pw

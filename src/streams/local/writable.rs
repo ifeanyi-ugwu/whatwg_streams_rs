@@ -3,7 +3,6 @@ use super::error::StreamError;
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
-use futures::future::AbortHandle;
 use futures::future::poll_fn;
 use futures::{AsyncWrite, SinkExt, StreamExt, future};
 use futures::{channel::mpsc::UnboundedReceiver, task::AtomicWaker};
@@ -864,8 +863,6 @@ enum InFlight<Sink> {
     Write {
         fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)>>>,
         completion: Option<oneshot::Sender<StreamResult<()>>>,
-        chunk_size: usize,
-        abort_handle: Option<AbortHandle>,
     },
     Close {
         fut: Pin<Box<dyn Future<Output = StreamResult<()>>>>,
@@ -1050,8 +1047,6 @@ async fn stream_task<T, Sink>(
                             (sink, result)
                         }),
                         completion: Some(completion),
-                        chunk_size,
-                        abort_handle: None, // Remove this entirely
                     });
                 } else {
                     let _ = pw.completion_tx.send(Err("Sink missing".into()));

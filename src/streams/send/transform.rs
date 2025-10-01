@@ -1,7 +1,7 @@
 use super::super::{CountQueuingStrategy, QueuingStrategy, Unlocked, errors::StreamError};
 use super::{
     readable::{DefaultStream, ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    writable::{WritableSink, WritableStream, WritableStreamDefaultController, spawn_on_thread},
+    writable::{WritableSink, WritableStream, WritableStreamDefaultController},
 };
 use futures::{
     channel::{
