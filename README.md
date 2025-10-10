@@ -56,12 +56,11 @@ use futures::task::LocalSpawnExt;
 let mut pool = LocalPool::new();
 let spawner = pool.spawner();
 
-let stream = ReadableStream::from_vec(vec![10, 20, 30])
-    .spawn(|fut| spawner.spawn_local(fut).unwrap());
-
 // Drive your application code on the pool
 pool.run_until(async move {
-    // Application code goes here
+    let stream = ReadableStream::from_vec(vec![10, 20, 30])
+        .spawn(|fut| spawner.spawn_local(fut).unwrap());
+
     let (_, reader) = stream.get_reader().unwrap();
 
     let mut got = Vec::new();
