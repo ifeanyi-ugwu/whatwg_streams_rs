@@ -4,3 +4,87 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4.41", features = ["serde"] }
+flate2 = "1.1.2"
+futures = "0.3.31"
+futures-util = "0.3.31"
+serde = "1.0.219"
+serde_json = "1.0.143"
+tar = "0.4.44"
+tokio = { version = "1.47.1", features = ['full'] }
+tokio-tungstenite = "0.27.0"
+url = "2.5.7"
+uuid = { version = "1.18.0", features = ["v4"] }
+whatwg_streams = { version = "*", path = "/Users/ifeanyi/Projects/Personal/open-source/whatwg_streams/whatwg_streams_rs" }
+
+[[example]]
+name = "log_filter"
+path = "examples/file_processing/log_filter.rs"
+
+[[example]]
+name = "file_reader_byob"
+path = "examples/bytes/file_reader_byob.rs"
+
+[[example]]
+name = "gzip_transform"
+path = "examples/compression/gzip_transform.rs"
+
+[[example]]
+name = "csv_processor"
+path = "examples/file_processing/csv_processor.rs"
+
+[[example]]
+name = "websocket_proxy"
+path = "examples/network/websocket_proxy.rs"
+
+[[example]]
+name = "websocket"
+path = "examples/network/websocket.rs"
+
+[[example]]
+name = "tcp_relay"
+path = "examples/network/tcp_relay.rs"
+
+[[example]]
+name = "buffer_pool"
+path = "examples/bytes/buffer_pool.rs"
+
+[[example]]
+name = "binary_protocol"
+path = "examples/bytes/binary_protocol.rs"
+
+[[example]]
+name = "simple_readable"
+path = "examples/basic/simple_readable.rs"
+
+[[example]]
+name = "simple_writable"
+path = "examples/basic/simple_writable.rs"
+
+[[example]]
+name = "simple_transform"
+path = "examples/basic/simple_transform.rs"
+
+[[example]]
+name = "json_stream"
+path = "examples/file_processing/json_stream.rs"
+
+[[example]]
+name = "decompress_stream"
+path = "examples/compression/decompress_stream.rs"
+
+[[example]]
+name = "archive_creator"
+path = "examples/compression/archive_creator.rs"
+
+[[example]]
+name = "backpressure_demo"
+path = "examples/advanced/backpressure_demo.rs"
+
+[[example]]
+name = "multi_stage_pipeline"
+path = "examples/advanced/multi_stage_pipeline.rs"
+
+[[example]]
+name = "http_response"
+path = "examples/network/http_response.rs"
