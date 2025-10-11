@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Streams Demo</title>
+  </head>
+  <body>
+    <h1>Streams Demo (Readable → Transform → Output)</h1>
+    <pre id="stream-output"></pre>
+
+    <script type="module">
+      import init, { run_stream_demo } from "./pkg/local_stream_wasm.js";
+
+      async function main() {
+        await init();
+        await run_stream_demo("stream-output");
+      }
+
+      main();
+    </script>
+  </body>
+</html>

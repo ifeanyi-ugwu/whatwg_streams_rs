@@ -1,0 +1,25 @@
+<canvas id="my-canvas" width="300" height="300"></canvas>
+<br />
+<button id="invert-btn">Invert Colors</button>
+
+<script type="module">
+  import init, { run_stream_demo } from "./pkg/local_stream_wasm.js";
+
+  async function main() {
+    await init();
+
+    const canvas = document.getElementById("my-canvas");
+    const ctx = canvas.getContext("2d");
+
+    // Draw something first
+    ctx.fillStyle = "red";
+    ctx.fillRect(50, 50, 200, 200);
+
+    // Hook up button
+    document.getElementById("invert-btn").addEventListener("click", () => {
+      run_stream_demo("my-canvas");
+    });
+  }
+
+  main();
+</script>

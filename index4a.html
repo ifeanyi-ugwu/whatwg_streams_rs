@@ -1,0 +1,19 @@
+<canvas id="my-canvas" width="300" height="300"></canvas>
+<script type="module">
+  import init, { run_stream_demo } from "./pkg/local_stream_wasm.js";
+
+  async function main() {
+    await init();
+
+    // draw something first
+    const canvas = document.getElementById("my-canvas");
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "red";
+    ctx.fillRect(50, 50, 200, 200);
+
+    // now invert it through WASM stream
+    run_stream_demo("my-canvas");
+  }
+
+  main();
+</script>
