@@ -1,4 +1,6 @@
-use super::{super::StreamResult, readable::ReadableByteStreamController};
+use super::{error::StreamError, readable::ReadableByteStreamController};
+
+pub type StreamResult<T> = Result<T, StreamError>;
 
 pub trait ReadableByteSource: Send + Sized + 'static {
     fn start(

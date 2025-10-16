@@ -1,4 +1,4 @@
-use super::super::errors::StreamError;
+use super::error::StreamError;
 use super::{byte_source_trait::ReadableByteSource, readable::ReadableByteStreamController};
 use futures::future::poll_fn;
 use parking_lot::Mutex;
@@ -88,7 +88,7 @@ where
                 .error
                 .lock()
                 .clone()
-                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                .unwrap_or_else(|| StreamError::from("Stream errored"));
             return Poll::Ready(Err(error));
         }
 
@@ -167,7 +167,7 @@ where
                 .error
                 .lock()
                 .clone()
-                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                .unwrap_or_else(|| StreamError::from("Stream errored"));
             return Poll::Ready(Err(error));
         }
 
@@ -258,10 +258,10 @@ where
     // Called by source when data is produced
     pub fn enqueue_data(&self, data: &[u8]) {
         /*if self.byte_state.closed.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Stream is closed".into()));
+            return Err(StreamError::Closed);
         }
         if self.byte_state.errored.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Stream is errored".into()));
+            return Err(StreamError::from("Stream is errored"));
         }*/
 
         if data.is_empty() {
@@ -398,7 +398,7 @@ where
                     .error
                     .lock()
                     .clone()
-                    .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                    .unwrap_or_else(|| StreamError::from("Stream errored"));
                 return Poll::Ready(Err(error));
             }
 

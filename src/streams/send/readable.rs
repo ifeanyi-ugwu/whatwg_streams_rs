@@ -1,4 +1,5 @@
-use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked, errors::StreamError};
+use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked};
+use super::error::StreamError;
 pub use super::byte_source_trait::ReadableByteSource;
 use super::{
     byte_state::{ByteStreamState, ByteStreamStateInterface},
@@ -206,28 +207,28 @@ impl<T> ReadableStreamDefaultController<T> {
     pub fn close(&self) -> StreamResult<()> {
         self.tx
             .unbounded_send(ControllerMsg::Close)
-            .map_err(|_| StreamError::Custom("Failed to close stream".into()))?;
+            .map_err(|_| StreamError::from("Failed to close stream"))?;
         Ok(())
     }
 
     pub fn enqueue(&self, chunk: T) -> StreamResult<()> {
         if self.closed.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Stream is closed".into()));
+            return Err(StreamError::Closed);
         }
         if self.errored.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Stream is errored".into()));
+            return Err(StreamError::from("Stream is errored"));
         }
 
         self.tx
             .unbounded_send(ControllerMsg::Enqueue { chunk })
-            .map_err(|_| StreamError::Custom("Failed to enqueue chunk".into()))?;
+            .map_err(|_| StreamError::from("Failed to enqueue chunk"))?;
         Ok(())
     }
 
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
         self.tx
             .unbounded_send(ControllerMsg::Error(error))
-            .map_err(|_| StreamError::Custom("Failed to error stream".into()))?;
+            .map_err(|_| StreamError::from("Failed to error stream"))?;
         Ok(())
     }
 }
@@ -258,10 +259,10 @@ impl ReadableByteStreamController {
 
     pub fn enqueue(&mut self, chunk: Vec<u8>) -> StreamResult<()> {
         if self.byte_state.is_closed() {
-            return Err(StreamError::Custom("Stream is closed".into()));
+            return Err(StreamError::Closed);
         }
         if self.byte_state.is_errored() {
-            return Err(StreamError::Custom("Stream is errored".into()));
+            return Err(StreamError::from("Stream is errored"));
         }
 
         self.byte_state.enqueue_data(&chunk);
@@ -327,7 +328,7 @@ where
     fn get_stored_error(&self) -> StreamError {
         self.stored_error
             .clone()
-            .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()))
+            .unwrap_or_else(|| StreamError::from("Stream is errored"))
     }
 
     fn desired_size(&self) -> isize {
@@ -414,9 +415,9 @@ where
                 reason,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Cancel canceled".into())))
+            .unwrap_or_else(|_| Err(StreamError::from("Cancel canceled")))
     }
 
     async fn pipe_to_inner<Sink>(
@@ -1373,7 +1374,7 @@ where
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(StreamError::Custom("Stream already locked".into()));
+            return Err(StreamError::from("Stream already locked"));
         }
 
         let locked_stream = ReadableStream {
@@ -1424,7 +1425,7 @@ where
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(StreamError::Custom("Stream already locked".into()));
+            return Err(StreamError::from("Stream already locked"));
         }
 
         let locked_stream = ReadableStream {
@@ -1476,7 +1477,7 @@ where
                 .read()
                 .ok()
                 .and_then(|guard| guard.clone())
-                .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));
+                .unwrap_or_else(|| StreamError::from("Stream is errored"));
             return Poll::Ready(Some(Err(error)));
         }
 
@@ -1607,7 +1608,7 @@ where
                     .read()
                     .ok()
                     .and_then(|guard| guard.clone())
-                    .unwrap_or_else(|| StreamError::Custom("Stream is errored".into()));
+                    .unwrap_or_else(|| StreamError::from("Stream is errored"));
                 return Poll::Ready(Err(error));
             }
             if self.0.closed.load(Ordering::SeqCst) {
@@ -1640,9 +1641,9 @@ where
                 reason,
                 completion: tx,
             })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Cancel canceled".into())))
+            .unwrap_or_else(|_| Err(StreamError::from("Cancel canceled")))
     }
 
     pub async fn read(&self) -> StreamResult<Option<T>> {
@@ -1650,9 +1651,9 @@ where
         self.0
             .command_tx
             .unbounded_send(StreamCommand::Read { completion: tx })
-            .map_err(|_| StreamError::Custom("Stream task dropped".into()))?;
+            .map_err(|_| StreamError::from("Stream task dropped"))?;
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::Custom("Read canceled".into())))
+            .unwrap_or_else(|_| Err(StreamError::from("Read canceled")))
     }
 
     pub fn release_lock(self) -> ReadableStream<T, Source, StreamType, Unlocked> {
@@ -2142,7 +2143,7 @@ pub async fn readable_byte_stream_task<Source>(
                         if byte_state.errored.load(Ordering::SeqCst) {
                             let error = byte_state.error.lock()
                                 .clone()
-                                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
+                                .unwrap_or_else(|| StreamError::from("Stream errored"));
                             let _ = completion.send(Err(error));
                             continue;
                         }
@@ -2647,7 +2648,7 @@ mod tests_old {
                 &mut self,
                 controller: &mut ReadableStreamDefaultController<i32>,
             ) -> StreamResult<()> {
-                controller.error(StreamError::Custom("Test error".into()))?;
+                controller.error(StreamError::from("Test error"))?;
                 Ok(())
             }
         }
@@ -2657,7 +2658,7 @@ mod tests_old {
 
         // Should get the error
         match reader.read().await {
-            Err(StreamError::Custom(_)) => {} // Expected
+            Err(StreamError::Other(_)) => {} // Expected
             other => panic!("Expected Custom error, got: {:?}", other),
         }
     }
@@ -2837,7 +2838,7 @@ mod tests {
                     Ok(())
                 } else {
                     // Second call errors
-                    controller.error(StreamError::Custom("Source error".into()))?;
+                    controller.error(StreamError::from("Source error"))?;
                     Ok(())
                 }
             }
@@ -2854,7 +2855,7 @@ mod tests {
 
         // Second read should propagate error
         match reader.read().await {
-            Err(StreamError::Custom(_)) => {} // Expected
+            Err(StreamError::Other(_)) => {} // Expected
             other => panic!("Expected Custom error, got: {:?}", other),
         }
 
@@ -3111,7 +3112,7 @@ mod tests {
                     *self.sent_items.borrow_mut() = true;
                     Ok(())
                 } else {
-                    controller.error(StreamError::Custom("Controller error".into()))?;
+                    controller.error(StreamError::from("Controller error"))?;
                     Ok(())
                 }
             }
@@ -3129,7 +3130,7 @@ mod tests {
 
         // Second read should get the error
         match reader.read().await {
-            Err(StreamError::Custom(_)) => {} // Expected
+            Err(StreamError::Other(_)) => {} // Expected
             other => panic!("Expected Custom error, got: {:?}", other),
         }
     }
@@ -3256,8 +3257,8 @@ mod tests {
                 _controller: &mut super::ReadableStreamDefaultController<i32>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
                 async {
-                    Err(super::StreamError::Custom(
-                        "Start initialization failed".into(),
+                    Err(super::StreamError::from(
+                        "Start initialization failed"
                     ))
                 }
             }
@@ -3281,7 +3282,7 @@ mod tests {
         let read_result = reader.read().await;
         assert!(read_result.is_err());
 
-        if let Err(super::StreamError::Custom(err)) = read_result {
+        if let Err(super::StreamError::Other(err)) = read_result {
             assert_eq!(err.to_string(), "Start initialization failed");
         } else {
             panic!("Expected Custom error from start failure");
@@ -3295,7 +3296,7 @@ mod tests {
         let closed_result = reader.closed().await;
         assert!(closed_result.is_err());
 
-        if let Err(super::StreamError::Custom(err)) = closed_result {
+        if let Err(super::StreamError::Other(err)) = closed_result {
             assert_eq!(err.to_string(), "Start initialization failed");
         } else {
             panic!("Expected Custom error from start failure");
@@ -3402,7 +3403,7 @@ mod tests {
                     *count += 1;
 
                     if *count > fail_after {
-                        return Err(super::StreamError::Custom("Write failed".into()));
+                        return Err(super::StreamError::from("Write failed"));
                     }
 
                     written.lock().unwrap().push(chunk);
@@ -3538,7 +3539,7 @@ mod tests {
                 controller: &mut super::ReadableStreamDefaultController<Vec<u8>>,
             ) -> super::StreamResult<()> {
                 if self.index >= self.error_after {
-                    return Err(super::StreamError::Custom("Source error".into()));
+                    return Err(super::StreamError::from("Source error"));
                 }
 
                 if self.index >= self.data.len() {
@@ -3689,7 +3690,7 @@ mod tests {
                 let mut idx = self.index.lock().unwrap();
 
                 if self.should_error && *idx >= self.error_after {
-                    return Err(super::StreamError::Custom("Source error".into()));
+                    return Err(super::StreamError::from("Source error"));
                 }
 
                 if *idx >= self.data.len() {
@@ -3755,7 +3756,7 @@ mod tests {
 
                 async move {
                     if should_error {
-                        return Err(super::StreamError::Custom("Sink error".into()));
+                        return Err(super::StreamError::from("Sink error"));
                     }
                     written.lock().unwrap().push(chunk);
                     Ok(())
@@ -4215,7 +4216,7 @@ mod tests {
                 _controller: &mut ReadableByteStreamController,
             ) -> StreamResult<()> {
                 // Simulate start failure
-                Err(StreamError::Custom("Start failed".into()))
+                Err(StreamError::from("Start failed"))
             }
 
             async fn pull(
@@ -4242,7 +4243,7 @@ mod tests {
 
         // Attempt to read should fail due to start error
         /*match reader.read().await {
-            Err(StreamError::Custom(msg)) if msg.contains("Start failed") => {
+            Err(StreamError::Other(msg)) if msg.to_string().contains("Start failed") => {
                 // Expected error from start failure
             }
             other => panic!("Expected start failure error, got: {:?}", other),
@@ -4270,7 +4271,7 @@ mod tests {
 
         // Stream should be in error state
         match reader.closed().await {
-            Err(StreamError::Custom(msg)) if msg.to_string().contains("Start failed") => {}
+            Err(StreamError::Other(msg)) if msg.to_string().contains("Start failed") => {}
             other => panic!(
                 "Expected closed() to propagate start failure, got: {:?}",
                 other
@@ -4666,7 +4667,7 @@ mod builder_tests {
                 &mut self,
                 controller: &mut ReadableStreamDefaultController<String>,
             ) -> StreamResult<()> {
-                controller.error(StreamError::Custom("Test error".into()))?;
+                controller.error(StreamError::from("Test error"))?;
                 Ok(())
             }
         }
@@ -4676,7 +4677,7 @@ mod builder_tests {
 
         block_on(async {
             match reader.read().await {
-                Err(StreamError::Custom(msg)) => {
+                Err(StreamError::Other(msg)) => {
                     assert!(msg.to_string().contains("Test error"));
                 }
                 other => panic!("Expected custom error, got: {:?}", other),
@@ -4884,7 +4885,7 @@ mod pipe_through_tests {
                 controller: &mut TransformStreamDefaultController<i32>,
             ) -> impl Future<Output = StreamResult<()>> + Send + 'static {
                 if chunk == 3 {
-                    futures::future::ready(Err(StreamError::Custom("Error on 3".into())))
+                    futures::future::ready(Err(StreamError::from("Error on 3")))
                 } else {
                     let result = controller.enqueue(chunk);
                     futures::future::ready(result)
@@ -5057,7 +5058,7 @@ mod tee_tests {
                     self.count += 1;
                     Ok(())
                 } else {
-                    Err(StreamError::Custom("Test error".into()))
+                    Err(StreamError::from("Test error"))
                 }
             }
         }
@@ -5079,11 +5080,11 @@ mod tee_tests {
         let err2 = reader2.read().await.unwrap_err();
 
         match (&err1, &err2) {
-            (StreamError::Custom(msg1), StreamError::Custom(msg2)) => {
+            (StreamError::Other(msg1), StreamError::Other(msg2)) => {
                 assert_eq!(msg1.to_string(), "Test error");
                 assert_eq!(msg2.to_string(), "Test error");
             }
-            _ => panic!("Expected Custom error"),
+            _ => panic!("Expected Other error"),
         }
     }
 
