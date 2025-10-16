@@ -415,9 +415,9 @@ where
                 reason,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::from("Cancel canceled")))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn pipe_to_inner<Sink>(
@@ -1641,9 +1641,9 @@ where
                 reason,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::from("Cancel canceled")))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub async fn read(&self) -> StreamResult<Option<T>> {
@@ -1651,9 +1651,9 @@ where
         self.0
             .command_tx
             .unbounded_send(StreamCommand::Read { completion: tx })
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::from("Read canceled")))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub fn release_lock(self) -> ReadableStream<T, Source, StreamType, Unlocked> {

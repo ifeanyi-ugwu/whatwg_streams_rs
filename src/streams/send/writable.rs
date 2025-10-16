@@ -109,7 +109,7 @@ where
                 completion: tx,
             })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         // Await the completion of the abort operation
         rx.await
@@ -123,7 +123,7 @@ where
             .clone()
             .send(StreamCommand::Close { completion: tx })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         rx.await
             .map_err(|_| StreamError::from("Close canceled"))?
@@ -356,7 +356,7 @@ where
                 chunk: item,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         // For the Sink trait, we return immediately after enqueueing.
         // The actual write completion is handled asynchronously by the stream task.
@@ -387,7 +387,7 @@ where
                 .unbounded_send(StreamCommand::Flush { completion: tx })
                 .is_err()
             {
-                return Poll::Ready(Err(StreamError::from("Stream task dropped")));
+                return Poll::Ready(Err(StreamError::TaskDropped));
             }
 
             *this.flush_receiver = Some(rx);
@@ -402,7 +402,7 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     *this.flush_receiver = None;
-                    Poll::Ready(Err(StreamError::from("Flush operation canceled")))
+                    Poll::Ready(Err(StreamError::TaskDropped))
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -440,7 +440,7 @@ where
                 .unbounded_send(StreamCommand::Close { completion: tx })
                 .is_err()
             {
-                return Poll::Ready(Err(StreamError::from("Stream task dropped")));
+                return Poll::Ready(Err(StreamError::TaskDropped));
             }
             *this.close_receiver = Some(rx);
         }
@@ -454,7 +454,7 @@ where
                 }
                 Poll::Ready(Err(_)) => {
                     *this.close_receiver = None;
-                    Poll::Ready(Err(StreamError::from("Close operation canceled")))
+                    Poll::Ready(Err(StreamError::TaskDropped))
                 }
                 Poll::Pending => Poll::Pending,
             }
@@ -556,6 +556,9 @@ where
                         }
                         StreamError::Closed => {
                             IoError::new(ErrorKind::BrokenPipe, "Stream is closed")
+                        }
+                        StreamError::TaskDropped => {
+                            IoError::new(ErrorKind::BrokenPipe, "Stream task dropped")
                         }
                         StreamError::Other(_) => {
                             IoError::new(ErrorKind::Other, stream_err.to_string())
@@ -1265,7 +1268,7 @@ where
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"));
+            .map_err(|_| StreamError::TaskDropped);
 
         // Return a future that handles the completion waiting
         async move {
@@ -1274,7 +1277,7 @@ where
 
             // Then wait for the write to complete
             rx.await
-                .unwrap_or_else(|_| Err(StreamError::from("Write canceled")))
+                .unwrap_or_else(|_| Err(StreamError::TaskDropped))
         }
     }
 
@@ -1392,10 +1395,10 @@ where
             .clone()
             .send(StreamCommand::Close { completion: tx })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::from("Close canceled")))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     /// Abort the stream asynchronously with an optional reason
@@ -1410,10 +1413,10 @@ where
                 completion: tx,
             })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         rx.await
-            .unwrap_or_else(|_| Err(StreamError::from("Abort canceled")))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     /// Get the desired size synchronously (how much data the stream can accept)
