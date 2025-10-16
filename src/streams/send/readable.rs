@@ -1,6 +1,6 @@
 use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked};
-use super::error::StreamError;
 pub use super::byte_source_trait::ReadableByteSource;
+use super::error::StreamError;
 use super::{
     byte_state::{ByteStreamState, ByteStreamStateInterface},
     transform::{TransformReadableSource, TransformStream},
@@ -416,8 +416,7 @@ where
                 completion: tx,
             })
             .map_err(|_| StreamError::TaskDropped)?;
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn pipe_to_inner<Sink>(
@@ -1642,8 +1641,7 @@ where
                 completion: tx,
             })
             .map_err(|_| StreamError::TaskDropped)?;
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub async fn read(&self) -> StreamResult<Option<T>> {
@@ -1652,8 +1650,7 @@ where
             .command_tx
             .unbounded_send(StreamCommand::Read { completion: tx })
             .map_err(|_| StreamError::TaskDropped)?;
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub fn release_lock(self) -> ReadableStream<T, Source, StreamType, Unlocked> {
@@ -3256,11 +3253,7 @@ mod tests {
                 &mut self,
                 _controller: &mut super::ReadableStreamDefaultController<i32>,
             ) -> impl std::future::Future<Output = super::StreamResult<()>> + Send {
-                async {
-                    Err(super::StreamError::from(
-                        "Start initialization failed"
-                    ))
-                }
+                async { Err(super::StreamError::from("Start initialization failed")) }
             }
 
             fn pull(
@@ -4250,7 +4243,7 @@ mod tests {
         }*/
         // Attempt to read should fail due to start error
         match reader.read().await {
-            Err(StreamError::Custom(msg)) => {
+            Err(StreamError::Other(msg)) => {
                 // Convert the ArcError into a string and check for the substring.
                 let error_message = msg.to_string();
                 if error_message.contains("Start failed") {
