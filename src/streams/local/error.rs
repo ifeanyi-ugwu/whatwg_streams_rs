@@ -6,6 +6,7 @@ pub enum StreamError {
     Aborted(Option<String>),
     Closing,
     Closed,
+    TaskDropped,
     Other(Rc<dyn Error>),
 }
 
@@ -77,6 +78,7 @@ impl fmt::Display for StreamError {
             StreamError::Aborted(None) => write!(f, "Stream was aborted"),
             StreamError::Closing => write!(f, "Stream is closing"),
             StreamError::Closed => write!(f, "Stream is closed"),
+            StreamError::TaskDropped => write!(f, "Stream task was dropped"),
             StreamError::Other(err) => write!(f, "{}", err),
         }
     }

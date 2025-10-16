@@ -110,11 +110,11 @@ where
                 completion: tx,
             })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         // Await the completion of the abort operation
         rx.await
-            .unwrap_or_else(|_| Err("Abort operation canceled".into()))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub async fn close(&self) -> StreamResult<()> {
@@ -124,9 +124,9 @@ where
             .clone()
             .send(StreamCommand::Close { completion: tx })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await.unwrap_or_else(|_| Err("Close canceled".into()))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 }
 
@@ -357,7 +357,7 @@ where
                 chunk: item,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         // For the Sink trait, we return immediately after enqueueing.
         // The actual write completion is handled asynchronously by the stream task.
@@ -557,6 +557,9 @@ where
                         }
                         StreamError::Closed => {
                             IoError::new(ErrorKind::BrokenPipe, "Stream is closed")
+                        }
+                        StreamError::TaskDropped => {
+                            IoError::new(ErrorKind::BrokenPipe, "Stream task dropped")
                         }
                         StreamError::Other(_) => {
                             IoError::new(ErrorKind::Other, stream_err.to_string())
@@ -1265,7 +1268,7 @@ where
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"));
+            .map_err(|_| StreamError::TaskDropped);
 
         // Return a future that handles the completion waiting
         async move {
@@ -1273,7 +1276,7 @@ where
             enqueue_result?;
 
             // Then wait for the write to complete
-            rx.await.unwrap_or_else(|_| Err("Write canceled".into()))
+            rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
         }
     }
 
@@ -1379,7 +1382,7 @@ where
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Stream task dropped"))
+            .map_err(|_| StreamError::TaskDropped)
     }
 
     /// Close the stream asynchronously
@@ -1391,9 +1394,9 @@ where
             .clone()
             .send(StreamCommand::Close { completion: tx })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await.unwrap_or_else(|_| Err("Close canceled".into()))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     /// Abort the stream asynchronously with an optional reason
@@ -1408,9 +1411,9 @@ where
                 completion: tx,
             })
             .await
-            .map_err(|_| StreamError::from("Stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await.unwrap_or_else(|_| Err("Abort canceled".into()))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     /// Get the desired size synchronously (how much data the stream can accept)

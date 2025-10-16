@@ -216,10 +216,10 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
                 chunk,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Transform stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         rx.await
-            .unwrap_or_else(|_| Err("Write operation canceled".into()))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn close(self) -> StreamResult<()> {
@@ -227,10 +227,10 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
 
         self.transform_tx
             .unbounded_send(TransformCommand::Close { completion: tx })
-            .map_err(|_| StreamError::from("Transform stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         rx.await
-            .unwrap_or_else(|_| Err("Close operation canceled".into()))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
@@ -241,10 +241,10 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
                 reason,
                 completion: tx,
             })
-            .map_err(|_| StreamError::from("Transform stream task dropped"))?;
+            .map_err(|_| StreamError::TaskDropped)?;
 
         rx.await
-            .unwrap_or_else(|_| Err("Abort operation canceled".into()))
+            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 }
 
