@@ -1,9 +1,8 @@
-pub mod errors;
 pub mod local;
 pub mod send;
 
 /// Result of a stream operation
-pub type StreamResult<T> = Result<T, errors::StreamError>;
+pub type StreamResult<T> = Result<T, send::error::StreamError>;
 
 /// Type-level marker for unlocked streams
 pub struct Unlocked;
