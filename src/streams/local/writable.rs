@@ -113,8 +113,7 @@ where
             .map_err(|_| StreamError::TaskDropped)?;
 
         // Await the completion of the abort operation
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub async fn close(&self) -> StreamResult<()> {

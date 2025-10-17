@@ -394,8 +394,7 @@ where
                 completion: tx,
             })
             .map_err(|_| StreamError::TaskDropped)?;
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn pipe_to_inner<Sink>(

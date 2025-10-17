@@ -125,8 +125,7 @@ where
             .await
             .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await
-            .map_err(|_| StreamError::from("Close canceled"))?
+        rx.await.map_err(|_| StreamError::from("Close canceled"))?
     }
 }
 
@@ -346,7 +345,7 @@ where
         // be called after poll_ready returns Ready(Ok(()))
         if self.backpressure.load(Ordering::SeqCst) {
             return Err(StreamError::from(
-                "start_send called while backpressure is active - call poll_ready first"
+                "start_send called while backpressure is active - call poll_ready first",
             ));
         }
 
@@ -1276,8 +1275,7 @@ where
             enqueue_result?;
 
             // Then wait for the write to complete
-            rx.await
-                .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+            rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
         }
     }
 
@@ -1397,8 +1395,7 @@ where
             .await
             .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     /// Abort the stream asynchronously with an optional reason
@@ -1415,8 +1412,7 @@ where
             .await
             .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     /// Get the desired size synchronously (how much data the stream can accept)
@@ -2996,9 +2992,10 @@ mod sink_integration_tests {
             if let Some(fail_on) = self.fail_on_write {
                 if current_count >= fail_on {
                     self.log_operation(&format!("write failed on item {}", current_count + 1));
-                    return Err(StreamError::from(
-                        format!("Intentional write failure on item {}", current_count + 1)
-                    ));
+                    return Err(StreamError::from(format!(
+                        "Intentional write failure on item {}",
+                        current_count + 1
+                    )));
                 }
             }
 
@@ -3560,9 +3557,10 @@ mod async_write_integration_tests {
             if let Some(fail_on) = self.fail_on_write {
                 if current_writes > fail_on {
                     self.log_operation("write failed");
-                    return Err(StreamError::from(
-                        format!("Intentional write failure on write {}", current_writes)
-                    ));
+                    return Err(StreamError::from(format!(
+                        "Intentional write failure on write {}",
+                        current_writes
+                    )));
                 }
             }
 

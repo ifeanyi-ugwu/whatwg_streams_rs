@@ -218,8 +218,7 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
             })
             .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn close(self) -> StreamResult<()> {
@@ -229,8 +228,7 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
             .unbounded_send(TransformCommand::Close { completion: tx })
             .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
@@ -243,8 +241,7 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
             })
             .map_err(|_| StreamError::TaskDropped)?;
 
-        rx.await
-            .unwrap_or_else(|_| Err(StreamError::TaskDropped))
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 }
 
