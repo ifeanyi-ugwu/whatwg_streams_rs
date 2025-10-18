@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Streaming Element Demo</title>
+  </head>
+  <body>
+    <h1>Streaming Element Demo</h1>
+
+    <streaming-element
+      id="output"
+      style="border: 1px solid #ccc; padding: 10px; display: block"
+    >
+    </streaming-element>
+    <br />
+    <button id="start-btn">Start Streaming</button>
+
+    <script type="module">
+      import init from "./pkg/streaming_element_demo.js";
+
+      async function main() {
+        await init();
+
+        const output = document.getElementById("output");
+
+        document.getElementById("start-btn").addEventListener("click", () => {
+          const writer = output.writable.get_writer();
+          const chunks = [
+            "Hello, world!",
+            "This text comes from Rust → WASM WritableStream.",
+            "Each chunk is appended live.",
+          ];
+
+          (async () => {
+            for (const chunk of chunks) {
+              await writer.write(chunk);
+            }
+            await writer.close();
+          })();
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
