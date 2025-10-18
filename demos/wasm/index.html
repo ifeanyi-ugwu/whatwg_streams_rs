@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Streams Demos (Rust + WASM)</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+        max-width: 800px;
+      }
+      h1 {
+        margin-bottom: 1rem;
+      }
+      ul {
+        line-height: 1.8;
+      }
+      a {
+        text-decoration: none;
+        color: #0366d6;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Streams Demos (Rust + WASM)</h1>
+    <p>
+      This site collects demos inspired by the
+      <a href="https://streams.spec.whatwg.org/">WHATWG Streams demos</a>
+      and
+      <a href="https://developer.mozilla.org/en-US/docs/Web/API/Streams_API"
+        >MDN Streams docs</a
+      >, reimplemented in Rust → WebAssembly using the
+      <code>whatwg_streams</code> crate.
+    </p>
+
+    <h2>Available Demos</h2>
+    <ul>
+      <!-- <li>
+        <a href="invert-canvas/index.html">Invert Canvas</a> — Load an image
+        into a canvas and invert its colors via a Rust TransformStream.
+      </li> -->
+      <li>
+        <a href="append-child/index.html">Append Child Writable</a> — Custom
+        WritableStream that appends DOM nodes (WHATWG demo).
+      </li>
+      <li>
+        <a href="streaming-element/index.html">Streaming Element</a> — Stream
+        into a custom DOM element.
+      </li>
+      <li>
+        <a href="streaming-element-backpressure/index.html"
+          >Streaming Element with Backpressure</a
+        >
+        — Variation that applies backpressure to avoid jank.
+      </li>
+      <li>
+        <a href="streaming-fetch-progress/index.html"
+          >Streaming Fetch + Progress Bar</a
+        >
+        — Fetch a large resource and stream updates into a progress bar.
+      </li>
+      <li>
+        <a href="service-worker-stream/index.html"
+          >Service Worker Streaming Response</a
+        >
+        — Stream API responses through a service worker into the DOM.
+      </li>
+      <li>
+        <a href="grayscale-png/index.html">Grayscale PNG</a> — Fetch a PNG,
+        convert it to grayscale via a Rust TransformStream.
+      </li>
+      <li>
+        <a href="png-chunks/index.html">Unpack PNG Chunks</a> — Fetch a PNG and
+        pipe chunks of bytes through a custom transform.
+      </li>
+    </ul>
+
+    <p>
+      More demos coming soon — each one is isolated in
+      <code>&lt;name&gt;/</code>.
+    </p>
+  </body>
+</html>
