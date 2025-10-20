@@ -1,14 +1,14 @@
 [package]
 name = "whatwg_streams"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 edition = "2024"
 description = "whatwg_streams for rust"
 license = "MIT"
 
 [features]
 default = ["send"]
-send = []   # Multi-threaded: Arc-based, requires Send+Sync
-local = []  # Single-threaded: Rc-based, no Send/Sync required
+send = []          # Multi-threaded: Arc-based, requires Send+Sync
+local = []         # Single-threaded: Rc-based, no Send/Sync required
 
 [dependencies]
 futures = "0.3.31"
