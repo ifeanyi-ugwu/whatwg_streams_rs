@@ -1,8 +1,9 @@
 use super::{error::StreamError, readable::ReadableByteStreamController};
+use crate::platform::MaybeSend;
 
 type StreamResult<T> = Result<T, StreamError>;
 
-pub trait ReadableByteSource: 'static {
+pub trait ReadableByteSource: MaybeSend + 'static {
     fn start(
         &mut self,
         controller: &mut ReadableByteStreamController,

@@ -4,6 +4,7 @@ use super::{
     readable::{DefaultStream, ReadableSource, ReadableStream, ReadableStreamDefaultController},
     writable::{WritableSink, WritableStream, WritableStreamDefaultController},
 };
+use crate::platform::{MaybeSend, SharedPtr};
 use futures::{
     channel::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
@@ -12,7 +13,6 @@ use futures::{
     future::{self, Future},
     stream::StreamExt,
 };
-use std::rc::Rc;
 
 pub type StreamResult<T> = Result<T, StreamError>;
 
@@ -33,13 +33,53 @@ enum TransformCommand<I> {
 }
 
 /// TransformStream connecting readable and writable sides
-pub struct TransformStream<I, O> {
+pub struct TransformStream<I: MaybeSend + 'static, O: MaybeSend + 'static> {
     readable: ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>,
     writable: WritableStream<I, TransformWritableSink<I>, Unlocked>,
 }
 
-impl<I: 'static, O: 'static> TransformStream<I, O> {
+impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
     /// Internal builder that wires everything up but does not spawn anything.
+    #[cfg(feature = "send")]
+    fn new_inner<T>(
+        transformer: T,
+        writable_strategy: Box<dyn QueuingStrategy<I> + Send>,
+        readable_strategy: Box<dyn QueuingStrategy<O> + Send>,
+    ) -> (
+        Self,
+        impl Future<Output = ()>, // readable task
+        impl Future<Output = ()>, // writable task
+        impl Future<Output = ()>, // transform task
+    )
+    where
+        T: Transformer<I, O> + 'static,
+    {
+        let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
+
+        let readable_source = TransformReadableSource::new();
+        let writable_sink = TransformWritableSink::new(transform_tx);
+
+        let (readable, readable_fut) =
+            ReadableStream::new_inner(readable_source, readable_strategy);
+        let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
+
+        let controller = TransformStreamDefaultController::new(
+            readable.controller.clone(),
+            writable.controller.clone(),
+        );
+
+        let transform_fut = transform_task(transformer, transform_rx, controller);
+
+        (
+            TransformStream { readable, writable },
+            readable_fut,
+            writable_fut,
+            transform_fut,
+        )
+    }
+
+    /// Internal builder that wires everything up but does not spawn anything.
+    #[cfg(feature = "local")]
     fn new_inner<T>(
         transformer: T,
         writable_strategy: Box<dyn QueuingStrategy<I>>,
@@ -101,15 +141,15 @@ impl<I: 'static, O: 'static> TransformStream<I, O> {
 }
 
 /// Controller for transform operations
-pub struct TransformStreamDefaultController<O> {
-    readable_controller: Rc<ReadableStreamDefaultController<O>>,
-    writable_controller: Rc<WritableStreamDefaultController>,
+pub struct TransformStreamDefaultController<O: MaybeSend + 'static> {
+    readable_controller: SharedPtr<ReadableStreamDefaultController<O>>,
+    writable_controller: SharedPtr<WritableStreamDefaultController>,
 }
 
-impl<O> TransformStreamDefaultController<O> {
+impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
     fn new(
-        readable_controller: Rc<ReadableStreamDefaultController<O>>,
-        writable_controller: Rc<WritableStreamDefaultController>,
+        readable_controller: SharedPtr<ReadableStreamDefaultController<O>>,
+        writable_controller: SharedPtr<WritableStreamDefaultController>,
     ) -> Self {
         Self {
             readable_controller,
@@ -143,7 +183,7 @@ impl<O> TransformStreamDefaultController<O> {
 }
 
 /// Transformer trait
-pub trait Transformer<I, O> {
+pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend + 'static {
     /// Called once when the transform stream is created
     fn start(
         &mut self,
@@ -171,11 +211,11 @@ pub trait Transformer<I, O> {
 }
 
 /// Readable source for the transform stream
-pub struct TransformReadableSource<O> {
+pub struct TransformReadableSource<O: MaybeSend + 'static> {
     _phantom: std::marker::PhantomData<O>,
 }
 
-impl<O> TransformReadableSource<O> {
+impl<O: MaybeSend + 'static> TransformReadableSource<O> {
     fn new() -> Self {
         Self {
             _phantom: std::marker::PhantomData,
@@ -183,7 +223,7 @@ impl<O> TransformReadableSource<O> {
     }
 }
 
-impl<O: 'static> ReadableSource<O> for TransformReadableSource<O> {
+impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
     async fn pull(
         &mut self,
         _controller: &mut ReadableStreamDefaultController<O>,
@@ -193,17 +233,17 @@ impl<O: 'static> ReadableSource<O> for TransformReadableSource<O> {
 }
 
 /// Writable sink
-pub struct TransformWritableSink<I> {
+pub struct TransformWritableSink<I: MaybeSend + 'static> {
     transform_tx: UnboundedSender<TransformCommand<I>>,
 }
 
-impl<I> TransformWritableSink<I> {
+impl<I: MaybeSend + 'static> TransformWritableSink<I> {
     fn new(transform_tx: UnboundedSender<TransformCommand<I>>) -> Self {
         Self { transform_tx }
     }
 }
 
-impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
+impl<I: MaybeSend + 'static> WritableSink<I> for TransformWritableSink<I> {
     async fn write(
         &mut self,
         chunk: I,
@@ -246,7 +286,7 @@ impl<I: 'static> WritableSink<I> for TransformWritableSink<I> {
 }
 
 /// Simple transform task
-async fn transform_task<I, O, T>(
+async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
     mut transformer: T,
     mut transform_rx: UnboundedReceiver<TransformCommand<I>>,
     mut controller: TransformStreamDefaultController<O>,
@@ -311,7 +351,7 @@ impl<T> IdentityTransformer<T> {
     }
 }
 
-impl<T> Transformer<T, T> for IdentityTransformer<T> {
+impl<T: MaybeSend + 'static> Transformer<T, T> for IdentityTransformer<T> {
     fn transform(
         &mut self,
         chunk: T,
@@ -322,13 +362,23 @@ impl<T> Transformer<T, T> for IdentityTransformer<T> {
     }
 }
 
+#[cfg(feature = "send")]
+pub struct TransformStreamBuilder<I, O, T> {
+    transformer: T,
+    writable_strategy: Box<dyn QueuingStrategy<I> + Send>,
+    readable_strategy: Box<dyn QueuingStrategy<O> + Send>,
+}
+
+#[cfg(feature = "local")]
 pub struct TransformStreamBuilder<I, O, T> {
     transformer: T,
     writable_strategy: Box<dyn QueuingStrategy<I>>,
     readable_strategy: Box<dyn QueuingStrategy<O>>,
 }
 
-impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuilder<I, O, T> {
+impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'static>
+    TransformStreamBuilder<I, O, T>
+{
     fn new(transformer: T) -> Self {
         Self {
             transformer,
@@ -337,11 +387,25 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
         }
     }
 
+    #[cfg(feature = "send")]
+    pub fn writable_strategy<S: QueuingStrategy<I> + Send + 'static>(mut self, s: S) -> Self {
+        self.writable_strategy = Box::new(s);
+        self
+    }
+
+    #[cfg(feature = "send")]
+    pub fn readable_strategy<S: QueuingStrategy<O> + Send + 'static>(mut self, s: S) -> Self {
+        self.readable_strategy = Box::new(s);
+        self
+    }
+
+    #[cfg(feature = "local")]
     pub fn writable_strategy<S: QueuingStrategy<I> + 'static>(mut self, s: S) -> Self {
         self.writable_strategy = Box::new(s);
         self
     }
 
+    #[cfg(feature = "local")]
     pub fn readable_strategy<S: QueuingStrategy<O> + 'static>(mut self, s: S) -> Self {
         self.readable_strategy = Box::new(s);
         self
@@ -423,7 +487,7 @@ impl<I: 'static, O: 'static, T: Transformer<I, O> + 'static> TransformStreamBuil
     }
 }
 
-impl<I: 'static, O: 'static> TransformStream<I, O> {
+impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
     /// Returns a builder for this transform stream
     pub fn builder<T: Transformer<I, O> + 'static>(
         transformer: T,

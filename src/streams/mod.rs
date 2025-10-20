@@ -1,12 +1,21 @@
-pub mod local;
-pub mod send;
+pub mod byte_source_trait;
+pub mod byte_state;
+pub mod error;
+pub mod readable;
+pub mod transform;
+pub mod writable;
 
-/// Result of a stream operation
-pub type StreamResult<T> = Result<T, send::error::StreamError>;
+// Re-export main types
+pub use byte_source_trait::*;
+pub use byte_state::*;
+pub use error::*;
+pub use readable::*;
+pub use transform::*;
+pub use writable::*;
 
 /// Type-level marker for unlocked streams
 pub struct Unlocked;
-/// Type-level marker for locked streams  
+/// Type-level marker for locked streams
 pub struct Locked;
 
 /// Generic queuing strategy trait

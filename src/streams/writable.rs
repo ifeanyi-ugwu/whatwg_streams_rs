@@ -1,5 +1,6 @@
 use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked};
 use super::error::StreamError;
+use crate::platform::{MaybeSend, SharedPtr};
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -12,10 +13,9 @@ use std::future::Future;
 use std::io::{Error as IoError, ErrorKind};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 type StreamResult<T> = Result<T, StreamError>;
 
@@ -56,15 +56,15 @@ pub enum StreamCommand<T> {
 }
 
 #[pin_project]
-pub struct WritableStream<T, Sink, S = Unlocked> {
+pub struct WritableStream<T: MaybeSend + 'static, Sink, S = Unlocked> {
     command_tx: UnboundedSender<StreamCommand<T>>,
-    backpressure: Rc<AtomicBool>,
-    closed: Rc<AtomicBool>,
-    errored: Rc<AtomicBool>,
-    locked: Rc<AtomicBool>,
-    queue_total_size: Rc<AtomicUsize>,
-    high_water_mark: Rc<AtomicUsize>,
-    stored_error: Rc<RwLock<Option<StreamError>>>,
+    backpressure: SharedPtr<AtomicBool>,
+    closed: SharedPtr<AtomicBool>,
+    errored: SharedPtr<AtomicBool>,
+    locked: SharedPtr<AtomicBool>,
+    queue_total_size: SharedPtr<AtomicUsize>,
+    high_water_mark: SharedPtr<AtomicUsize>,
+    stored_error: SharedPtr<RwLock<Option<StreamError>>>,
     _sink: PhantomData<Sink>,
     _state: PhantomData<S>,
     #[pin]
@@ -74,10 +74,10 @@ pub struct WritableStream<T, Sink, S = Unlocked> {
     #[pin]
     write_receiver: Option<oneshot::Receiver<Result<(), StreamError>>>,
     pending_write_len: Option<usize>,
-    pub(crate) controller: Rc<WritableStreamDefaultController>,
+    pub(crate) controller: SharedPtr<WritableStreamDefaultController>,
 }
 
-impl<T, Sink, S> WritableStream<T, Sink, S> {
+impl<T: MaybeSend, Sink, S> WritableStream<T, Sink, S> {
     pub fn locked(&self) -> bool {
         self.locked.load(Ordering::SeqCst)
     }
@@ -93,7 +93,7 @@ impl<T, Sink, S> WritableStream<T, Sink, S> {
 
 impl<T, Sink> WritableStream<T, Sink, Unlocked>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     /// Abort the stream, signaling that no more data will be written.
@@ -131,7 +131,7 @@ where
 
 impl<T, Sink> WritableStream<T, Sink, Unlocked>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     pub fn get_writer(
@@ -154,13 +154,13 @@ where
 
         let locked = WritableStream {
             command_tx: self.command_tx.clone(),
-            backpressure: Rc::clone(&self.backpressure),
-            closed: Rc::clone(&self.closed),
-            errored: Rc::clone(&self.errored),
-            locked: Rc::clone(&self.locked),
-            queue_total_size: Rc::clone(&self.queue_total_size),
-            high_water_mark: Rc::clone(&self.high_water_mark),
-            stored_error: Rc::clone(&self.stored_error),
+            backpressure: SharedPtr::clone(&self.backpressure),
+            closed: SharedPtr::clone(&self.closed),
+            errored: SharedPtr::clone(&self.errored),
+            locked: SharedPtr::clone(&self.locked),
+            queue_total_size: SharedPtr::clone(&self.queue_total_size),
+            high_water_mark: SharedPtr::clone(&self.high_water_mark),
+            stored_error: SharedPtr::clone(&self.stored_error),
             _sink: PhantomData,
             _state: PhantomData::<Locked>,
             flush_receiver: None,
@@ -174,7 +174,7 @@ where
     }
 }
 
-impl<T, Sink> WritableStream<T, Sink>
+impl<T: MaybeSend + 'static, Sink> WritableStream<T, Sink>
 where
     T: 'static,
     Sink: WritableSink<T> + 'static,
@@ -185,8 +185,8 @@ where
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
     ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
-        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let stored_error = Rc::new(RwLock::new(None));
+        let high_water_mark = SharedPtr::new(AtomicUsize::new(strategy.high_water_mark()));
+        let stored_error = SharedPtr::new(RwLock::new(None));
 
         let inner = WritableStreamInner {
             state: StreamState::Writable,
@@ -200,18 +200,18 @@ where
             abort_reason: None,
             abort_requested: false,
             abort_completions: Vec::new(),
-            stored_error: Rc::clone(&stored_error),
+            stored_error: SharedPtr::clone(&stored_error),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
             flush_completions: Vec::new(),
             pending_flush_commands: Vec::new(),
         };
 
-        let backpressure = Rc::new(AtomicBool::new(false));
-        let closed = Rc::new(AtomicBool::new(false));
-        let errored = Rc::new(AtomicBool::new(false));
-        let locked = Rc::new(AtomicBool::new(false));
-        let queue_total_size = Rc::new(AtomicUsize::new(0));
+        let backpressure = SharedPtr::new(AtomicBool::new(false));
+        let closed = SharedPtr::new(AtomicBool::new(false));
+        let errored = SharedPtr::new(AtomicBool::new(false));
+        let locked = SharedPtr::new(AtomicBool::new(false));
+        let queue_total_size = SharedPtr::new(AtomicUsize::new(0));
 
         let (ctrl_tx, ctrl_rx): (
             UnboundedSender<ControllerMsg>,
@@ -222,10 +222,10 @@ where
         let fut = stream_task(
             command_rx,
             inner,
-            Rc::clone(&backpressure),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-            Rc::clone(&queue_total_size),
+            SharedPtr::clone(&backpressure),
+            SharedPtr::clone(&closed),
+            SharedPtr::clone(&errored),
+            SharedPtr::clone(&queue_total_size),
             controller.clone(),
             ctrl_rx,
         );
@@ -254,7 +254,7 @@ where
 
 impl<T, Sink, S> WritableStream<T, Sink, S>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     // private helper
@@ -274,17 +274,17 @@ where
     }
 }
 
-impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
+impl<T: MaybeSend + 'static, Sink> Clone for WritableStream<T, Sink, Locked> {
     fn clone(&self) -> Self {
         Self {
             command_tx: self.command_tx.clone(),
-            backpressure: Rc::clone(&self.backpressure),
-            closed: Rc::clone(&self.closed),
-            errored: Rc::clone(&self.errored),
-            locked: Rc::clone(&self.locked),
-            queue_total_size: Rc::clone(&self.queue_total_size),
-            high_water_mark: Rc::clone(&self.high_water_mark),
-            stored_error: Rc::clone(&self.stored_error),
+            backpressure: SharedPtr::clone(&self.backpressure),
+            closed: SharedPtr::clone(&self.closed),
+            errored: SharedPtr::clone(&self.errored),
+            locked: SharedPtr::clone(&self.locked),
+            queue_total_size: SharedPtr::clone(&self.queue_total_size),
+            high_water_mark: SharedPtr::clone(&self.high_water_mark),
+            stored_error: SharedPtr::clone(&self.stored_error),
             _sink: PhantomData,
             _state: PhantomData,
             flush_receiver: None,
@@ -298,7 +298,7 @@ impl<T, Sink> Clone for WritableStream<T, Sink, Locked> {
 
 impl<T, SinkType> futures::Sink<T> for WritableStream<T, SinkType, Unlocked>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     SinkType: WritableSink<T> + 'static,
 {
     type Error = StreamError;
@@ -466,7 +466,7 @@ where
 
 impl<T, Sink> AsyncWrite for WritableStream<T, Sink, Unlocked>
 where
-    T: for<'a> From<&'a [u8]> + 'static,
+    T: for<'a> From<&'a [u8]> + MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     fn poll_write(
@@ -710,7 +710,7 @@ where
     }
 }
 
-pub trait WritableSink<T: 'static>: Sized {
+pub trait WritableSink<T: MaybeSend + 'static>: MaybeSend + Sized + 'static {
     /// Start the sink
     fn start(
         &mut self,
@@ -743,13 +743,13 @@ pub trait WritableSink<T: 'static>: Sized {
 fn process_command<T, Sink>(
     cmd: StreamCommand<T>,
     inner: &mut WritableStreamInner<T, Sink>,
-    backpressure: &Rc<AtomicBool>,
-    closed: &Rc<AtomicBool>,
-    errored: &Rc<AtomicBool>,
-    queue_total_size: &Rc<AtomicUsize>,
+    backpressure: &SharedPtr<AtomicBool>,
+    closed: &SharedPtr<AtomicBool>,
+    errored: &SharedPtr<AtomicBool>,
+    queue_total_size: &SharedPtr<AtomicUsize>,
     _cx: &mut Context<'_>,
 ) where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     match cmd {
@@ -879,14 +879,14 @@ enum InFlight<Sink> {
 async fn stream_task<T, Sink>(
     mut command_rx: UnboundedReceiver<StreamCommand<T>>,
     mut inner: WritableStreamInner<T, Sink>,
-    backpressure: Rc<AtomicBool>,
-    closed: Rc<AtomicBool>,
-    errored: Rc<AtomicBool>,
-    queue_total_size: Rc<AtomicUsize>,
+    backpressure: SharedPtr<AtomicBool>,
+    closed: SharedPtr<AtomicBool>,
+    errored: SharedPtr<AtomicBool>,
+    queue_total_size: SharedPtr<AtomicUsize>,
     mut controller: WritableStreamDefaultController,
     mut ctrl_rx: UnboundedReceiver<ControllerMsg>,
 ) where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     let mut inflight: Option<InFlight<Sink>> = None;
@@ -1207,11 +1207,11 @@ fn update_flags<T, Sink>(
     }
 }
 
-pub struct WritableStreamDefaultWriter<T, Sink> {
+pub struct WritableStreamDefaultWriter<T: MaybeSend + 'static, Sink> {
     stream: WritableStream<T, Sink, Locked>,
 }
 
-impl<T, Sink> WritableStreamDefaultWriter<T, Sink>
+impl<T: MaybeSend + 'static, Sink> WritableStreamDefaultWriter<T, Sink>
 where
     T: 'static,
     Sink: WritableSink<T> + 'static,
@@ -1434,12 +1434,12 @@ where
 // this is meant to be called when queue or inflight size is modified before waking wakers i.e before calling `update_flags`
 fn update_atomic_counters<T, Sink>(
     inner: &WritableStreamInner<T, Sink>,
-    queue_total_size: &Rc<AtomicUsize>,
+    queue_total_size: &SharedPtr<AtomicUsize>,
 ) {
     queue_total_size.store(inner.queue_total_size, Ordering::SeqCst);
 }
 
-impl<T, Sink> WritableStreamDefaultWriter<T, Sink>
+impl<T: MaybeSend + 'static, Sink> WritableStreamDefaultWriter<T, Sink>
 where
     T: 'static,
     Sink: WritableSink<T> + 'static,
@@ -1451,21 +1451,19 @@ where
     }
 }
 
-impl<T, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
+impl<T: MaybeSend + 'static, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
     fn drop(&mut self) {
         self.stream.locked.store(false, Ordering::SeqCst);
     }
 }
 
-impl<T, Sink> Clone for WritableStreamDefaultWriter<T, Sink> {
+impl<T: MaybeSend + 'static, Sink> Clone for WritableStreamDefaultWriter<T, Sink> {
     fn clone(&self) -> Self {
         Self {
             stream: self.stream.clone(),
         }
     }
 }
-
-use std::task::Waker;
 
 struct WritableStreamInner<T, Sink> {
     state: StreamState,
@@ -1486,7 +1484,7 @@ struct WritableStreamInner<T, Sink> {
     abort_completions: Vec<oneshot::Sender<StreamResult<()>>>,
 
     //stored_error: Option<StreamError>,
-    stored_error: Rc<RwLock<Option<StreamError>>>,
+    stored_error: SharedPtr<RwLock<Option<StreamError>>>,
 
     ready_wakers: WakerSet,
     closed_wakers: WakerSet,
@@ -1496,7 +1494,7 @@ struct WritableStreamInner<T, Sink> {
     pending_flush_commands: Vec<oneshot::Sender<StreamResult<()>>>,
 }
 
-impl<T, Sink> WritableStreamInner<T, Sink> {
+impl<T: MaybeSend + 'static, Sink> WritableStreamInner<T, Sink> {
     /// Update the stream's backpressure flag to reflect the current load.
     fn update_backpressure(&mut self) {
         let prev = self.backpressure;
@@ -1524,7 +1522,7 @@ impl<T, Sink> WritableStreamInner<T, Sink> {
 }
 
 // Stream task processing for flush - count writes at this moment!
-fn process_flush_command<T, Sink>(
+fn process_flush_command<T: MaybeSend + 'static, Sink>(
     completion: oneshot::Sender<StreamResult<()>>,
     inner: &mut WritableStreamInner<T, Sink>,
     inflight: &Option<InFlight<Sink>>,
@@ -1599,20 +1597,20 @@ fn process_controller_msgs<T, Sink>(
 #[derive(Clone)]
 pub struct WritableStreamDefaultController {
     tx: UnboundedSender<ControllerMsg>,
-    //abort_reg: Rc<AbortRegistration>,
-    abort_requested: Rc<AtomicBool>,
-    abort_waker: Rc<AtomicWaker>,
+    //abort_reg: SharedPtr<AbortRegistration>,
+    abort_requested: SharedPtr<AtomicBool>,
+    abort_waker: SharedPtr<AtomicWaker>,
 }
 
 impl WritableStreamDefaultController {
-    /*pub fn new(sender: UnboundedSender<ControllerMsg>, abort_reg: Rc<AbortRegistration>) -> Self {
+    /*pub fn new(sender: UnboundedSender<ControllerMsg>, abort_reg: SharedPtr<AbortRegistration>) -> Self {
         Self { tx: sender,abort_reg }
     }*/
     pub fn new(sender: UnboundedSender<ControllerMsg>) -> Self {
         Self {
             tx: sender,
-            abort_requested: Rc::new(AtomicBool::new(false)),
-            abort_waker: Rc::new(AtomicWaker::new()),
+            abort_requested: SharedPtr::new(AtomicBool::new(false)),
+            abort_waker: SharedPtr::new(AtomicWaker::new()),
         }
     }
 
@@ -1721,17 +1719,17 @@ impl WritableStreamDefaultController {
     }
 }
 
-pub struct ReadyFuture<T, Sink> {
+pub struct ReadyFuture<T: MaybeSend + 'static, Sink> {
     writer: WritableStreamDefaultWriter<T, Sink>,
 }
 
-impl<T, Sink> ReadyFuture<T, Sink> {
+impl<T: MaybeSend + 'static, Sink> ReadyFuture<T, Sink> {
     pub fn new(stream: WritableStreamDefaultWriter<T, Sink>) -> Self {
         Self { writer: stream }
     }
 }
 
-impl<T, Sink> Future for ReadyFuture<T, Sink>
+impl<T: MaybeSend + 'static, Sink> Future for ReadyFuture<T, Sink>
 where
     T: 'static,
     Sink: WritableSink<T> + 'static,
@@ -1765,17 +1763,17 @@ where
     }
 }
 
-pub struct ClosedFuture<T, Sink> {
+pub struct ClosedFuture<T: MaybeSend + 'static, Sink> {
     writer: WritableStreamDefaultWriter<T, Sink>,
 }
 
-impl<T, Sink> ClosedFuture<T, Sink> {
+impl<T: MaybeSend + 'static, Sink> ClosedFuture<T, Sink> {
     pub fn new(stream: WritableStreamDefaultWriter<T, Sink>) -> Self {
         Self { writer: stream }
     }
 }
 
-impl<T, Sink> Future for ClosedFuture<T, Sink>
+impl<T: MaybeSend + 'static, Sink> Future for ClosedFuture<T, Sink>
 where
     T: 'static,
     Sink: WritableSink<T> + 'static,
@@ -1806,12 +1804,12 @@ where
 /// A lightweight, thread-safe set storing multiple wakers.
 /// It ensures wakers are stored without duplicates (based on `will_wake`).
 #[derive(Clone, Default)]
-pub struct WakerSet(Rc<Mutex<Vec<Waker>>>);
+pub struct WakerSet(SharedPtr<Mutex<Vec<Waker>>>);
 
 impl WakerSet {
     /// Creates a new, empty `WakerSet`.
     pub fn new() -> Self {
-        WakerSet(Rc::new(Mutex::new(Vec::new())))
+        WakerSet(SharedPtr::new(Mutex::new(Vec::new())))
     }
 
     /// Adds a waker to the set.
@@ -1840,7 +1838,7 @@ impl WakerSet {
 
 pub struct WritableStreamBuilder<T, Sink>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     sink: Sink,
@@ -1848,7 +1846,7 @@ where
     _phantom: PhantomData<T>,
 }
 
-impl<T, Sink> WritableStreamBuilder<T, Sink>
+impl<T: MaybeSend + 'static, Sink> WritableStreamBuilder<T, Sink>
 where
     T: 'static,
     Sink: WritableSink<T> + 'static,
@@ -1894,7 +1892,7 @@ where
 
 impl<T, Sink> WritableStream<T, Sink, Unlocked>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     Sink: WritableSink<T> + 'static,
 {
     /// Returns a builder for this writable stream
@@ -1911,13 +1909,13 @@ mod tests {
 
     #[derive(Clone)]
     struct CountingSink {
-        write_count: Rc<Mutex<usize>>,
+        write_count: SharedPtr<Mutex<usize>>,
     }
 
     impl CountingSink {
         fn new() -> Self {
             CountingSink {
-                write_count: Rc::new(Mutex::new(0)),
+                write_count: SharedPtr::new(Mutex::new(0)),
             }
         }
 
@@ -1932,7 +1930,7 @@ mod tests {
             _chunk: Vec<u8>,
             _controller: &mut WritableStreamDefaultController,
         ) -> impl std::future::Future<Output = StreamResult<()>> {
-            let count = Rc::clone(&self.write_count);
+            let count = SharedPtr::clone(&self.write_count);
             async move {
                 let mut guard = count.lock().unwrap();
                 *guard += 1;
@@ -1966,13 +1964,13 @@ mod tests {
     async fn handles_basic_write_close_lifecycle() {
         #[derive(Clone)]
         struct TestSink {
-            write_count: Rc<Mutex<usize>>,
+            write_count: SharedPtr<Mutex<usize>>,
         }
 
         impl TestSink {
             fn new() -> Self {
                 Self {
-                    write_count: Rc::new(Mutex::new(0)),
+                    write_count: SharedPtr::new(Mutex::new(0)),
                 }
             }
 
@@ -2014,15 +2012,15 @@ mod tests {
     async fn handles_close_and_abort_operations() {
         #[derive(Clone)]
         struct TestSink {
-            closed: Rc<Mutex<bool>>,
-            aborted: Rc<Mutex<Option<String>>>,
+            closed: SharedPtr<Mutex<bool>>,
+            aborted: SharedPtr<Mutex<Option<String>>>,
         }
 
         impl TestSink {
             fn new() -> Self {
                 Self {
-                    closed: Rc::new(Mutex::new(false)),
-                    aborted: Rc::new(Mutex::new(None)),
+                    closed: SharedPtr::new(Mutex::new(false)),
+                    aborted: SharedPtr::new(Mutex::new(None)),
                 }
             }
 
@@ -2111,16 +2109,16 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn applies_backpressure_correctly() {
         struct SlowSink {
-            calls: Rc<Mutex<usize>>,
-            unblock_notify: Rc<tokio::sync::Notify>,
+            calls: SharedPtr<Mutex<usize>>,
+            unblock_notify: SharedPtr<tokio::sync::Notify>,
         }
 
         impl SlowSink {
-            fn new() -> (Self, Rc<tokio::sync::Notify>) {
-                let notify = Rc::new(tokio::sync::Notify::new());
+            fn new() -> (Self, SharedPtr<tokio::sync::Notify>) {
+                let notify = SharedPtr::new(tokio::sync::Notify::new());
                 (
                     Self {
-                        calls: Rc::new(Mutex::new(0)),
+                        calls: SharedPtr::new(Mutex::new(0)),
                         unblock_notify: notify.clone(),
                     },
                     notify,
@@ -2154,7 +2152,7 @@ mod tests {
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
         let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
-        let writer = Rc::new(writer);
+        let writer = SharedPtr::new(writer);
 
         // First write starts but blocks in sink
         let writer_clone = writer.clone();
@@ -2255,13 +2253,13 @@ mod tests {
     async fn propagates_sink_errors_to_stream() {
         #[derive(Clone)]
         struct FailingSink {
-            error_flag: Rc<Mutex<bool>>,
+            error_flag: SharedPtr<Mutex<bool>>,
         }
 
         impl FailingSink {
             fn new() -> Self {
                 Self {
-                    error_flag: Rc::new(Mutex::new(false)),
+                    error_flag: SharedPtr::new(Mutex::new(false)),
                 }
             }
 
@@ -2374,17 +2372,17 @@ mod tests {
     async fn ready_future_resolves_when_no_backpressure() {
         #[derive(Clone)]
         struct BlockSink {
-            notify: Rc<tokio::sync::Notify>,
-            write_calls: Rc<Mutex<usize>>,
+            notify: SharedPtr<tokio::sync::Notify>,
+            write_calls: SharedPtr<Mutex<usize>>,
         }
 
         impl BlockSink {
-            fn new() -> (Self, Rc<tokio::sync::Notify>) {
-                let notify = Rc::new(tokio::sync::Notify::new());
+            fn new() -> (Self, SharedPtr<tokio::sync::Notify>) {
+                let notify = SharedPtr::new(tokio::sync::Notify::new());
                 (
                     Self {
                         notify: notify.clone(),
-                        write_calls: Rc::new(Mutex::new(0)),
+                        write_calls: SharedPtr::new(Mutex::new(0)),
                     },
                     notify,
                 )
@@ -2413,7 +2411,7 @@ mod tests {
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
         let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
-        let writer = Rc::new(writer);
+        let writer = SharedPtr::new(writer);
 
         // Start first write
         let writer_clone = writer.clone();
@@ -2473,22 +2471,22 @@ mod sink_integration_tests {
     #[derive(Debug, Clone)]
     struct TestSink {
         id: String,
-        received_items: Rc<Mutex<Vec<String>>>,
+        received_items: SharedPtr<Mutex<Vec<String>>>,
         write_delay: Option<Duration>,
         fail_on_write: Option<usize>,
         fail_on_close: bool,
-        operation_log: Rc<Mutex<Vec<String>>>,
+        operation_log: SharedPtr<Mutex<Vec<String>>>,
     }
 
     impl TestSink {
         fn new(id: &str) -> Self {
             Self {
                 id: id.to_string(),
-                received_items: Rc::new(Mutex::new(Vec::new())),
+                received_items: SharedPtr::new(Mutex::new(Vec::new())),
                 write_delay: None,
                 fail_on_write: None,
                 fail_on_close: false,
-                operation_log: Rc::new(Mutex::new(Vec::new())),
+                operation_log: SharedPtr::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2864,12 +2862,12 @@ mod sink_integration_tests {
             .strategy(strategy)
             .spawn(tokio::task::spawn_local);
 
-        let sink_handle = Rc::new(Mutex::new(stream));
+        let sink_handle = SharedPtr::new(Mutex::new(stream));
         let item_count = 100;
         let mut send_futures = Vec::new();
 
         for i in 0..item_count {
-            let sink_clone = Rc::clone(&sink_handle);
+            let sink_clone = SharedPtr::clone(&sink_handle);
             let item = format!("item_{}", i);
             send_futures.push(tokio::task::spawn_local(async move {
                 let mut sink = sink_clone.lock().await;
@@ -2905,22 +2903,22 @@ mod async_write_integration_tests {
     #[derive(Debug, Clone)]
     struct BytesSink {
         id: String,
-        received_data: Rc<Mutex<Vec<u8>>>,
+        received_data: SharedPtr<Mutex<Vec<u8>>>,
         write_delay: Option<Duration>,
         fail_on_write: Option<usize>,
         fail_on_close: bool,
-        operation_log: Rc<Mutex<Vec<String>>>,
+        operation_log: SharedPtr<Mutex<Vec<String>>>,
     }
 
     impl BytesSink {
         fn new(id: &str) -> Self {
             Self {
                 id: id.to_string(),
-                received_data: Rc::new(Mutex::new(Vec::new())),
+                received_data: SharedPtr::new(Mutex::new(Vec::new())),
                 write_delay: None,
                 fail_on_write: None,
                 fail_on_close: false,
-                operation_log: Rc::new(Mutex::new(Vec::new())),
+                operation_log: SharedPtr::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -3263,19 +3261,59 @@ mod async_write_integration_tests {
 mod writable_builder_tests {
     use super::*;
 
+    #[cfg(feature = "send")]
     pub struct TestSink {
-        pub written_data: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        pub written_data: crate::platform::SharedPtr<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "local")]
+    pub struct TestSink {
+        pub written_data: crate::platform::SharedPtr<std::cell::RefCell<Vec<String>>>,
     }
 
     impl TestSink {
+        #[cfg(feature = "send")]
         pub fn new() -> Self {
             Self {
-                written_data: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                written_data: crate::platform::SharedPtr::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        #[cfg(feature = "local")]
+        pub fn new() -> Self {
+            Self {
+                written_data: crate::platform::SharedPtr::new(std::cell::RefCell::new(Vec::new())),
             }
         }
     }
 
+    // Helper to access written data regardless of feature
+    #[cfg(feature = "send")]
+    macro_rules! get_written_data {
+        ($data:expr) => {
+            $data.lock().unwrap()
+        };
+    }
+
+    #[cfg(feature = "local")]
+    macro_rules! get_written_data {
+        ($data:expr) => {
+            $data.borrow()
+        };
+    }
+
     impl WritableSink<String> for TestSink {
+        #[cfg(feature = "send")]
+        async fn write(
+            &mut self,
+            chunk: String,
+            _controller: &mut super::WritableStreamDefaultController,
+        ) -> Result<(), StreamError> {
+            self.written_data.lock().unwrap().push(chunk);
+            Ok(())
+        }
+
+        #[cfg(feature = "local")]
         async fn write(
             &mut self,
             chunk: String,
@@ -3297,7 +3335,7 @@ mod writable_builder_tests {
     #[tokio_localset_test::localset_test]
     async fn builder_spawn_creates_working_stream() {
         let sink = TestSink::new();
-        let written_data = std::rc::Rc::clone(&sink.written_data);
+        let written_data = crate::platform::SharedPtr::clone(&sink.written_data);
 
         let stream = WritableStream::builder(sink).spawn(tokio::task::spawn_local);
         let (_, writer) = stream.get_writer().unwrap();
@@ -3306,14 +3344,14 @@ mod writable_builder_tests {
         writer.write("world".to_string()).await.unwrap();
         writer.close().await.unwrap();
 
-        let data = written_data.borrow();
+        let data = get_written_data!(written_data);
         assert_eq!(*data, vec!["hello".to_string(), "world".to_string()]);
     }
 
     #[tokio_localset_test::localset_test]
     async fn builder_prepare_allows_manual_spawning() {
         let sink = TestSink::new();
-        let written_data = std::rc::Rc::clone(&sink.written_data);
+        let written_data = crate::platform::SharedPtr::clone(&sink.written_data);
 
         let (stream, fut) = WritableStream::builder(sink).prepare();
 
@@ -3324,7 +3362,7 @@ mod writable_builder_tests {
         writer.write("test".to_string()).await.unwrap();
         writer.close().await.unwrap();
 
-        let data = written_data.borrow();
+        let data = get_written_data!(written_data);
         assert_eq!(*data, vec!["test".to_string()]);
     }
 
@@ -3335,7 +3373,7 @@ mod writable_builder_tests {
     #[tokio_localset_test::localset_test]
     async fn builder_spawn_ref_works_with_function_pointer() {
         let sink = TestSink::new();
-        let written_data = std::rc::Rc::clone(&sink.written_data);
+        let written_data = crate::platform::SharedPtr::clone(&sink.written_data);
 
         let stream = WritableStream::builder(sink).spawn_ref(&spawn_local_fn);
         let (_, writer) = stream.get_writer().unwrap();
@@ -3343,14 +3381,14 @@ mod writable_builder_tests {
         writer.write("reference".to_string()).await.unwrap();
         writer.close().await.unwrap();
 
-        let data = written_data.borrow();
+        let data = get_written_data!(written_data);
         assert_eq!(*data, vec!["reference".to_string()]);
     }
 
     #[tokio_localset_test::localset_test]
     async fn builder_accepts_custom_strategy() {
         let sink = TestSink::new();
-        let written_data = std::rc::Rc::clone(&sink.written_data);
+        let written_data = crate::platform::SharedPtr::clone(&sink.written_data);
 
         let custom_strategy = CountQueuingStrategy::new(5);
         let stream = WritableStream::builder(sink)
@@ -3362,7 +3400,7 @@ mod writable_builder_tests {
         writer.write("custom".to_string()).await.unwrap();
         writer.close().await.unwrap();
 
-        let data = written_data.borrow();
+        let data = get_written_data!(written_data);
         assert_eq!(*data, vec!["custom".to_string()]);
     }
 }

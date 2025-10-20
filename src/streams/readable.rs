@@ -6,6 +6,7 @@ pub use super::{
     transform::{TransformReadableSource, TransformStream},
     writable::{WritableSink, WritableStream},
 };
+use crate::platform::{MaybeSend, MaybeSync, SharedPtr};
 use futures::{
     FutureExt,
     channel::{
@@ -22,7 +23,6 @@ use std::{
     io::{Error as IoError, ErrorKind, Result as IoResult},
     marker::PhantomData,
     pin::Pin,
-    rc::Rc,
     sync::{
         Mutex, RwLock,
         atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
@@ -44,20 +44,20 @@ pub struct DefaultStream;
 pub struct ByteStream;
 
 // ----------- Stream Type Marker Trait -----------
-pub trait StreamTypeMarker {
-    type Controller<T>;
+pub trait StreamTypeMarker: MaybeSend + 'static {
+    type Controller<T: MaybeSend + 'static>: MaybeSync + 'static;
 }
 
 impl StreamTypeMarker for DefaultStream {
-    type Controller<T> = ReadableStreamDefaultController<T>;
+    type Controller<T: MaybeSend + 'static> = ReadableStreamDefaultController<T>;
 }
 
 impl StreamTypeMarker for ByteStream {
-    type Controller<T> = ReadableByteStreamController;
+    type Controller<T: MaybeSend + 'static> = ReadableByteStreamController;
 }
 
 // ----------- Source Traits -----------
-pub trait ReadableSource<T: 'static>: 'static {
+pub trait ReadableSource<T: MaybeSend + 'static>: MaybeSend + 'static {
     fn start(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
@@ -96,11 +96,11 @@ pub trait ReadableSource<T: 'static>: 'static {
 
 // ----------- WakerSet -----------
 #[derive(Clone, Default, Debug)]
-pub struct WakerSet(Rc<Mutex<Vec<Waker>>>);
+pub struct WakerSet(SharedPtr<Mutex<Vec<Waker>>>);
 
 impl WakerSet {
     pub fn new() -> Self {
-        Self(Rc::new(Mutex::new(Vec::new())))
+        Self(SharedPtr::new(Mutex::new(Vec::new())))
     }
 
     pub fn register(&self, waker: &Waker) {
@@ -153,16 +153,16 @@ enum ByteControllerMsg {
 }
 
 // ----------- Controllers -----------
-pub struct ReadableStreamDefaultController<T> {
+pub struct ReadableStreamDefaultController<T: MaybeSend + 'static> {
     tx: UnboundedSender<ControllerMsg<T>>,
-    queue_total_size: Rc<AtomicUsize>,
-    high_water_mark: Rc<AtomicUsize>,
-    desired_size: Rc<AtomicIsize>,
-    closed: Rc<AtomicBool>,
-    errored: Rc<AtomicBool>,
+    queue_total_size: SharedPtr<AtomicUsize>,
+    high_water_mark: SharedPtr<AtomicUsize>,
+    desired_size: SharedPtr<AtomicIsize>,
+    closed: SharedPtr<AtomicBool>,
+    errored: SharedPtr<AtomicBool>,
 }
 
-impl<T> Clone for ReadableStreamDefaultController<T> {
+impl<T: MaybeSend + 'static> Clone for ReadableStreamDefaultController<T> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -175,14 +175,14 @@ impl<T> Clone for ReadableStreamDefaultController<T> {
     }
 }
 
-impl<T> ReadableStreamDefaultController<T> {
+impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
     fn new(
         tx: UnboundedSender<ControllerMsg<T>>,
-        queue_total_size: Rc<AtomicUsize>,
-        high_water_mark: Rc<AtomicUsize>,
-        desired_size: Rc<AtomicIsize>,
-        closed: Rc<AtomicBool>,
-        errored: Rc<AtomicBool>,
+        queue_total_size: SharedPtr<AtomicUsize>,
+        high_water_mark: SharedPtr<AtomicUsize>,
+        desired_size: SharedPtr<AtomicIsize>,
+        closed: SharedPtr<AtomicBool>,
+        errored: SharedPtr<AtomicBool>,
     ) -> Self {
         Self {
             tx,
@@ -232,17 +232,17 @@ impl<T> ReadableStreamDefaultController<T> {
 }
 
 pub struct ReadableByteStreamController {
-    //byte_state: Rc<ByteStreamState<Source>>,
-    byte_state: Rc<dyn ByteStreamStateInterface>,
+    //byte_state: SharedPtr<ByteStreamState<Source>>,
+    byte_state: SharedPtr<dyn ByteStreamStateInterface>,
 }
 
 impl ReadableByteStreamController {
-    pub fn new<Source>(byte_state: Rc<ByteStreamState<Source>>) -> Self
+    pub fn new<Source>(byte_state: SharedPtr<ByteStreamState<Source>>) -> Self
     where
         Source: ReadableByteSource,
     {
         Self {
-            byte_state: byte_state as Rc<dyn ByteStreamStateInterface>,
+            byte_state: byte_state as SharedPtr<dyn ByteStreamStateInterface>,
         }
     }
 
@@ -299,7 +299,7 @@ struct ReadableStreamInner<T, Source> {
     pulling: bool,
 }
 
-impl<T, Source> ReadableStreamInner<T, Source> {
+impl<T: MaybeSend + 'static, Source> ReadableStreamInner<T, Source> {
     fn new(source: Source, strategy: Box<dyn QueuingStrategy<T>>) -> Self {
         Self {
             state: StreamState::Readable,
@@ -336,25 +336,25 @@ impl<T, Source> ReadableStreamInner<T, Source> {
 }
 
 // ----------- Main ReadableStream with Typestate -----------
-pub struct ReadableStream<T, Source, StreamType, LockState = Unlocked>
+pub struct ReadableStream<T: MaybeSend + 'static, Source, StreamType, LockState = Unlocked>
 where
     StreamType: StreamTypeMarker,
 {
     command_tx: UnboundedSender<StreamCommand<T>>,
-    queue_total_size: Rc<AtomicUsize>,
-    high_water_mark: Rc<AtomicUsize>,
-    closed: Rc<AtomicBool>,
-    errored: Rc<AtomicBool>,
-    locked: Rc<AtomicBool>,
-    stored_error: Rc<RwLock<Option<StreamError>>>,
-    desired_size: Rc<AtomicIsize>,
-    pub(crate) controller: Rc<StreamType::Controller<T>>,
-    //byte_state: Option<Rc<ByteStreamState<Source>>>,
-    pub(crate) byte_state: Option<Rc<dyn ByteStreamStateInterface>>,
+    queue_total_size: SharedPtr<AtomicUsize>,
+    high_water_mark: SharedPtr<AtomicUsize>,
+    closed: SharedPtr<AtomicBool>,
+    errored: SharedPtr<AtomicBool>,
+    locked: SharedPtr<AtomicBool>,
+    stored_error: SharedPtr<RwLock<Option<StreamError>>>,
+    desired_size: SharedPtr<AtomicIsize>,
+    pub(crate) controller: SharedPtr<StreamType::Controller<T>>,
+    //byte_state: Option<SharedPtr<ByteStreamState<Source>>>,
+    pub(crate) byte_state: Option<SharedPtr<dyn ByteStreamStateInterface>>,
     _phantom: PhantomData<(T, Source, StreamType, LockState)>,
 }
 
-impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
+impl<T: MaybeSend + 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
     pub(crate) fn controller(&self) -> &ReadableStreamDefaultController<T> {
         self.controller.as_ref()
     }
@@ -366,7 +366,7 @@ impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
     }
 }
 
-impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
+impl<T: MaybeSend + 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
     pub fn locked(&self) -> bool {
         self.locked.load(Ordering::SeqCst)
     }
@@ -382,7 +382,7 @@ impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
     }
 }
 
-impl<T: 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
+impl<T: MaybeSend + 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     S: StreamTypeMarker,
 {
@@ -549,15 +549,15 @@ pub enum BackpressureMode {
 
 #[derive(Clone)]
 pub struct AsyncSignal {
-    waker: Rc<Mutex<Option<Waker>>>,
-    signaled: Rc<AtomicBool>,
+    waker: SharedPtr<Mutex<Option<Waker>>>,
+    signaled: SharedPtr<AtomicBool>,
 }
 
 impl AsyncSignal {
     pub fn new() -> Self {
         Self {
-            waker: Rc::new(Mutex::new(None)),
-            signaled: Rc::new(AtomicBool::new(false)),
+            waker: SharedPtr::new(Mutex::new(None)),
+            signaled: SharedPtr::new(AtomicBool::new(false)),
         }
     }
 
@@ -581,18 +581,18 @@ impl AsyncSignal {
     }
 }
 
-pub struct TeeSource<T> {
+pub struct TeeSource<T: MaybeSend + 'static> {
     chunk_rx: UnboundedReceiver<TeeChunk<T>>,
     branch_id: TeeSourceId,
-    branch_canceled: Rc<AtomicBool>,
+    branch_canceled: SharedPtr<AtomicBool>,
 
     // Optional fields used only for backpressure-aware modes.
     // None for the Unbounded fast-path.
-    pending_count: Option<Rc<AtomicUsize>>,
+    pending_count: Option<SharedPtr<AtomicUsize>>,
     backpressure_signal: Option<AsyncSignal>,
 }
 
-impl<T: 'static> ReadableSource<T> for TeeSource<T> {
+impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
     async fn pull(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
@@ -643,7 +643,7 @@ impl<T: 'static> ReadableSource<T> for TeeSource<T> {
 
 struct TeeCoordinator<T, Source, StreamType, LockState>
 where
-    T: Clone,
+    T: MaybeSend + Clone + 'static,
     StreamType: StreamTypeMarker,
 {
     reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
@@ -651,20 +651,21 @@ where
     branch1_tx: UnboundedSender<TeeChunk<T>>,
     branch2_tx: UnboundedSender<TeeChunk<T>>,
 
-    branch1_canceled: Rc<AtomicBool>,
-    branch2_canceled: Rc<AtomicBool>,
+    branch1_canceled: SharedPtr<AtomicBool>,
+    branch2_canceled: SharedPtr<AtomicBool>,
 
     // Backpressure configuration
     backpressure_mode: BackpressureMode,
-    branch1_pending_count: Option<Rc<AtomicUsize>>,
-    branch2_pending_count: Option<Rc<AtomicUsize>>,
+    branch1_pending_count: Option<SharedPtr<AtomicUsize>>,
+    branch2_pending_count: Option<SharedPtr<AtomicUsize>>,
 
     backpressure_signal: Option<AsyncSignal>,
     branch1_high_water_mark: usize,
     branch2_high_water_mark: usize,
 }
 
-impl<T, Source, StreamType, LockState> TeeCoordinator<T, Source, StreamType, LockState>
+impl<T: MaybeSend + 'static, Source, StreamType, LockState>
+    TeeCoordinator<T, Source, StreamType, LockState>
 where
     T: Clone,
     StreamType: StreamTypeMarker,
@@ -861,7 +862,7 @@ where
 
 pub struct TeeBuilder<T, Source, S>
 where
-    T: Clone + 'static,
+    T: MaybeSend + Clone + 'static,
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
@@ -871,7 +872,7 @@ where
     branch2_strategy: Box<dyn QueuingStrategy<T>>,
 }
 
-impl<T, Source, S> TeeBuilder<T, Source, S>
+impl<T: MaybeSend + 'static, Source, S> TeeBuilder<T, Source, S>
 where
     T: Clone + 'static,
     Source: 'static,
@@ -1031,7 +1032,7 @@ where
     }
 }
 
-impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+impl<T: MaybeSend + 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Clone + 'static,
     Source: 'static,
@@ -1057,16 +1058,16 @@ where
         let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
         let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
 
-        let branch1_canceled = Rc::new(AtomicBool::new(false));
-        let branch2_canceled = Rc::new(AtomicBool::new(false));
+        let branch1_canceled = SharedPtr::new(AtomicBool::new(false));
+        let branch2_canceled = SharedPtr::new(AtomicBool::new(false));
 
         let (branch1_pending, branch2_pending, backpressure_signal) =
             if matches!(mode, BackpressureMode::Unbounded) {
                 (None, None, None)
             } else {
                 (
-                    Some(Rc::new(AtomicUsize::new(0))),
-                    Some(Rc::new(AtomicUsize::new(0))),
+                    Some(SharedPtr::new(AtomicUsize::new(0))),
+                    Some(SharedPtr::new(AtomicUsize::new(0))),
                     Some(AsyncSignal::new()),
                 )
             };
@@ -1119,6 +1120,8 @@ where
 
 pub struct PipeBuilder<T, O, Source, S>
 where
+    T: MaybeSend + 'static,
+    O: MaybeSend + 'static,
     S: StreamTypeMarker,
 {
     source_stream: ReadableStream<T, Source, S, Unlocked>,
@@ -1126,7 +1129,7 @@ where
     options: Option<StreamPipeOptions>,
 }
 
-impl<T, O, Source, S> PipeBuilder<T, O, Source, S>
+impl<T: MaybeSend + 'static, O: MaybeSend + 'static, Source, S> PipeBuilder<T, O, Source, S>
 where
     T: 'static,
     O: 'static,
@@ -1192,9 +1195,9 @@ where
     }
 }
 
-impl<T, Source, S> ReadableStream<T, Source, S, Unlocked>
+impl<T: MaybeSend + 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
-    T: 'static,
+    T: MaybeSend + 'static,
     Source: 'static,
     S: StreamTypeMarker + 'static,
 {
@@ -1204,7 +1207,7 @@ where
         options: Option<StreamPipeOptions>,
     ) -> PipeBuilder<T, O, Source, S>
     where
-        O: 'static,
+        O: MaybeSend + 'static,
     {
         PipeBuilder::new(self, transform, options)
     }
@@ -1230,14 +1233,14 @@ where
     ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = unbounded();
         let (_ctrl_tx, _ctrl_rx) = unbounded::<ByteControllerMsg>();
-        let queue_total_size = Rc::new(AtomicUsize::new(0));
-        let closed = Rc::new(AtomicBool::new(false));
-        let errored = Rc::new(AtomicBool::new(false));
-        let locked = Rc::new(AtomicBool::new(false));
-        let stored_error = Rc::new(RwLock::new(None));
+        let queue_total_size = SharedPtr::new(AtomicUsize::new(0));
+        let closed = SharedPtr::new(AtomicBool::new(false));
+        let errored = SharedPtr::new(AtomicBool::new(false));
+        let locked = SharedPtr::new(AtomicBool::new(false));
+        let stored_error = SharedPtr::new(RwLock::new(None));
 
-        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
+        let high_water_mark = SharedPtr::new(AtomicUsize::new(strategy.high_water_mark()));
+        let desired_size = SharedPtr::new(AtomicIsize::new(strategy.high_water_mark() as isize));
 
         let byte_state = ByteStreamState::new(source, strategy.high_water_mark());
         let controller = ReadableByteStreamController::new(byte_state.clone());
@@ -1254,7 +1257,7 @@ where
             errored,
             locked,
             stored_error,
-            controller: Rc::new(controller),
+            controller: SharedPtr::new(controller),
             byte_state: Some(byte_state),
             _phantom: PhantomData,
         };
@@ -1264,43 +1267,45 @@ where
 }
 
 // ----------- Generic Constructor -----------
-impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStream, Unlocked> {
+impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
+    ReadableStream<T, Source, DefaultStream, Unlocked>
+{
     pub(crate) fn new_inner(
         source: Source,
         strategy: Box<dyn QueuingStrategy<T> + 'static>,
     ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
-        let queue_total_size = Rc::new(AtomicUsize::new(0));
-        let closed = Rc::new(AtomicBool::new(false));
-        let errored = Rc::new(AtomicBool::new(false));
-        let locked = Rc::new(AtomicBool::new(false));
-        let stored_error = Rc::new(RwLock::new(None));
+        let queue_total_size = SharedPtr::new(AtomicUsize::new(0));
+        let closed = SharedPtr::new(AtomicBool::new(false));
+        let errored = SharedPtr::new(AtomicBool::new(false));
+        let locked = SharedPtr::new(AtomicBool::new(false));
+        let stored_error = SharedPtr::new(RwLock::new(None));
 
-        let high_water_mark = Rc::new(AtomicUsize::new(strategy.high_water_mark()));
-        let desired_size = Rc::new(AtomicIsize::new(strategy.high_water_mark() as isize));
+        let high_water_mark = SharedPtr::new(AtomicUsize::new(strategy.high_water_mark()));
+        let desired_size = SharedPtr::new(AtomicIsize::new(strategy.high_water_mark() as isize));
 
         let inner = ReadableStreamInner::new(source, strategy);
 
         let controller = ReadableStreamDefaultController::new(
             ctrl_tx.clone(),
-            Rc::clone(&queue_total_size),
-            Rc::clone(&high_water_mark),
-            Rc::clone(&desired_size),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
+            SharedPtr::clone(&queue_total_size),
+            SharedPtr::clone(&high_water_mark),
+            SharedPtr::clone(&desired_size),
+            SharedPtr::clone(&closed),
+            SharedPtr::clone(&errored),
         );
 
         let task_fut = readable_stream_task(
             command_rx,
             ctrl_rx,
             inner,
-            Rc::clone(&queue_total_size),
-            Rc::clone(&high_water_mark),
-            Rc::clone(&desired_size),
-            Rc::clone(&closed),
-            Rc::clone(&errored),
-            Rc::clone(&stored_error),
+            SharedPtr::clone(&queue_total_size),
+            SharedPtr::clone(&high_water_mark),
+            SharedPtr::clone(&desired_size),
+            SharedPtr::clone(&closed),
+            SharedPtr::clone(&errored),
+            SharedPtr::clone(&stored_error),
             ctrl_tx,
             controller.clone(),
         );
@@ -1324,7 +1329,7 @@ impl<T: 'static, Source: ReadableSource<T>> ReadableStream<T, Source, DefaultStr
 }
 
 // ----------- Additional reader methods for generic streams -----------
-impl<T, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
+impl<T: MaybeSend + 'static, Source, StreamType> ReadableStream<T, Source, StreamType, Unlocked>
 where
     StreamType: StreamTypeMarker,
 {
@@ -1347,13 +1352,13 @@ where
 
         let locked_stream = ReadableStream {
             command_tx: self.command_tx.clone(),
-            queue_total_size: Rc::clone(&self.queue_total_size),
-            high_water_mark: Rc::clone(&self.high_water_mark),
-            desired_size: Rc::clone(&self.desired_size),
-            closed: Rc::clone(&self.closed),
-            errored: Rc::clone(&self.errored),
-            locked: Rc::clone(&self.locked),
-            stored_error: Rc::clone(&self.stored_error),
+            queue_total_size: SharedPtr::clone(&self.queue_total_size),
+            high_water_mark: SharedPtr::clone(&self.high_water_mark),
+            desired_size: SharedPtr::clone(&self.desired_size),
+            closed: SharedPtr::clone(&self.closed),
+            errored: SharedPtr::clone(&self.errored),
+            locked: SharedPtr::clone(&self.locked),
+            stored_error: SharedPtr::clone(&self.stored_error),
             controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
@@ -1401,13 +1406,13 @@ where
 
         let locked_stream = ReadableStream {
             command_tx: self.command_tx.clone(),
-            queue_total_size: Rc::clone(&self.queue_total_size),
-            high_water_mark: Rc::clone(&self.high_water_mark),
-            desired_size: Rc::clone(&self.desired_size),
-            closed: Rc::clone(&self.closed),
-            errored: Rc::clone(&self.errored),
-            locked: Rc::clone(&self.locked),
-            stored_error: Rc::clone(&self.stored_error),
+            queue_total_size: SharedPtr::clone(&self.queue_total_size),
+            high_water_mark: SharedPtr::clone(&self.high_water_mark),
+            desired_size: SharedPtr::clone(&self.desired_size),
+            closed: SharedPtr::clone(&self.closed),
+            errored: SharedPtr::clone(&self.errored),
+            locked: SharedPtr::clone(&self.locked),
+            stored_error: SharedPtr::clone(&self.stored_error),
             controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
             _phantom: PhantomData,
@@ -1432,7 +1437,8 @@ where
 }
 
 // ----------- Stream Trait Implementation  -----------
-impl<T, Source, StreamType, LockState> Stream for ReadableStream<T, Source, StreamType, LockState>
+impl<T: MaybeSend + 'static, Source, StreamType, LockState> Stream
+    for ReadableStream<T, Source, StreamType, LockState>
 where
     StreamType: StreamTypeMarker,
 {
@@ -1462,7 +1468,7 @@ where
     }
 }
 
-impl<T, Source, StreamType, LockState> AsyncRead
+impl<T: MaybeSend + 'static, Source, StreamType, LockState> AsyncRead
     for ReadableStream<T, Source, StreamType, LockState>
 where
     T: for<'a> From<&'a [u8]>,
@@ -1486,13 +1492,13 @@ where
 }
 
 // ----------- Example Source Implementations  -----------
-pub struct IteratorSource<I> {
+pub struct IteratorSource<I: MaybeSend + 'static> {
     iter: I,
 }
 
-impl<I, T: 'static> ReadableSource<T> for IteratorSource<I>
+impl<I: MaybeSend + 'static, T: MaybeSend + 'static> ReadableSource<T> for IteratorSource<I>
 where
-    I: Iterator<Item = T> + 'static,
+    I: Iterator<Item = T> + MaybeSend + 'static,
 {
     async fn pull(
         &mut self,
@@ -1507,13 +1513,13 @@ where
     }
 }
 
-pub struct AsyncStreamSource<S> {
+pub struct AsyncStreamSource<S: MaybeSend + 'static> {
     stream: S,
 }
 
-impl<S, T: 'static> ReadableSource<T> for AsyncStreamSource<S>
+impl<S: MaybeSend + 'static, T: MaybeSend + 'static> ReadableSource<T> for AsyncStreamSource<S>
 where
-    S: Stream<Item = T> + Unpin + 'static,
+    S: Stream<Item = T> + Unpin + MaybeSend + 'static,
 {
     async fn pull(
         &mut self,
@@ -1529,13 +1535,14 @@ where
 }
 
 // ----------- Default Reader -----------
-pub struct ReadableStreamDefaultReader<T, Source, StreamType, LockState>(
+pub struct ReadableStreamDefaultReader<T: MaybeSend + 'static, Source, StreamType, LockState>(
     ReadableStream<T, Source, StreamType, LockState>,
 )
 where
     StreamType: StreamTypeMarker;
 
-impl<T, Source, StreamType, LockState> ReadableStreamDefaultReader<T, Source, StreamType, LockState>
+impl<T: MaybeSend + 'static, Source, StreamType, LockState>
+    ReadableStreamDefaultReader<T, Source, StreamType, LockState>
 where
     StreamType: StreamTypeMarker,
 {
@@ -1640,7 +1647,7 @@ where
 {
 }*/
 
-impl<T, Source, StreamType, LockState> Drop
+impl<T: MaybeSend + 'static, Source, StreamType, LockState> Drop
     for ReadableStreamDefaultReader<T, Source, StreamType, LockState>
 where
     StreamType: StreamTypeMarker,
@@ -1709,11 +1716,11 @@ impl<Source, LockState> Drop for ReadableStreamBYOBReader<Source, LockState> {
 }
 
 fn update_desired_size(
-    queue_total_size: &Rc<AtomicUsize>,
-    high_water_mark: &Rc<AtomicUsize>,
-    desired_size: &Rc<AtomicIsize>,
-    closed: &Rc<AtomicBool>,
-    errored: &Rc<AtomicBool>,
+    queue_total_size: &SharedPtr<AtomicUsize>,
+    high_water_mark: &SharedPtr<AtomicUsize>,
+    desired_size: &SharedPtr<AtomicIsize>,
+    closed: &SharedPtr<AtomicBool>,
+    errored: &SharedPtr<AtomicBool>,
 ) {
     if closed.load(Ordering::SeqCst) || errored.load(Ordering::SeqCst) {
         desired_size.store(0, Ordering::SeqCst);
@@ -1732,15 +1739,16 @@ async fn readable_stream_task<T: 'static, Source>(
     mut command_rx: UnboundedReceiver<StreamCommand<T>>,
     mut ctrl_rx: UnboundedReceiver<ControllerMsg<T>>,
     mut inner: ReadableStreamInner<T, Source>,
-    queue_total_size: Rc<AtomicUsize>,
-    high_water_mark: Rc<AtomicUsize>,
-    desired_size: Rc<AtomicIsize>,
-    closed: Rc<AtomicBool>,
-    errored: Rc<AtomicBool>,
-    stored_error: Rc<RwLock<Option<StreamError>>>,
+    queue_total_size: SharedPtr<AtomicUsize>,
+    high_water_mark: SharedPtr<AtomicUsize>,
+    desired_size: SharedPtr<AtomicIsize>,
+    closed: SharedPtr<AtomicBool>,
+    errored: SharedPtr<AtomicBool>,
+    stored_error: SharedPtr<RwLock<Option<StreamError>>>,
     ctrl_tx: UnboundedSender<ControllerMsg<T>>,
     mut controller: ReadableStreamDefaultController<T>,
 ) where
+    T: MaybeSend,
     Source: ReadableSource<T>,
 {
     // Call start() first before processing any commands
@@ -1972,7 +1980,7 @@ async fn readable_stream_task<T: 'static, Source>(
 
 // ----------- Byte Stream Task Implementation -----------
 pub async fn readable_byte_stream_task<Source>(
-    byte_state: Rc<ByteStreamState<Source>>,
+    byte_state: SharedPtr<ByteStreamState<Source>>,
     mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
     mut controller: ReadableByteStreamController,
 ) where
@@ -2154,6 +2162,7 @@ pub async fn readable_byte_stream_task<Source>(
 // ----------- Builder Pattern Implementation -----------
 pub struct ReadableStreamBuilder<T, Source, StreamType = DefaultStream>
 where
+    T: MaybeSend + 'static,
     StreamType: StreamTypeMarker,
 {
     source: Source,
@@ -2161,7 +2170,7 @@ where
     _phantom: PhantomData<(T, StreamType)>,
 }
 
-impl<T, Source> ReadableStreamBuilder<T, Source, DefaultStream>
+impl<T: MaybeSend + 'static, Source> ReadableStreamBuilder<T, Source, DefaultStream>
 where
     T: 'static,
     Source: ReadableSource<T>,
@@ -2266,7 +2275,7 @@ where
 }
 
 // Main ReadableStream impl - default streams
-impl<T, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
+impl<T: MaybeSend + 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked>
 where
     T: 'static,
     Source: ReadableSource<T>,
@@ -2278,7 +2287,9 @@ where
 }
 
 // Shortcut methods on ReadableStream for common cases
-impl<T: 'static> ReadableStream<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream, Unlocked> {
+impl<T: MaybeSend + 'static>
+    ReadableStream<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream, Unlocked>
+{
     /// Create from Vec - shortcut for ReadableStreamBuilder::from_vec()
     pub fn from_vec(
         vec: Vec<T>,
@@ -2287,9 +2298,9 @@ impl<T: 'static> ReadableStream<T, IteratorSource<std::vec::IntoIter<T>>, Defaul
     }
 }
 
-impl<T: 'static, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked>
+impl<T: MaybeSend + 'static, I> ReadableStream<T, IteratorSource<I>, DefaultStream, Unlocked>
 where
-    I: Iterator<Item = T> + 'static,
+    I: Iterator<Item = T> + MaybeSend + 'static,
 {
     /// Create from Iterator - shortcut for ReadableStreamBuilder::from_iterator()
     pub fn from_iterator(iter: I) -> ReadableStreamBuilder<T, IteratorSource<I>, DefaultStream> {
@@ -2297,9 +2308,9 @@ where
     }
 }
 
-impl<T: 'static, S> ReadableStream<T, AsyncStreamSource<S>, DefaultStream, Unlocked>
+impl<T: MaybeSend + 'static, S> ReadableStream<T, AsyncStreamSource<S>, DefaultStream, Unlocked>
 where
-    S: Stream<Item = T> + Unpin + 'static,
+    S: Stream<Item = T> + Unpin + MaybeSend + 'static,
 {
     /// Create from Stream - shortcut for ReadableStreamBuilder::from_stream()
     pub fn from_stream(stream: S) -> ReadableStreamBuilder<T, AsyncStreamSource<S>, DefaultStream> {
@@ -2319,7 +2330,9 @@ where
 }
 
 // Convenience constructors as static methods on the builder
-impl<T: 'static> ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream> {
+impl<T: MaybeSend + 'static>
+    ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>, DefaultStream>
+{
     /// Create a builder from a Vec
     pub fn from_vec(vec: Vec<T>) -> Self {
         Self::new(IteratorSource {
@@ -2328,9 +2341,9 @@ impl<T: 'static> ReadableStreamBuilder<T, IteratorSource<std::vec::IntoIter<T>>,
     }
 }
 
-impl<T: 'static, I> ReadableStreamBuilder<T, IteratorSource<I>, DefaultStream>
+impl<T: MaybeSend + 'static, I> ReadableStreamBuilder<T, IteratorSource<I>, DefaultStream>
 where
-    I: Iterator<Item = T> + 'static,
+    I: Iterator<Item = T> + MaybeSend + 'static,
 {
     /// Create a builder from an Iterator
     pub fn from_iterator(iter: I) -> Self {
@@ -2338,9 +2351,9 @@ where
     }
 }
 
-impl<T: 'static, S> ReadableStreamBuilder<T, AsyncStreamSource<S>, DefaultStream>
+impl<T: MaybeSend + 'static, S> ReadableStreamBuilder<T, AsyncStreamSource<S>, DefaultStream>
 where
-    S: Stream<Item = T> + Unpin + 'static,
+    S: Stream<Item = T> + Unpin + MaybeSend + 'static,
 {
     /// Create a builder from a Stream
     pub fn from_stream(stream: S) -> Self {
@@ -2416,7 +2429,7 @@ mod tests {
         let data = vec![1, 2, 3];
         let stream =
             ReadableStream::from_iterator(data.into_iter()).spawn(tokio::task::spawn_local);
-        let locked_ref = Rc::clone(&stream.locked);
+        let locked_ref = SharedPtr::clone(&stream.locked);
 
         {
             let (_locked_stream, _reader) = stream.get_reader().unwrap();
@@ -2729,7 +2742,7 @@ mod tests {
 
         struct PushStartSource {
             data: Vec<i32>,
-            enqueued: Rc<Mutex<bool>>,
+            enqueued: SharedPtr<Mutex<bool>>,
         }
 
         impl ReadableSource<i32> for PushStartSource {
@@ -2763,7 +2776,7 @@ mod tests {
 
         let source = PushStartSource {
             data: vec![10, 20, 30],
-            enqueued: Rc::new(Mutex::new(false)),
+            enqueued: SharedPtr::new(Mutex::new(false)),
         };
 
         let stream = ReadableStream::builder(source).spawn(|fut| {
@@ -2832,8 +2845,8 @@ mod tests {
 
         struct SlowStartByteSource {
             data: Vec<u8>,
-            start_barrier: Rc<Barrier>,
-            start_completed: Rc<AtomicBool>,
+            start_barrier: SharedPtr<Barrier>,
+            start_completed: SharedPtr<AtomicBool>,
         }
 
         impl ReadableByteSource for SlowStartByteSource {
@@ -2868,13 +2881,13 @@ mod tests {
             }
         }
 
-        let barrier = Rc::new(Barrier::new(2));
-        let start_completed = Rc::new(AtomicBool::new(false));
+        let barrier = SharedPtr::new(Barrier::new(2));
+        let start_completed = SharedPtr::new(AtomicBool::new(false));
 
         let source = SlowStartByteSource {
             data: b"delayed data".to_vec(),
-            start_barrier: Rc::clone(&barrier),
-            start_completed: Rc::clone(&start_completed),
+            start_barrier: SharedPtr::clone(&barrier),
+            start_completed: SharedPtr::clone(&start_completed),
         };
 
         let stream = ReadableStream::builder_bytes(source).spawn(|fut| {
@@ -2908,13 +2921,13 @@ mod pipe_to_tests {
 
     #[derive(Clone)]
     struct CountingSink {
-        written: Rc<Mutex<Vec<Vec<u8>>>>,
+        written: SharedPtr<Mutex<Vec<Vec<u8>>>>,
     }
 
     impl CountingSink {
         fn new() -> Self {
             Self {
-                written: Rc::new(Mutex::new(Vec::new())),
+                written: SharedPtr::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2963,19 +2976,19 @@ mod pipe_to_tests {
     async fn handles_destination_write_errors() {
         #[derive(Clone)]
         struct FailingWriteSink {
-            written: Rc<Mutex<Vec<Vec<u8>>>>,
+            written: SharedPtr<Mutex<Vec<Vec<u8>>>>,
             fail_after: usize,
-            write_count: Rc<Mutex<usize>>,
-            abort_called: Rc<Mutex<bool>>,
+            write_count: SharedPtr<Mutex<usize>>,
+            abort_called: SharedPtr<Mutex<bool>>,
         }
 
         impl FailingWriteSink {
             fn new(fail_after: usize) -> Self {
                 Self {
-                    written: Rc::new(Mutex::new(Vec::new())),
+                    written: SharedPtr::new(Mutex::new(Vec::new())),
                     fail_after,
-                    write_count: Rc::new(Mutex::new(0)),
-                    abort_called: Rc::new(Mutex::new(false)),
+                    write_count: SharedPtr::new(Mutex::new(0)),
+                    abort_called: SharedPtr::new(Mutex::new(false)),
                 }
             }
 
@@ -2990,8 +3003,8 @@ mod pipe_to_tests {
                 chunk: Vec<u8>,
                 _controller: &mut WritableStreamDefaultController,
             ) -> impl std::future::Future<Output = StreamResult<()>> {
-                let written = Rc::clone(&self.written);
-                let write_count = Rc::clone(&self.write_count);
+                let written = SharedPtr::clone(&self.written);
+                let write_count = SharedPtr::clone(&self.write_count);
                 let fail_after = self.fail_after;
 
                 async move {
@@ -3022,7 +3035,7 @@ mod pipe_to_tests {
         struct TrackingSource {
             data: Vec<Vec<u8>>,
             index: usize,
-            cancelled: Rc<Mutex<bool>>,
+            cancelled: SharedPtr<Mutex<bool>>,
         }
 
         impl TrackingSource {
@@ -3030,7 +3043,7 @@ mod pipe_to_tests {
                 Self {
                     data,
                     index: 0,
-                    cancelled: Rc::new(Mutex::new(false)),
+                    cancelled: SharedPtr::new(Mutex::new(false)),
                 }
             }
         }
@@ -3064,7 +3077,7 @@ mod pipe_to_tests {
         ];
 
         let source = TrackingSource::new(data.clone());
-        let cancelled_flag = Rc::clone(&source.cancelled);
+        let cancelled_flag = SharedPtr::clone(&source.cancelled);
         let readable = ReadableStream::builder(source).spawn(|fut| {
             tokio::task::spawn_local(fut);
         });
@@ -3138,17 +3151,17 @@ mod pipe_to_tests {
 
         #[derive(Clone)]
         struct TrackingSink {
-            written: Rc<Mutex<Vec<Vec<u8>>>>,
-            abort_called: Rc<Mutex<bool>>,
-            abort_reason: Rc<Mutex<Option<String>>>,
+            written: SharedPtr<Mutex<Vec<Vec<u8>>>>,
+            abort_called: SharedPtr<Mutex<bool>>,
+            abort_reason: SharedPtr<Mutex<Option<String>>>,
         }
 
         impl TrackingSink {
             fn new() -> Self {
                 Self {
-                    written: Rc::new(Mutex::new(Vec::new())),
-                    abort_called: Rc::new(Mutex::new(false)),
-                    abort_reason: Rc::new(Mutex::new(None)),
+                    written: SharedPtr::new(Mutex::new(Vec::new())),
+                    abort_called: SharedPtr::new(Mutex::new(false)),
+                    abort_reason: SharedPtr::new(Mutex::new(None)),
                 }
             }
 
@@ -3171,7 +3184,7 @@ mod pipe_to_tests {
                 chunk: Vec<u8>,
                 _controller: &mut WritableStreamDefaultController,
             ) -> impl std::future::Future<Output = StreamResult<()>> {
-                let written = Rc::clone(&self.written);
+                let written = SharedPtr::clone(&self.written);
                 async move {
                     written.lock().unwrap().push(chunk);
                     Ok(())
@@ -3230,8 +3243,8 @@ mod pipe_to_tests {
         #[derive(Clone)]
         struct TestSource {
             data: Vec<Vec<u8>>,
-            index: Rc<Mutex<usize>>,
-            cancelled: Rc<Mutex<bool>>,
+            index: SharedPtr<Mutex<usize>>,
+            cancelled: SharedPtr<Mutex<bool>>,
             should_error: bool,
             error_after: usize,
         }
@@ -3240,8 +3253,8 @@ mod pipe_to_tests {
             fn new(data: Vec<Vec<u8>>) -> Self {
                 Self {
                     data,
-                    index: Rc::new(Mutex::new(0)),
-                    cancelled: Rc::new(Mutex::new(false)),
+                    index: SharedPtr::new(Mutex::new(0)),
+                    cancelled: SharedPtr::new(Mutex::new(false)),
                     should_error: false,
                     error_after: 0,
                 }
@@ -3287,18 +3300,18 @@ mod pipe_to_tests {
 
         #[derive(Clone)]
         struct TestSink {
-            written: Rc<Mutex<Vec<Vec<u8>>>>,
-            aborted: Rc<Mutex<bool>>,
-            closed: Rc<Mutex<bool>>,
+            written: SharedPtr<Mutex<Vec<Vec<u8>>>>,
+            aborted: SharedPtr<Mutex<bool>>,
+            closed: SharedPtr<Mutex<bool>>,
             should_error: bool,
         }
 
         impl TestSink {
             fn new() -> Self {
                 Self {
-                    written: Rc::new(Mutex::new(Vec::new())),
-                    aborted: Rc::new(Mutex::new(false)),
-                    closed: Rc::new(Mutex::new(false)),
+                    written: SharedPtr::new(Mutex::new(Vec::new())),
+                    aborted: SharedPtr::new(Mutex::new(false)),
+                    closed: SharedPtr::new(Mutex::new(false)),
                     should_error: false,
                 }
             }

@@ -2,12 +2,12 @@ use super::{
     byte_source_trait::ReadableByteSource, error::StreamError,
     readable::ReadableByteStreamController,
 };
+use crate::platform::{MaybeSend, MaybeSync, SharedPtr};
 use futures::future::poll_fn;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     pin::Pin,
-    rc::Rc,
     sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
@@ -42,8 +42,8 @@ impl<Source> ByteStreamState<Source>
 where
     Source: ReadableByteSource + 'static,
 {
-    pub fn new(source: Source, high_water_mark: usize) -> Rc<Self> {
-        Rc::new(Self {
+    pub fn new(source: Source, high_water_mark: usize) -> SharedPtr<Self> {
+        SharedPtr::new(Self {
             buffer: Mutex::new(VecDeque::new()),
             source: Mutex::new(Some(source)),
             read_wakers: Mutex::new(Vec::new()),
@@ -431,7 +431,7 @@ where
 }
 
 //#[async_trait]
-pub trait ByteStreamStateInterface {
+pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn desired_size(&self) -> Option<isize>;
     fn close(&self);
     fn enqueue_data(&self, data: &[u8]);
