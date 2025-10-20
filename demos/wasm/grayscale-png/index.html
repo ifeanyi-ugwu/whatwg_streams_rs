@@ -1,0 +1,45 @@
+<div style="display: flex; gap: 20px">
+  <canvas id="orig-canvas" style="border: 1px solid #000"></canvas>
+  <canvas id="gray-canvas" style="border: 1px solid #000"></canvas>
+</div>
+<br />
+<button id="grayscale-btn">Grayscale PNG</button>
+
+<script type="module">
+  import init, { grayscale_png_stream_wasm } from "./pkg/grayscale_png.js";
+
+  async function main() {
+    await init();
+
+    const origCanvas = document.getElementById("orig-canvas");
+    const ctxOrig = origCanvas.getContext("2d");
+    const grayCanvas = document.getElementById("gray-canvas");
+
+    // Fetch PNG bytes
+    const resp = await fetch(
+      "https://mdn.github.io/dom-examples/streams/grayscale-png/tortoise.png"
+    );
+    const arrayBuffer = await resp.arrayBuffer();
+    const pngBytes = new Uint8Array(arrayBuffer);
+
+    // Draw original PNG into left canvas
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = URL.createObjectURL(new Blob([pngBytes], { type: "image/png" }));
+
+    img.onload = () => {
+      // Resize both canvases to match the image
+      origCanvas.width = grayCanvas.width = img.naturalWidth;
+      origCanvas.height = grayCanvas.height = img.naturalHeight;
+
+      ctxOrig.drawImage(img, 0, 0);
+    };
+
+    document.getElementById("grayscale-btn").onclick = () => {
+      // Rust decodes + streams grayscale into right canvas
+      grayscale_png_stream_wasm("gray-canvas", Array.from(pngBytes));
+    };
+  }
+
+  main();
+</script>

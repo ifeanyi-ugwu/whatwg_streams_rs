@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Grayscale WASM Canvas</title>
+    <style>
+      canvas {
+        border: 1px solid black;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Grayscale Canvas Demo</h1>
+
+    <!-- Canvas element -->
+    <canvas id="myCanvas" width="300" height="300"></canvas>
+
+    <!-- Button to apply grayscale -->
+    <button id="grayscaleBtn">Apply Grayscale</button>
+
+    <!-- Load WASM bundle -->
+    <script type="module">
+      import init, { run_grayscale_canvas } from "./pkg/grayscale_png.js";
+
+      async function main() {
+        // Initialize WASM
+        await init();
+
+        const canvas = document.getElementById("myCanvas");
+
+        // Draw some demo content
+        const ctx = canvas.getContext("2d");
+        const gradient = ctx.createLinearGradient(0, 0, 300, 300);
+        gradient.addColorStop(0, "red");
+        gradient.addColorStop(1, "blue");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(0, 0, 300, 300);
+
+        // Button click: run WASM grayscale
+        document
+          .getElementById("grayscaleBtn")
+          .addEventListener("click", () => {
+            run_grayscale_canvas("myCanvas");
+          });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
