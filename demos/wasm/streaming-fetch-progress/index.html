@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Streaming Fetch + Progress Bar</title>
+  </head>
+  <body>
+    <h1>Streaming Fetch + Progress Bar</h1>
+
+    <div
+      id="progress"
+      style="border: 1px solid #ccc; padding: 10px; width: 300px"
+    >
+      Progress: 0%
+    </div>
+    <br />
+    <button id="start-btn">Start Download</button>
+
+    <script type="module">
+      import init, {
+        run_fetch_progress_demo,
+      } from "./pkg/fetch_progress_demo.js";
+
+      async function main() {
+        await init();
+
+        document.getElementById("start-btn").addEventListener("click", () => {
+          const url = "https://nbg1-speed.hetzner.com/100MB.bin"; // example large file
+          run_fetch_progress_demo(url, "progress");
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
