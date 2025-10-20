@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Service Worker Streaming Demo</title>
+  </head>
+  <body>
+    <h1>Streaming via Service Worker</h1>
+
+    <div
+      id="output"
+      style="border: 1px solid #ccc; padding: 10px; min-height: 50px"
+    ></div>
+    <br />
+    <button id="start-btn">Start Streaming via Service Worker</button>
+
+    <script type="module">
+      import init, {
+        StreamingElementHandle,
+      } from "./pkg/service_worker_stream.js";
+
+      async function main() {
+        await init();
+
+        // Create a handle for the streaming element
+        //const streamHandle = new StreamingElementHandle("output");
+
+        // Register Service Worker
+        if ("serviceWorker" in navigator) {
+          navigator.serviceWorker
+            .register("./service-worker.js")
+            .then(() => console.log("Service Worker registered"))
+            .catch((err) => console.error("Service Worker failed:", err));
+        }
+
+        document
+          .getElementById("start-btn")
+          .addEventListener("click", async () => {
+            const outputEl = document.getElementById("output");
+            outputEl.innerHTML = ""; // clear previous chunks
+            const streamHandle = new StreamingElementHandle("output"); // new each time
+            try {
+              const response = await fetch("/streaming-element");
+              const reader = response.body.getReader();
+
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = new TextDecoder().decode(value);
+                streamHandle.write_chunk(chunk); // Rust handles DOM write
+              }
+
+              streamHandle.close();
+            } catch (err) {
+              console.error("Streaming failed:", err);
+            }
+          });
+      }
+
+      main();
+    </script>
+  </body>
+</html>

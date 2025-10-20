@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Service Worker Streaming Demo</title>
+  </head>
+  <body>
+    <h1>Streaming via Service Worker</h1>
+
+    <div
+      id="output"
+      style="border: 1px solid #ccc; padding: 10px; min-height: 50px"
+    ></div>
+    <br />
+    <button id="start-btn">Start Streaming via Service Worker</button>
+
+    <script type="module">
+      // Register the Service Worker
+      if ("serviceWorker" in navigator) {
+        navigator.serviceWorker
+          .register("/service-worker.js")
+          .then(() => console.log("Service Worker registered"))
+          .catch((err) => console.error("Service Worker failed:", err));
+      }
+
+      // Import WASM
+      import init, {
+        run_streaming_element_demo,
+      } from "../streaming-element/pkg/streaming_element_demo.js";
+
+      async function main() {
+        await init();
+
+        // Initialize the streaming element demo (creates the writable stream)
+        run_streaming_element_demo("output");
+
+        const output = document.getElementById("output");
+        const startBtn = document.getElementById("start-btn");
+
+        startBtn.addEventListener("click", async () => {
+          try {
+            // Fetch from the Service Worker route
+            const response = await fetch("/stream-demo");
+
+            // Get a reader from the fetch response
+            const reader = response.body.getReader();
+
+            // Get a writer from the streaming element
+            const { _, writer } = output.writable.get_writer();
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              // Decode bytes into string
+              const chunk = new TextDecoder().decode(value);
+              await writer.write(chunk);
+            }
+
+            await writer.close();
+          } catch (err) {
+            console.error("Streaming failed:", err);
+          }
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
