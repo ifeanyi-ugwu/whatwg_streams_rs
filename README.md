@@ -95,20 +95,27 @@ let stream = ReadableStream::from_vec(vec![1, 2, 3])
 This approach is useful for lightweight single-use threads or environments where you don’t want a full async runtime.
 For most applications, using a proper runtime like Tokio, async-std, or Smol remains recommended.
 
-## Local Streams (non-Send)
+## Feature Flags: Multi-threaded vs Single-threaded
 
-In addition to the default `send`-based API, this crate also provides a **`local`** module.
-It offers the exact same `ReadableStream`, `WritableStream`, and `TransformStream` types, but optimized for **single-threaded runtimes**:
+By default, this crate uses **`Arc`** for multi-threaded runtimes (the `send` feature).
+For single-threaded runtimes, you can use the **`local`** feature instead, which uses **`Rc`** internally:
 
-- Internally uses `Rc` instead of `Arc`.
-- Futures are **not required to be `Send`**.
-- Slightly lower overhead if you don’t need multi-threaded execution.
+- **`send`** (default): Multi-threaded, uses `Arc`, requires `Send + Sync`
+- **`local`**: Single-threaded, uses `Rc`, no `Send` requirement, lower overhead
 
-This is useful if you’re using executors like `tokio::task::spawn_local` or `futures::executor::LocalPool`.
+### Using the `local` feature
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+whatwg_streams = { version = "0.1.0", default-features = false, features = ["local"] }
+```
+
+Then use with single-threaded executors like `tokio::task::spawn_local` or `futures::executor::LocalPool`:
 
 ```rust
-use whatwg_streams::local::ReadableStream;
-use futures::StreamExt;
+use whatwg_streams::ReadableStream;
 use tokio::task::LocalSet;
 
 #[tokio::main(flavor = "current_thread")]
@@ -132,9 +139,9 @@ async fn main() {
 }
 ```
 
-Both `send` and `local` modules expose the same API surface.
-Choose **`send`** (default) if you want multi-threaded flexibility,
-or **`local`** if you’re sure everything runs on a single thread.
+The API is identical for both features.
+Choose **`send`** (default) for multi-threaded flexibility,
+or **`local`** when you're certain everything runs on a single thread.
 
 ### Basic Usage
 
