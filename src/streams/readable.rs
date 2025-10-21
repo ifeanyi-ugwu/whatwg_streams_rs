@@ -33,7 +33,7 @@ use std::{
 type StreamResult<T> = Result<T, StreamError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamState {
+enum StreamState {
     Readable,
     Closed,
     Errored,
@@ -99,7 +99,7 @@ pub trait ReadableSource<T: MaybeSend + 'static>: MaybeSend + 'static {
 
 // ----------- WakerSet -----------
 #[derive(Clone, Default, Debug)]
-pub struct WakerSet(SharedPtr<Mutex<Vec<Waker>>>);
+struct WakerSet(SharedPtr<Mutex<Vec<Waker>>>);
 
 impl WakerSet {
     pub fn new() -> Self {
@@ -122,7 +122,7 @@ impl WakerSet {
 }
 
 // ----------- Stream Commands -----------
-pub enum StreamCommand<T> {
+enum StreamCommand<T> {
     Read {
         completion: oneshot::Sender<StreamResult<Option<T>>>,
     },
@@ -485,7 +485,7 @@ where
 // ===== Tee implementation =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TeeSourceId {
+enum TeeSourceId {
     Branch1,
     Branch2,
 }
@@ -551,7 +551,7 @@ pub enum BackpressureMode {
 }
 
 #[derive(Clone)]
-pub struct AsyncSignal {
+struct AsyncSignal {
     waker: SharedPtr<Mutex<Option<Waker>>>,
     signaled: SharedPtr<AtomicBool>,
 }
@@ -584,7 +584,7 @@ impl AsyncSignal {
     }
 }
 
-pub struct TeeSource<T: MaybeSend + 'static> {
+struct TeeSource<T: MaybeSend + 'static> {
     chunk_rx: UnboundedReceiver<TeeChunk<T>>,
     branch_id: TeeSourceId,
     branch_canceled: SharedPtr<AtomicBool>,

@@ -20,7 +20,7 @@ use std::task::{Context, Poll, Waker};
 type StreamResult<T> = Result<T, StreamError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamState {
+enum StreamState {
     Writable,
     Closed,
     Errored,
@@ -32,7 +32,7 @@ struct PendingWrite<T> {
 }
 
 /// Commands sent to stream task for state mutation
-pub enum StreamCommand<T> {
+enum StreamCommand<T> {
     Write {
         chunk: T,
         completion: oneshot::Sender<StreamResult<()>>,
@@ -1612,7 +1612,7 @@ fn decrement_flush_counters<T, Sink>(inner: &mut WritableStreamInner<T, Sink>) {
     }
 }
 
-pub enum ControllerMsg {
+enum ControllerMsg {
     /// Trigger a stream error (controller.error(...))
     Error(StreamError),
 }
@@ -1762,11 +1762,10 @@ impl WritableStreamDefaultController {
     }
 }
 
-
 /// A lightweight, thread-safe set storing multiple wakers.
 /// It ensures wakers are stored without duplicates (based on `will_wake`).
 #[derive(Clone, Default)]
-pub struct WakerSet(SharedPtr<Mutex<Vec<Waker>>>);
+struct WakerSet(SharedPtr<Mutex<Vec<Waker>>>);
 
 impl WakerSet {
     /// Creates a new, empty `WakerSet`.

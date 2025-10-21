@@ -27,10 +27,12 @@ impl<T: Sync> MaybeSync for T {}
 
 // Type alias for boxed futures with proper Send bounds
 #[cfg(feature = "send")]
-pub type PlatformBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+pub type PlatformBoxFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 #[cfg(feature = "send")]
-pub type PlatformBoxFutureStatic<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
+pub type PlatformBoxFutureStatic<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
 
 // Type alias for boxed QueuingStrategy trait objects
 #[cfg(feature = "send")]
@@ -63,7 +65,8 @@ impl<T> MaybeSync for T {}
 pub type PlatformBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
 
 #[cfg(feature = "local")]
-pub type PlatformBoxFutureStatic<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'static>>;
+pub type PlatformBoxFutureStatic<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'static>>;
 
 // Type alias for boxed QueuingStrategy trait objects without Send
 #[cfg(feature = "local")]

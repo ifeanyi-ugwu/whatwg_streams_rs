@@ -4,8 +4,7 @@
 /// Run with:
 ///   cargo test --features send  (default)
 ///   cargo test --no-default-features --features local
-
-use whatwg_streams::{ReadableStream, WritableStream, TransformStream};
+use whatwg_streams::{ReadableStream, TransformStream, WritableStream};
 
 // Helper trait to check if a type implements Send
 fn assert_send<T: Send>() {}
@@ -47,8 +46,8 @@ fn test_local_feature_streams_not_required_to_be_send() {
     // This test just verifies the code compiles without Send/Sync bounds
 
     // We can use !Send types with local feature
-    use std::rc::Rc;
     use std::cell::RefCell;
+    use std::rc::Rc;
 
     let _rc_value: Rc<RefCell<i32>> = Rc::new(RefCell::new(42));
 

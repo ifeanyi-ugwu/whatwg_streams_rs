@@ -5,13 +5,21 @@ pub mod readable;
 pub mod transform;
 pub mod writable;
 
-// Re-export main types
-pub use byte_source_trait::*;
-pub use byte_state::*;
-pub use error::*;
-pub use readable::*;
-pub use transform::*;
-pub use writable::*;
+pub use byte_source_trait::ReadableByteSource;
+pub use error::StreamError;
+pub use readable::{
+    AsyncStreamSource, BackpressureMode, ByteStream, DefaultStream, IteratorSource, PipeBuilder,
+    ReadableByteStreamController, ReadableSource, ReadableStream, ReadableStreamBYOBReader,
+    ReadableStreamBuilder, ReadableStreamDefaultController, ReadableStreamDefaultReader,
+    StreamPipeOptions, StreamTypeMarker, TeeBuilder, TeeConfig,
+};
+pub use transform::{
+    TransformStream, TransformStreamBuilder, TransformStreamDefaultController, Transformer,
+};
+pub use writable::{
+    WritableSink, WritableStream, WritableStreamBuilder, WritableStreamDefaultController,
+    WritableStreamDefaultWriter,
+};
 
 /// Type-level marker for unlocked streams
 pub struct Unlocked;

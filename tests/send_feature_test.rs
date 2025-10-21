@@ -7,8 +7,7 @@ async fn test_send_feature_with_tokio_spawn() {
     use whatwg_streams::ReadableStream;
 
     // tokio::spawn requires Send, so if LocalBoxFuture breaks Send, this won't compile
-    let stream = ReadableStream::from_vec(vec![1, 2, 3])
-        .spawn(tokio::spawn);  // This requires Send!
+    let stream = ReadableStream::from_vec(vec![1, 2, 3]).spawn(tokio::spawn); // This requires Send!
 
     let (_, mut reader) = stream.get_reader().unwrap();
 
@@ -23,23 +22,24 @@ async fn test_send_feature_with_tokio_spawn() {
 #[cfg(feature = "local")]
 #[tokio::test]
 async fn test_local_feature_with_spawn_local() {
-    use whatwg_streams::ReadableStream;
     use tokio::task::LocalSet;
+    use whatwg_streams::ReadableStream;
 
     let local = LocalSet::new();
 
-    local.run_until(async {
-        // spawn_local does NOT require Send
-        let stream = ReadableStream::from_vec(vec![1, 2, 3])
-            .spawn(tokio::task::spawn_local);
+    local
+        .run_until(async {
+            // spawn_local does NOT require Send
+            let stream = ReadableStream::from_vec(vec![1, 2, 3]).spawn(tokio::task::spawn_local);
 
-        let (_, mut reader) = stream.get_reader().unwrap();
+            let (_, mut reader) = stream.get_reader().unwrap();
 
-        let mut result = Vec::new();
-        while let Some(val) = reader.read().await.unwrap() {
-            result.push(val);
-        }
+            let mut result = Vec::new();
+            while let Some(val) = reader.read().await.unwrap() {
+                result.push(val);
+            }
 
-        assert_eq!(result, vec![1, 2, 3]);
-    }).await;
+            assert_eq!(result, vec![1, 2, 3]);
+        })
+        .await;
 }
