@@ -332,7 +332,6 @@ let source = ReadableStream::from_vec(vec![1, 2, 3])
 
 let (stream1, stream2) = source
     .tee()
-    .backpressure_mode(BackpressureMode::SpecCompliant)
     .spawn(tokio::task::spawn)?;
 
 // Both streams receive the same data
@@ -396,10 +395,7 @@ use whatwg_streams::error::StreamError;
 match reader.read().await {
     Ok(Some(data)) => process(data),
     Ok(None) => println!("Stream ended"),
-    Err(StreamError::Canceled) => println!("Operation was canceled"),
-    Err(StreamError::Aborted(reason)) => println!("Stream aborted: {:?}", reason),
-    Err(StreamError::Closed) => println!("Stream is closed"),
-    Err(StreamError::Other(err)) => println!("Other error: {}", err),
+    Err(e) => println!("Error: {}", e),
 }
 ```
 
