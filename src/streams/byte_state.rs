@@ -7,7 +7,6 @@ use futures::future::poll_fn;
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
-    pin::Pin,
     sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
