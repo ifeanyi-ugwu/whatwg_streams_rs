@@ -1423,12 +1423,53 @@ where
         self.stream.desired_size()
     }
 
-    pub fn ready(&self) -> ReadyFuture<T, Sink> {
-        ReadyFuture::new(self.clone())
+    pub fn ready(&self) -> impl Future<Output = StreamResult<()>> {
+        let writer = self.clone();
+        poll_fn(move |cx| {
+            if writer.stream.errored.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(writer.stream.get_stored_error()));
+            }
+            if writer.stream.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            if !writer.stream.backpressure.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            // Not ready, register waker:
+            let waker = cx.waker().clone();
+            let _ = writer
+                .stream
+                .command_tx
+                .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+            // If the channel is full or busy, that's okay—the next poll will try again.
+            // Re-check backpressure after registration
+            if !writer.stream.backpressure.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        })
     }
 
-    pub fn closed(&self) -> ClosedFuture<T, Sink> {
-        ClosedFuture::new(self.clone())
+    pub fn closed(&self) -> impl Future<Output = StreamResult<()>> {
+        let writer = self.clone();
+        poll_fn(move |cx| {
+            if writer.stream.errored.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(writer.stream.get_stored_error()));
+            }
+            if writer.stream.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            let waker = cx.waker().clone();
+            let _ = writer
+                .stream
+                .command_tx
+                .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
+            // Re-check closed after registration
+            if writer.stream.closed.load(Ordering::SeqCst) {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        })
     }
 }
 
@@ -1721,87 +1762,6 @@ impl WritableStreamDefaultController {
     }
 }
 
-pub struct ReadyFuture<T: MaybeSend + 'static, Sink> {
-    writer: WritableStreamDefaultWriter<T, Sink>,
-}
-
-impl<T: MaybeSend + 'static, Sink> ReadyFuture<T, Sink> {
-    pub fn new(stream: WritableStreamDefaultWriter<T, Sink>) -> Self {
-        Self { writer: stream }
-    }
-}
-
-impl<T: MaybeSend + 'static, Sink> Future for ReadyFuture<T, Sink>
-where
-    T: 'static,
-    Sink: WritableSink<T> + 'static,
-{
-    type Output = StreamResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.writer.stream.errored.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(self.writer.stream.get_stored_error()));
-        }
-        if self.writer.stream.closed.load(Ordering::SeqCst) {
-            //return Poll::Ready(Err(StreamError::Other("Stream is closed".into())));
-            return Poll::Ready(Ok(()));
-        }
-        if !self.writer.stream.backpressure.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-        // Not ready, register waker:
-        let waker = cx.waker().clone();
-        let _ = self
-            .writer
-            .stream
-            .command_tx
-            .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
-        // If the channel is full or busy, that's okay—the next poll will try again.
-        // Re-check backpressure after registration
-        if !self.writer.stream.backpressure.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Pending
-    }
-}
-
-pub struct ClosedFuture<T: MaybeSend + 'static, Sink> {
-    writer: WritableStreamDefaultWriter<T, Sink>,
-}
-
-impl<T: MaybeSend + 'static, Sink> ClosedFuture<T, Sink> {
-    pub fn new(stream: WritableStreamDefaultWriter<T, Sink>) -> Self {
-        Self { writer: stream }
-    }
-}
-
-impl<T: MaybeSend + 'static, Sink> Future for ClosedFuture<T, Sink>
-where
-    T: 'static,
-    Sink: WritableSink<T> + 'static,
-{
-    type Output = StreamResult<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.writer.stream.errored.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(self.writer.stream.get_stored_error()));
-        }
-        if self.writer.stream.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-        let waker = cx.waker().clone();
-        let _ = self
-            .writer
-            .stream
-            .command_tx
-            .unbounded_send(StreamCommand::RegisterClosedWaker { waker });
-        // Re-check closed after registration
-        if self.writer.stream.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Pending
-    }
-}
 
 /// A lightweight, thread-safe set storing multiple wakers.
 /// It ensures wakers are stored without duplicates (based on `will_wake`).
