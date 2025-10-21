@@ -45,7 +45,7 @@ pub struct ByteStream;
 
 // ----------- Stream Type Marker Trait -----------
 pub trait StreamTypeMarker: MaybeSend + 'static {
-    type Controller<T: MaybeSend + 'static>: MaybeSync + 'static;
+    type Controller<T: MaybeSend + 'static>: MaybeSend + MaybeSync + Clone + 'static;
 }
 
 impl StreamTypeMarker for DefaultStream {
@@ -61,16 +61,19 @@ pub trait ReadableSource<T: MaybeSend + 'static>: MaybeSend + 'static {
     fn start(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
-    ) -> impl Future<Output = StreamResult<()>> {
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         async { Ok(()) }
     }
 
     fn pull(
         &mut self,
         controller: &mut ReadableStreamDefaultController<T>,
-    ) -> impl Future<Output = StreamResult<()>>;
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend;
 
-    fn cancel(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> {
+    fn cancel(
+        &mut self,
+        reason: Option<String>,
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         async { Ok(()) }
     }
 }
@@ -286,7 +289,7 @@ struct ReadableStreamInner<T, Source> {
     state: StreamState,
     queue: VecDeque<T>,
     queue_total_size: usize,
-    strategy: Box<dyn QueuingStrategy<T>>,
+    strategy: crate::platform::BoxedStrategyStatic<T>,
     source: Option<Source>,
     cancel_requested: bool,
     cancel_reason: Option<String>,
@@ -300,7 +303,7 @@ struct ReadableStreamInner<T, Source> {
 }
 
 impl<T: MaybeSend + 'static, Source> ReadableStreamInner<T, Source> {
-    fn new(source: Source, strategy: Box<dyn QueuingStrategy<T>>) -> Self {
+    fn new(source: Source, strategy: crate::platform::BoxedStrategyStatic<T>) -> Self {
         Self {
             state: StreamState::Readable,
             queue: VecDeque::new(),
@@ -351,7 +354,7 @@ where
     pub(crate) controller: SharedPtr<StreamType::Controller<T>>,
     //byte_state: Option<SharedPtr<ByteStreamState<Source>>>,
     pub(crate) byte_state: Option<SharedPtr<dyn ByteStreamStateInterface>>,
-    _phantom: PhantomData<(T, Source, StreamType, LockState)>,
+    _phantom: PhantomData<fn() -> (T, Source, StreamType, LockState)>,
 }
 
 impl<T: MaybeSend + 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
@@ -863,19 +866,19 @@ where
 pub struct TeeBuilder<T, Source, S>
 where
     T: MaybeSend + Clone + 'static,
-    Source: 'static,
+    Source: MaybeSend + 'static,
     S: StreamTypeMarker + 'static,
 {
     mode: BackpressureMode,
     stream: ReadableStream<T, Source, S, Unlocked>,
-    branch1_strategy: Box<dyn QueuingStrategy<T>>,
-    branch2_strategy: Box<dyn QueuingStrategy<T>>,
+    branch1_strategy: crate::platform::BoxedStrategyStatic<T>,
+    branch2_strategy: crate::platform::BoxedStrategyStatic<T>,
 }
 
 impl<T: MaybeSend + 'static, Source, S> TeeBuilder<T, Source, S>
 where
     T: Clone + 'static,
-    Source: 'static,
+    Source: MaybeSend + 'static,
     S: StreamTypeMarker + 'static,
 {
     fn new(stream: ReadableStream<T, Source, S, Unlocked>) -> Self {
@@ -893,7 +896,7 @@ where
     }
 
     /// Set queuing strategy for the first branch
-    pub fn branch1_strategy<Strategy: QueuingStrategy<T> + 'static>(
+    pub fn branch1_strategy<Strategy: QueuingStrategy<T> + MaybeSend + 'static>(
         mut self,
         strategy: Strategy,
     ) -> Self {
@@ -902,7 +905,7 @@ where
     }
 
     /// Set queuing strategy for the second branch
-    pub fn branch2_strategy<Strategy: QueuingStrategy<T> + 'static>(
+    pub fn branch2_strategy<Strategy: QueuingStrategy<T> + MaybeSend + 'static>(
         mut self,
         strategy: Strategy,
     ) -> Self {
@@ -911,7 +914,7 @@ where
     }
 
     /// Set the same queuing strategy for both branches
-    pub fn strategy<Strategy: QueuingStrategy<T> + 'static + Clone>(
+    pub fn strategy<Strategy: QueuingStrategy<T> + MaybeSend + 'static + Clone>(
         mut self,
         strategy: Strategy,
     ) -> Self {
@@ -949,7 +952,7 @@ where
         StreamError,
     >
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         let fut = async move {
@@ -971,7 +974,7 @@ where
         StreamError,
     >
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         let fut = async move {
@@ -995,9 +998,9 @@ where
         StreamError,
     >
     where
-        F1: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R1,
-        F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R2,
-        F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
+        F1: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R1,
+        F2: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R2,
+        F3: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R3,
     {
         let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         coordinator_spawn(Box::pin(coord_fut));
@@ -1020,9 +1023,9 @@ where
         StreamError,
     >
     where
-        F1: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R1,
-        F2: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R2,
-        F3: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3,
+        F1: Fn(crate::platform::PlatformFuture<'static, ()>) -> R1,
+        F2: Fn(crate::platform::PlatformFuture<'static, ()>) -> R2,
+        F3: Fn(crate::platform::PlatformFuture<'static, ()>) -> R3,
     {
         let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
         coordinator_spawn(Box::pin(coord_fut));
@@ -1035,14 +1038,14 @@ where
 impl<T: MaybeSend + 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Clone + 'static,
-    Source: 'static,
+    Source: MaybeSend + 'static,
     S: StreamTypeMarker + 'static,
 {
     fn tee_inner(
         self,
         mode: BackpressureMode,
-        branch1_strategy: Box<dyn QueuingStrategy<T>>,
-        branch2_strategy: Box<dyn QueuingStrategy<T>>,
+        branch1_strategy: crate::platform::BoxedStrategyStatic<T>,
+        branch2_strategy: crate::platform::BoxedStrategyStatic<T>,
     ) -> Result<
         (
             ReadableStream<T, TeeSource<T>, DefaultStream, Unlocked>,
@@ -1133,7 +1136,7 @@ impl<T: MaybeSend + 'static, O: MaybeSend + 'static, Source, S> PipeBuilder<T, O
 where
     T: 'static,
     O: 'static,
-    Source: 'static,
+    Source: MaybeSend + 'static,
     S: StreamTypeMarker + 'static,
 {
     pub fn new(
@@ -1168,7 +1171,7 @@ where
         spawn_fn: SpawnFn,
     ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
     where
-        SpawnFn: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        SpawnFn: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (readable, pipe_future) = self.prepare();
         let fut = Box::pin(async move {
@@ -1184,7 +1187,7 @@ where
         spawn_fn: &'static SpawnFn,
     ) -> ReadableStream<O, TransformReadableSource<O>, DefaultStream, Unlocked>
     where
-        SpawnFn: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        SpawnFn: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (readable, pipe_future) = self.prepare();
         let fut = Box::pin(async move {
@@ -1198,7 +1201,7 @@ where
 impl<T: MaybeSend + 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: MaybeSend + 'static,
-    Source: 'static,
+    Source: MaybeSend + 'static,
     S: StreamTypeMarker + 'static,
 {
     pub fn pipe_through<O>(
@@ -1272,7 +1275,7 @@ impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
 {
     pub(crate) fn new_inner(
         source: Source,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
+        strategy: crate::platform::BoxedStrategy<T>,
     ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = unbounded();
         let (ctrl_tx, ctrl_rx) = unbounded();
@@ -1774,8 +1777,11 @@ async fn readable_stream_task<T: 'static, Source>(
         }
     }
 
-    let mut pull_future: Option<Pin<Box<dyn Future<Output = (Source, StreamResult<()>)>>>> = None;
-    let mut cancel_future: Option<Pin<Box<dyn Future<Output = StreamResult<()>>>>> = None;
+    let mut pull_future: Option<
+        crate::platform::PlatformBoxFutureStatic<(Source, StreamResult<()>)>,
+    > = None;
+    let mut cancel_future: Option<crate::platform::PlatformBoxFutureStatic<StreamResult<()>>> =
+        None;
 
     poll_fn(|cx| {
         // Process controller messages first
@@ -2166,8 +2172,8 @@ where
     StreamType: StreamTypeMarker,
 {
     source: Source,
-    strategy: Box<dyn QueuingStrategy<T>>,
-    _phantom: PhantomData<(T, StreamType)>,
+    strategy: crate::platform::BoxedStrategyStatic<T>,
+    _phantom: PhantomData<fn() -> (T, StreamType)>,
 }
 
 impl<T: MaybeSend + 'static, Source> ReadableStreamBuilder<T, Source, DefaultStream>
@@ -2183,7 +2189,7 @@ where
         }
     }
 
-    pub fn strategy<S: QueuingStrategy<T> + 'static>(mut self, s: S) -> Self {
+    pub fn strategy<S: QueuingStrategy<T> + MaybeSend + 'static>(mut self, s: S) -> Self {
         self.strategy = Box::new(s);
         self
     }
@@ -2201,7 +2207,7 @@ where
     /// Spawn bundled into one task
     pub fn spawn<F, R>(self, spawn_fn: F) -> ReadableStream<T, Source, DefaultStream, Unlocked>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
@@ -2214,7 +2220,7 @@ where
         spawn_fn: &'static F,
     ) -> ReadableStream<T, Source, DefaultStream, Unlocked>
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
@@ -2235,7 +2241,7 @@ where
         }
     }
 
-    pub fn strategy<S: QueuingStrategy<Vec<u8>> + 'static>(mut self, s: S) -> Self {
+    pub fn strategy<S: QueuingStrategy<Vec<u8>> + MaybeSend + 'static>(mut self, s: S) -> Self {
         self.strategy = Box::new(s);
         self
     }
@@ -2253,7 +2259,7 @@ where
     /// Spawn with an owned spawner function
     pub fn spawn<F, R>(self, spawn_fn: F) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
@@ -2266,7 +2272,7 @@ where
         spawn_fn: &'static F,
     ) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
@@ -3880,7 +3886,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    fn spawn_local_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
+    fn spawn_local_fn(fut: crate::platform::PlatformFuture<'static, ()>) {
         tokio::task::spawn_local(fut);
     }
 

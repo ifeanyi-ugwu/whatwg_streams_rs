@@ -40,50 +40,10 @@ pub struct TransformStream<I: MaybeSend + 'static, O: MaybeSend + 'static> {
 
 impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
     /// Internal builder that wires everything up but does not spawn anything.
-    #[cfg(feature = "send")]
     fn new_inner<T>(
         transformer: T,
-        writable_strategy: Box<dyn QueuingStrategy<I> + Send>,
-        readable_strategy: Box<dyn QueuingStrategy<O> + Send>,
-    ) -> (
-        Self,
-        impl Future<Output = ()>, // readable task
-        impl Future<Output = ()>, // writable task
-        impl Future<Output = ()>, // transform task
-    )
-    where
-        T: Transformer<I, O> + 'static,
-    {
-        let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
-
-        let readable_source = TransformReadableSource::new();
-        let writable_sink = TransformWritableSink::new(transform_tx);
-
-        let (readable, readable_fut) =
-            ReadableStream::new_inner(readable_source, readable_strategy);
-        let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
-
-        let controller = TransformStreamDefaultController::new(
-            readable.controller.clone(),
-            writable.controller.clone(),
-        );
-
-        let transform_fut = transform_task(transformer, transform_rx, controller);
-
-        (
-            TransformStream { readable, writable },
-            readable_fut,
-            writable_fut,
-            transform_fut,
-        )
-    }
-
-    /// Internal builder that wires everything up but does not spawn anything.
-    #[cfg(feature = "local")]
-    fn new_inner<T>(
-        transformer: T,
-        writable_strategy: Box<dyn QueuingStrategy<I>>,
-        readable_strategy: Box<dyn QueuingStrategy<O>>,
+        writable_strategy: crate::platform::BoxedStrategy<I>,
+        readable_strategy: crate::platform::BoxedStrategy<O>,
     ) -> (
         Self,
         impl Future<Output = ()>, // readable task
@@ -188,7 +148,7 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
     fn start(
         &mut self,
         controller: &mut TransformStreamDefaultController<O>,
-    ) -> impl Future<Output = StreamResult<()>> {
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         let _ = controller;
         future::ready(Ok(()))
     }
@@ -198,13 +158,13 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
         &mut self,
         chunk: I,
         controller: &mut TransformStreamDefaultController<O>,
-    ) -> impl Future<Output = StreamResult<()>>;
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend;
 
     /// Called when the writable side is closed
     fn flush(
         &mut self,
         controller: &mut TransformStreamDefaultController<O>,
-    ) -> impl Future<Output = StreamResult<()>> {
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         let _ = controller;
         future::ready(Ok(()))
     }
@@ -362,18 +322,10 @@ impl<T: MaybeSend + 'static> Transformer<T, T> for IdentityTransformer<T> {
     }
 }
 
-#[cfg(feature = "send")]
 pub struct TransformStreamBuilder<I, O, T> {
     transformer: T,
-    writable_strategy: Box<dyn QueuingStrategy<I> + Send>,
-    readable_strategy: Box<dyn QueuingStrategy<O> + Send>,
-}
-
-#[cfg(feature = "local")]
-pub struct TransformStreamBuilder<I, O, T> {
-    transformer: T,
-    writable_strategy: Box<dyn QueuingStrategy<I>>,
-    readable_strategy: Box<dyn QueuingStrategy<O>>,
+    writable_strategy: crate::platform::BoxedStrategyStatic<I>,
+    readable_strategy: crate::platform::BoxedStrategyStatic<O>,
 }
 
 impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'static>
@@ -387,26 +339,12 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
         }
     }
 
-    #[cfg(feature = "send")]
-    pub fn writable_strategy<S: QueuingStrategy<I> + Send + 'static>(mut self, s: S) -> Self {
+    pub fn writable_strategy<S: QueuingStrategy<I> + MaybeSend + 'static>(mut self, s: S) -> Self {
         self.writable_strategy = Box::new(s);
         self
     }
 
-    #[cfg(feature = "send")]
-    pub fn readable_strategy<S: QueuingStrategy<O> + Send + 'static>(mut self, s: S) -> Self {
-        self.readable_strategy = Box::new(s);
-        self
-    }
-
-    #[cfg(feature = "local")]
-    pub fn writable_strategy<S: QueuingStrategy<I> + 'static>(mut self, s: S) -> Self {
-        self.writable_strategy = Box::new(s);
-        self
-    }
-
-    #[cfg(feature = "local")]
-    pub fn readable_strategy<S: QueuingStrategy<O> + 'static>(mut self, s: S) -> Self {
+    pub fn readable_strategy<S: QueuingStrategy<O> + MaybeSend + 'static>(mut self, s: S) -> Self {
         self.readable_strategy = Box::new(s);
         self
     }
@@ -430,7 +368,7 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
     /// Spawn bundled into one task
     pub fn spawn<F, R>(self, spawn_fn: F) -> TransformStream<I, O>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, rfut, wfut, tfut) = self.prepare();
         let fut = async move {
@@ -443,7 +381,7 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
     /// Spawn using a static function reference
     pub fn spawn_ref<F, R>(self, spawn_fn: &'static F) -> TransformStream<I, O>
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, rfut, wfut, tfut) = self.prepare();
         let fut = async move {
@@ -461,9 +399,9 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
         tf: F3,
     ) -> TransformStream<I, O>
     where
-        F1: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R1,
-        F2: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R2,
-        F3: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R3,
+        F1: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R1,
+        F2: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R2,
+        F3: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R3,
     {
         let (stream, rfut, wfut, tfut) = self.prepare();
         rf(Box::pin(rfut));
@@ -475,9 +413,9 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
     /// Spawn each part separately using static function references
     pub fn spawn_parts_ref<R1, R2, R3>(
         self,
-        rf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R1),
-        wf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R2),
-        tf: &'static (dyn Fn(futures::future::LocalBoxFuture<'static, ()>) -> R3),
+        rf: &'static (dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R1),
+        wf: &'static (dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R2),
+        tf: &'static (dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R3),
     ) -> TransformStream<I, O> {
         let (stream, rfut, wfut, tfut) = self.prepare();
         rf(Box::pin(rfut));
@@ -829,7 +767,7 @@ mod builder_tests {
         assert_eq!(reader.read().await.unwrap(), None);
     }
 
-    fn spawn_local_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
+    fn spawn_local_fn(fut: crate::platform::PlatformFuture<'static, ()>) {
         tokio::task::spawn_local(fut);
     }
 

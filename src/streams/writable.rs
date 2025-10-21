@@ -182,7 +182,7 @@ where
     /// Common constructor logic shared between spawn variants
     pub(crate) fn new_inner(
         sink: Sink,
-        strategy: Box<dyn QueuingStrategy<T> + 'static>,
+        strategy: crate::platform::BoxedStrategy<T>,
     ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = futures::channel::mpsc::unbounded();
         let high_water_mark = SharedPtr::new(AtomicUsize::new(strategy.high_water_mark()));
@@ -715,7 +715,7 @@ pub trait WritableSink<T: MaybeSend + 'static>: MaybeSend + Sized + 'static {
     fn start(
         &mut self,
         controller: &mut WritableStreamDefaultController,
-    ) -> impl Future<Output = StreamResult<()>> {
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         let _ = controller;
         future::ready(Ok(())) // default no-op
     }
@@ -725,15 +725,18 @@ pub trait WritableSink<T: MaybeSend + 'static>: MaybeSend + Sized + 'static {
         &mut self,
         chunk: T,
         controller: &mut WritableStreamDefaultController,
-    ) -> impl std::future::Future<Output = StreamResult<()>>;
+    ) -> impl std::future::Future<Output = StreamResult<()>> + MaybeSend;
 
     /// Close the sink
-    fn close(self) -> impl Future<Output = StreamResult<()>> {
+    fn close(self) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         future::ready(Ok(())) // default no-op
     }
 
     /// Abort the sink
-    fn abort(&mut self, reason: Option<String>) -> impl Future<Output = StreamResult<()>> {
+    fn abort(
+        &mut self,
+        reason: Option<String>,
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         let _ = reason;
         future::ready(Ok(())) // default no-op
     }
@@ -863,15 +866,15 @@ fn process_command<T, Sink>(
 // Inflight operations being driven
 enum InFlight<Sink> {
     Write {
-        fut: Pin<Box<dyn Future<Output = (Sink, StreamResult<()>)>>>,
+        fut: crate::platform::PlatformBoxFutureStatic<(Sink, StreamResult<()>)>,
         completion: Option<oneshot::Sender<StreamResult<()>>>,
     },
     Close {
-        fut: Pin<Box<dyn Future<Output = StreamResult<()>>>>,
+        fut: crate::platform::PlatformBoxFutureStatic<StreamResult<()>>,
         completions: Vec<oneshot::Sender<StreamResult<()>>>,
     },
     Abort {
-        fut: Pin<Box<dyn Future<Output = StreamResult<()>>>>,
+        fut: crate::platform::PlatformBoxFutureStatic<StreamResult<()>>,
         completions: Vec<oneshot::Sender<StreamResult<()>>>,
     },
 }
@@ -987,7 +990,7 @@ async fn stream_task<T, Sink>(
                         ));
                 if can_close {
                     if let Some(sink) = inner.sink.take() {
-                        let fut = async move { sink.close().await }.boxed_local();
+                        let fut = Box::pin(async move { sink.close().await });
                         let completions = std::mem::take(&mut inner.close_completions);
                         inflight = Some(InFlight::Close { fut, completions });
                         //inner.close_requested = false;
@@ -1012,7 +1015,7 @@ async fn stream_task<T, Sink>(
             } else if inner.abort_requested {
                 if let Some(mut sink) = inner.sink.take() {
                     let reason = inner.abort_reason.take();
-                    let fut = async move { sink.abort(reason).await }.boxed_local();
+                    let fut = Box::pin(async move { sink.abort(reason).await });
                     let completions = std::mem::take(&mut inner.abort_completions);
                     inflight = Some(InFlight::Abort { fut, completions });
                 } else {
@@ -1070,8 +1073,7 @@ async fn stream_task<T, Sink>(
                             if inner.abort_requested {
                                 // Transition to abort with recovered sink
                                 let reason = inner.abort_reason.take();
-                                let abort_fut =
-                                    async move { sink.abort(reason).await }.boxed_local();
+                                let abort_fut = Box::pin(async move { sink.abort(reason).await });
                                 let completions = std::mem::take(&mut inner.abort_completions);
 
                                 // Notify write completion with abort error
@@ -1469,7 +1471,7 @@ struct WritableStreamInner<T, Sink> {
     state: StreamState,
     queue: VecDeque<PendingWrite<T>>,
     queue_total_size: usize,
-    strategy: Box<dyn QueuingStrategy<T>>,
+    strategy: crate::platform::BoxedStrategyStatic<T>,
     sink: Option<Sink>,
 
     backpressure: bool,
@@ -1842,8 +1844,8 @@ where
     Sink: WritableSink<T> + 'static,
 {
     sink: Sink,
-    strategy: Box<dyn QueuingStrategy<T>>,
-    _phantom: PhantomData<T>,
+    strategy: crate::platform::BoxedStrategyStatic<T>,
+    _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T: MaybeSend + 'static, Sink> WritableStreamBuilder<T, Sink>
@@ -1859,7 +1861,7 @@ where
         }
     }
 
-    pub fn strategy<S: QueuingStrategy<T> + 'static>(mut self, s: S) -> Self {
+    pub fn strategy<S: QueuingStrategy<T> + MaybeSend + 'static>(mut self, s: S) -> Self {
         self.strategy = Box::new(s);
         self
     }
@@ -1872,7 +1874,7 @@ where
     /// Spawn with an owned spawner function
     pub fn spawn<F, R>(self, spawn_fn: F) -> WritableStream<T, Sink, Unlocked>
     where
-        F: FnOnce(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
@@ -1882,7 +1884,7 @@ where
     /// Spawn using a static spawner function reference
     pub fn spawn_ref<F, R>(self, spawn_fn: &'static F) -> WritableStream<T, Sink, Unlocked>
     where
-        F: Fn(futures::future::LocalBoxFuture<'static, ()>) -> R,
+        F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
         let (stream, fut) = self.prepare();
         spawn_fn(Box::pin(fut));
@@ -3366,7 +3368,7 @@ mod writable_builder_tests {
         assert_eq!(*data, vec!["test".to_string()]);
     }
 
-    fn spawn_local_fn(fut: futures::future::LocalBoxFuture<'static, ()>) {
+    fn spawn_local_fn(fut: crate::platform::PlatformFuture<'static, ()>) {
         tokio::task::spawn_local(fut);
     }
 

@@ -442,7 +442,7 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn is_errored(&self) -> bool;
     //async fn closed(&self) -> Result<(), StreamError>;
     //fn closed(&self) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send>>;
-    fn closed(&self) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + '_>>;
+    fn closed(&self) -> crate::platform::PlatformBoxFuture<'_, Result<(), StreamError>>;
     fn poll_read_into(
         &self,
         cx: &mut Context<'_>,
@@ -451,7 +451,7 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn cancel_source<'a>(
         &'a self,
         reason: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + 'a>>;
+    ) -> crate::platform::PlatformBoxFuture<'a, Result<(), StreamError>>;
     //fn poll_read_chunk(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Vec<u8>>, StreamError>>;
 }
 
@@ -499,7 +499,7 @@ where
     /*async fn closed(&self) -> Result<(), StreamError> {
         ByteStreamState::closed(self).await
     }*/
-    fn closed(&self) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + '_>> {
+    fn closed(&self) -> crate::platform::PlatformBoxFuture<'_, Result<(), StreamError>> {
         Box::pin(async move { ByteStreamState::closed(self).await })
     }
 
@@ -514,7 +514,7 @@ where
     fn cancel_source<'a>(
         &'a self,
         reason: Option<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + 'a>> {
+    ) -> crate::platform::PlatformBoxFuture<'a, Result<(), StreamError>> {
         Box::pin(async move {
             // Take the source out under lock (synchronously)
             let source_opt = self.source.lock().take();
