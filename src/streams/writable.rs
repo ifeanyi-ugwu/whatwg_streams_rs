@@ -714,9 +714,8 @@ pub trait WritableSink<T: MaybeSend + 'static>: MaybeSend + Sized + 'static {
     /// Start the sink
     fn start(
         &mut self,
-        controller: &mut WritableStreamDefaultController,
+        #[allow(unused)] controller: &mut WritableStreamDefaultController,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
-        let _ = controller;
         future::ready(Ok(())) // default no-op
     }
 

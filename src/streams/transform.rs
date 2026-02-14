@@ -147,9 +147,8 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
     /// Called once when the transform stream is created
     fn start(
         &mut self,
-        controller: &mut TransformStreamDefaultController<O>,
+        #[allow(unused)] controller: &mut TransformStreamDefaultController<O>,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
-        let _ = controller;
         future::ready(Ok(()))
     }
 
@@ -163,9 +162,8 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
     /// Called when the writable side is closed
     fn flush(
         &mut self,
-        controller: &mut TransformStreamDefaultController<O>,
+        #[allow(unused)] controller: &mut TransformStreamDefaultController<O>,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
-        let _ = controller;
         future::ready(Ok(()))
     }
 }
