@@ -2465,6 +2465,55 @@ mod tests {
     }
 
     #[tokio_localset_test::localset_test]
+    async fn futures_stream_trait_yields_all_chunks() {
+        use futures::stream::StreamExt;
+
+        let items = vec![1, 2, 3, 4, 5];
+        let mut stream = ReadableStream::from_vec(items.clone()).spawn(tokio::task::spawn_local);
+
+        let mut collected = Vec::new();
+        while let Some(result) = stream.next().await {
+            collected.push(result.unwrap());
+        }
+        assert_eq!(collected, items);
+    }
+
+    #[tokio_localset_test::localset_test]
+    async fn futures_stream_trait_propagates_errors() {
+        use futures::stream::StreamExt;
+
+        struct FailSource {
+            count: usize,
+        }
+
+        impl ReadableSource<String> for FailSource {
+            async fn pull(
+                &mut self,
+                controller: &mut ReadableStreamDefaultController<String>,
+            ) -> StreamResult<()> {
+                self.count += 1;
+                if self.count <= 2 {
+                    controller.enqueue(format!("item-{}", self.count))?;
+                    Ok(())
+                } else {
+                    Err(StreamError::from("source failed"))
+                }
+            }
+        }
+
+        let mut stream =
+            ReadableStream::builder(FailSource { count: 0 }).spawn(tokio::task::spawn_local);
+
+        // First two items succeed
+        assert_eq!(stream.next().await.unwrap().unwrap(), "item-1");
+        assert_eq!(stream.next().await.unwrap().unwrap(), "item-2");
+
+        // Third should be an error
+        let err = stream.next().await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("source failed"));
+    }
+
+    #[tokio_localset_test::localset_test]
     async fn handles_byte_stream_operations() {
         struct ChunkedByteSource {
             chunks: Vec<Vec<u8>>,
