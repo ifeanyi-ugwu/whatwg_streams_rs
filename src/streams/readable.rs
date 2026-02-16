@@ -301,6 +301,8 @@ where
     desired_size: SharedPtr<AtomicIsize>,
     pub(crate) controller: SharedPtr<StreamType::Controller<T>>,
     pub(crate) byte_state: Option<SharedPtr<dyn ByteStreamStateInterface>>,
+    /// Pending receiver for in-flight poll_next read (used by futures::Stream impl)
+    poll_read_rx: Option<oneshot::Receiver<StreamResult<Option<T>>>>,
     _phantom: PhantomData<fn() -> (T, Source, StreamType, LockState)>,
 }
 
@@ -1169,6 +1171,7 @@ where
             stored_error,
             controller: SharedPtr::new(controller),
             byte_state: Some(byte_state),
+            poll_read_rx: None,
             _phantom: PhantomData,
         };
 
@@ -1231,6 +1234,7 @@ impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
             stored_error,
             controller: controller.into(),
             byte_state: None,
+            poll_read_rx: None,
             _phantom: PhantomData,
         };
 
@@ -1271,6 +1275,7 @@ where
             stored_error: SharedPtr::clone(&self.stored_error),
             controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
+            poll_read_rx: None,
             _phantom: PhantomData,
         };
 
@@ -1285,6 +1290,7 @@ where
             stored_error: self.stored_error.clone(),
             controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
+            poll_read_rx: None,
             _phantom: PhantomData,
         });
 
@@ -1325,6 +1331,7 @@ where
             stored_error: SharedPtr::clone(&self.stored_error),
             controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
+            poll_read_rx: None,
             _phantom: PhantomData,
         };
 
@@ -1339,6 +1346,7 @@ where
             stored_error: self.stored_error.clone(),
             controller: self.controller.clone(),
             byte_state: self.byte_state.clone(),
+            poll_read_rx: None,
             _phantom: PhantomData,
         });
 
@@ -1355,25 +1363,63 @@ where
     type Item = StreamResult<T>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.errored.load(Ordering::Acquire) {
-            let error = self
-                .stored_error
-                .read()
-                .clone()
-                .unwrap_or_else(|| "Stream is errored".into());
-            return Poll::Ready(Some(Err(error)));
+        // Safe: ReadableStream is Unpin (all fields are Unpin), so we can get &mut Self
+        let this = self.get_mut();
+
+        // If we have an in-flight read, poll it
+        if let Some(rx) = this.poll_read_rx.as_mut() {
+            match Pin::new(rx).poll(cx) {
+                Poll::Ready(Ok(Ok(Some(chunk)))) => {
+                    this.poll_read_rx = None;
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Ready(Ok(Ok(None))) => {
+                    this.poll_read_rx = None;
+                    return Poll::Ready(None); // stream closed
+                }
+                Poll::Ready(Ok(Err(e))) => {
+                    this.poll_read_rx = None;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Err(_)) => {
+                    this.poll_read_rx = None;
+                    return Poll::Ready(Some(Err(StreamError::TaskDropped)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
-        if self.closed.load(Ordering::Acquire) {
-            return Poll::Ready(None);
-        }
-
-        let waker = cx.waker().clone();
-        let _ = self
+        // No in-flight read — send a Read command
+        let (tx, rx) = oneshot::channel();
+        if this
             .command_tx
-            .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+            .unbounded_send(StreamCommand::Read { completion: tx })
+            .is_err()
+        {
+            return Poll::Ready(Some(Err(StreamError::TaskDropped)));
+        }
 
-        Poll::Pending
+        // Store the receiver and poll it immediately
+        this.poll_read_rx = Some(rx);
+        match Pin::new(this.poll_read_rx.as_mut().unwrap()).poll(cx) {
+            Poll::Ready(Ok(Ok(Some(chunk)))) => {
+                this.poll_read_rx = None;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Ok(Ok(None))) => {
+                this.poll_read_rx = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Ok(Err(e))) => {
+                this.poll_read_rx = None;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(Err(_)) => {
+                this.poll_read_rx = None;
+                Poll::Ready(Some(Err(StreamError::TaskDropped)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -1534,6 +1580,7 @@ where
             stored_error: self.0.stored_error.clone(),
             controller: self.0.controller.clone(),
             byte_state: self.0.byte_state.clone(),
+            poll_read_rx: None,
             _phantom: PhantomData,
         }
     }
@@ -1596,6 +1643,7 @@ where
             stored_error: self.0.stored_error.clone(),
             controller: self.0.controller.clone(),
             byte_state: self.0.byte_state.clone(),
+            poll_read_rx: None,
             _phantom: PhantomData,
         }
     }
