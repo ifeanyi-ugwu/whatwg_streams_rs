@@ -2,6 +2,7 @@ pub mod byte_source_trait;
 pub mod byte_state;
 pub mod error;
 pub mod readable;
+pub(crate) mod shared;
 pub mod transform;
 pub mod writable;
 
@@ -13,6 +14,7 @@ pub use readable::{
     ReadableStreamBuilder, ReadableStreamDefaultController, ReadableStreamDefaultReader,
     StreamPipeOptions, StreamTypeMarker, TeeBuilder, TeeConfig,
 };
+pub use shared::StreamResult;
 pub use transform::{
     TransformStream, TransformStreamBuilder, TransformStreamDefaultController, Transformer,
 };

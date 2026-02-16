@@ -1,12 +1,10 @@
-use super::{error::StreamError, readable::ReadableByteStreamController};
+use super::{readable::ReadableByteStreamController, shared::StreamResult};
 use crate::platform::MaybeSend;
-
-type StreamResult<T> = Result<T, StreamError>;
 
 pub trait ReadableByteSource: MaybeSend + 'static {
     fn start(
         &mut self,
-        controller: &mut ReadableByteStreamController,
+        #[allow(unused)] controller: &mut ReadableByteStreamController,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         async { Ok(()) }
     }
@@ -19,7 +17,7 @@ pub trait ReadableByteSource: MaybeSend + 'static {
 
     fn cancel(
         &mut self,
-        reason: Option<String>,
+        #[allow(unused)] reason: Option<String>,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         async { Ok(()) }
     }

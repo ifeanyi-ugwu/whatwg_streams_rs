@@ -31,8 +31,6 @@ pub struct ByteStreamState<Source> {
     pub(crate) queue_total_size: AtomicUsize,
     pub(crate) high_water_mark: AtomicUsize,
     desired_size: AtomicIsize,
-    /*pub(crate) pending_reads:
-    Mutex<VecDeque<oneshot::Sender<Result<Option<Vec<u8>>, StreamError>>>>,*/
     start_completed: AtomicBool,
     start_wakers: Mutex<Vec<Waker>>,
 }
@@ -55,7 +53,6 @@ where
             queue_total_size: AtomicUsize::new(0),
             high_water_mark: AtomicUsize::new(high_water_mark),
             desired_size: AtomicIsize::new(high_water_mark as isize),
-            //pending_reads: Mutex::new(VecDeque::new()),
             start_completed: AtomicBool::new(false),
             start_wakers: Mutex::new(Vec::new()),
         })
@@ -68,13 +65,16 @@ where
         buf: &mut [u8],
     ) -> Poll<Result<usize, StreamError>> {
         // First, ensure start has completed
-        if !self.start_completed.load(Ordering::SeqCst) {
+        if !self.start_completed.load(Ordering::Acquire) {
             let mut wakers = self.start_wakers.lock();
-            let waker = cx.waker();
-            if !wakers.iter().any(|w| w.will_wake(waker)) {
-                wakers.push(waker.clone());
+            // Recheck after acquiring lock to avoid race
+            if !self.start_completed.load(Ordering::Acquire) {
+                let waker = cx.waker();
+                if !wakers.iter().any(|w| w.will_wake(waker)) {
+                    wakers.push(waker.clone());
+                }
+                return Poll::Pending;
             }
-            return Poll::Pending;
         }
 
         if buf.is_empty() {
@@ -82,7 +82,7 @@ where
         }
 
         // Check error state first
-        if self.errored.load(Ordering::SeqCst) {
+        if self.errored.load(Ordering::Acquire) {
             let error = self
                 .error
                 .lock()
@@ -119,9 +119,9 @@ where
                 buffer.drain(..copied);
                 let new_size = self
                     .queue_total_size
-                    .load(Ordering::SeqCst)
+                    .load(Ordering::Relaxed)
                     .saturating_sub(copied);
-                self.queue_total_size.store(new_size, Ordering::SeqCst);
+                self.queue_total_size.store(new_size, Ordering::Release);
                 self.update_desired_size();
 
                 copied
@@ -137,7 +137,7 @@ where
         }
 
         // No data available, check if closed
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::Acquire) {
             return Poll::Ready(Ok(0)); // EOF
         }
 
@@ -156,86 +156,21 @@ where
         Poll::Pending
     }
 
-    /*pub fn poll_read_chunk(
-        &self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<Vec<u8>>, StreamError>> {
-        // Check error state first
-        if self.errored.load(Ordering::SeqCst) {
-            let error = self
-                .error
-                .lock()
-                .clone()
-                .unwrap_or_else(|| StreamError::Custom("Stream errored".into()));
-            return Poll::Ready(Err(error));
-        }
-
-        // Try to get a chunk from the buffer
-        let chunk = {
-            let mut buffer = self.buffer.lock();
-            if !buffer.is_empty() {
-                // Determine a reasonable chunk size to return
-                let chunk_size = std::cmp::min(1024, buffer.len());
-                let mut chunk = Vec::with_capacity(chunk_size);
-
-                // Drain from VecDeque and extend the new Vec
-                chunk.extend(buffer.drain(..chunk_size));
-
-                // Update the total size
-                let new_size = self
-                    .queue_total_size
-                    .load(Ordering::SeqCst)
-                    .saturating_sub(chunk.len());
-                self.queue_total_size.store(new_size, Ordering::SeqCst);
-                self.update_desired_size();
-
-                Some(chunk)
-            } else {
-                None
-            }
-        };
-
-        if let Some(data) = chunk {
-            // We got data, so return it
-            self.maybe_trigger_pull();
-            return Poll::Ready(Ok(Some(data)));
-        }
-
-        // No data available, check if closed
-        if self.closed.load(Ordering::SeqCst) {
-            return Poll::Ready(Ok(None)); // EOF
-        }
-
-        // No data available, register waker and wait for more data
-        {
-            let mut wakers = self.read_wakers.lock();
-            let waker = cx.waker();
-            if !wakers.iter().any(|w| w.will_wake(waker)) {
-                wakers.push(waker.clone());
-            }
-        }
-
-        // Try to initiate a pull if one isn't already in progress
-        self.maybe_trigger_pull();
-
-        Poll::Pending
-    }*/
-
     // Internal method to trigger pulls when needed
     pub fn maybe_trigger_pull(&self) {
         // Only pull if:
         // 1. We're not already pulling
         // 2. We're not closed/errored
         // 3. Buffer is below high water mark
-        let current_size = self.queue_total_size.load(Ordering::SeqCst);
-        let hwm = self.high_water_mark.load(Ordering::SeqCst);
+        let current_size = self.queue_total_size.load(Ordering::Acquire);
+        let hwm = self.high_water_mark.load(Ordering::Acquire);
 
-        if !self.pull_in_progress.load(Ordering::SeqCst)
-            && !self.closed.load(Ordering::SeqCst)
-            && !self.errored.load(Ordering::SeqCst)
+        if !self.pull_in_progress.load(Ordering::Acquire)
+            && !self.closed.load(Ordering::Acquire)
+            && !self.errored.load(Ordering::Acquire)
             && current_size < hwm
         {
-            self.needs_pull.store(true, Ordering::SeqCst);
+            self.needs_pull.store(true, Ordering::Release);
             if let Some(waker) = self.pull_waker.lock().take() {
                 waker.wake();
             }
@@ -244,8 +179,8 @@ where
 
     // Method for the stream task to poll for pull requests
     pub fn poll_pull_needed(&self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.needs_pull.load(Ordering::SeqCst) {
-            self.needs_pull.store(false, Ordering::SeqCst);
+        if self.needs_pull.load(Ordering::Acquire) {
+            self.needs_pull.store(false, Ordering::Release);
             Poll::Ready(())
         } else {
             // Store waker for triggering pulls
@@ -256,35 +191,16 @@ where
 
     // Called by source when data is produced
     pub fn enqueue_data(&self, data: &[u8]) {
-        /*if self.byte_state.closed.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Stream is closed".into()));
-        }
-        if self.byte_state.errored.load(Ordering::SeqCst) {
-            return Err(StreamError::Custom("Stream is errored".into()));
-        }*/
-
         if data.is_empty() {
             return;
         }
 
         {
             let mut buffer = self.buffer.lock();
-            buffer.extend(data.iter().cloned());
-            let new_size = self.queue_total_size.load(Ordering::SeqCst) + data.len();
-            self.queue_total_size.store(new_size, Ordering::SeqCst);
+            buffer.extend(data);
+            let new_size = self.queue_total_size.load(Ordering::Relaxed) + data.len();
+            self.queue_total_size.store(new_size, Ordering::Release);
         }
-
-        /*{
-            let mut buffer = self.buffer.lock();
-            let mut pending = self.pending_reads.lock();
-            while !pending.is_empty() && !buffer.is_empty() {
-                if let Some(tx) = pending.pop_front() {
-                    let n = std::cmp::min(buffer.len(), 8192); // chunk size
-                    let chunk: Vec<u8> = buffer.drain(..n).collect();
-                    let _ = tx.send(Ok(Some(chunk)));
-                }
-            }
-        }*/
 
         self.update_desired_size();
         self.wake_readers();
@@ -292,24 +208,18 @@ where
 
     // Called when pull operation starts
     pub fn mark_pull_started(&self) {
-        self.pull_in_progress.store(true, Ordering::SeqCst);
+        self.pull_in_progress.store(true, Ordering::Release);
     }
 
     // Called when pull operation completes
     pub fn mark_pull_completed(&self) {
-        self.pull_in_progress.store(false, Ordering::SeqCst);
+        self.pull_in_progress.store(false, Ordering::Release);
         // Check if we need another pull
         self.maybe_trigger_pull();
     }
 
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        /*{
-            let mut pending = self.pending_reads.lock();
-            while let Some(tx) = pending.pop_front() {
-                let _ = tx.send(Ok(None)); // EOF
-            }
-        }*/
+        self.closed.store(true, Ordering::Release);
         self.update_desired_size();
         self.wake_readers();
         if let Some(waker) = self.pull_waker.lock().take() {
@@ -318,8 +228,8 @@ where
     }
 
     pub fn error(&self, err: StreamError) {
-        self.errored.store(true, Ordering::SeqCst);
         *self.error.lock() = Some(err);
+        self.errored.store(true, Ordering::Release);
         self.update_desired_size();
         self.wake_readers();
         if let Some(waker) = self.pull_waker.lock().take() {
@@ -335,21 +245,21 @@ where
     }
 
     fn update_desired_size(&self) {
-        if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
-            self.desired_size.store(0, Ordering::SeqCst);
+        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
+            self.desired_size.store(0, Ordering::Release);
             return;
         }
 
-        let hwm = self.high_water_mark.load(Ordering::SeqCst) as isize;
-        let current = self.queue_total_size.load(Ordering::SeqCst) as isize;
-        self.desired_size.store(hwm - current, Ordering::SeqCst);
+        let hwm = self.high_water_mark.load(Ordering::Relaxed) as isize;
+        let current = self.queue_total_size.load(Ordering::Relaxed) as isize;
+        self.desired_size.store(hwm - current, Ordering::Release);
     }
 
     pub fn desired_size(&self) -> Option<isize> {
-        if self.closed.load(Ordering::SeqCst) || self.errored.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
             None
         } else {
-            Some(self.desired_size.load(Ordering::SeqCst))
+            Some(self.desired_size.load(Ordering::Acquire))
         }
     }
 
@@ -360,7 +270,7 @@ where
 
     // Helper method to get current buffer size
     pub fn buffer_size(&self) -> usize {
-        self.queue_total_size.load(Ordering::SeqCst)
+        self.queue_total_size.load(Ordering::Acquire)
     }
 
     pub async fn start_source(
@@ -418,8 +328,7 @@ where
     }
 
     pub fn mark_start_completed(&self) {
-        //self.start_completed.store(true, Ordering::SeqCst);
-        if self.start_completed.swap(true, Ordering::SeqCst) {
+        if self.start_completed.swap(true, Ordering::AcqRel) {
             return;
         }
         let mut wakers = self.start_wakers.lock();
@@ -429,7 +338,6 @@ where
     }
 }
 
-//#[async_trait]
 pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn desired_size(&self) -> Option<isize>;
     fn close(&self);
@@ -439,8 +347,6 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn buffer_size(&self) -> usize;
     fn is_closed(&self) -> bool;
     fn is_errored(&self) -> bool;
-    //async fn closed(&self) -> Result<(), StreamError>;
-    //fn closed(&self) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send>>;
     fn closed(&self) -> crate::platform::PlatformBoxFuture<'_, Result<(), StreamError>>;
     fn poll_read_into(
         &self,
@@ -451,31 +357,25 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
         &'a self,
         reason: Option<String>,
     ) -> crate::platform::PlatformBoxFuture<'a, Result<(), StreamError>>;
-    //fn poll_read_chunk(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Vec<u8>>, StreamError>>;
 }
 
-//#[async_trait]
 impl<Source> ByteStreamStateInterface for ByteStreamState<Source>
 where
     Source: ReadableByteSource + 'static,
 {
     fn desired_size(&self) -> Option<isize> {
-        //self.desired_size()
         ByteStreamState::desired_size(self)
     }
 
     fn close(&self) {
-        //self.close();
         ByteStreamState::close(self)
     }
 
     fn enqueue_data(&self, data: &[u8]) {
-        //self.enqueue_data(data);
         ByteStreamState::enqueue_data(self, data)
     }
 
     fn error(&self, error: StreamError) {
-        //self.error(error);
         ByteStreamState::error(self, error)
     }
 
@@ -488,16 +388,13 @@ where
     }
 
     fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.closed.load(Ordering::Acquire)
     }
 
     fn is_errored(&self) -> bool {
-        self.errored.load(Ordering::SeqCst)
+        self.errored.load(Ordering::Acquire)
     }
 
-    /*async fn closed(&self) -> Result<(), StreamError> {
-        ByteStreamState::closed(self).await
-    }*/
     fn closed(&self) -> crate::platform::PlatformBoxFuture<'_, Result<(), StreamError>> {
         Box::pin(async move { ByteStreamState::closed(self).await })
     }
@@ -526,8 +423,4 @@ where
             }
         })
     }
-
-    /*fn poll_read_chunk(&self, cx: &mut Context<'_>) -> Poll<Result<Option<Vec<u8>>, StreamError>> {
-        ByteStreamState::poll_read_chunk(self, cx)
-    }*/
 }

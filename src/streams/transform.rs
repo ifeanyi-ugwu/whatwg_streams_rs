@@ -14,7 +14,7 @@ use futures::{
     stream::StreamExt,
 };
 
-pub type StreamResult<T> = Result<T, StreamError>;
+use super::shared::StreamResult;
 
 /// Commands sent from the writable side to the transform task
 #[derive(Debug)]
@@ -411,9 +411,9 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
     /// Spawn each part separately using static function references
     pub fn spawn_parts_ref<R1, R2, R3>(
         self,
-        rf: &'static (dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R1),
-        wf: &'static (dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R2),
-        tf: &'static (dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R3),
+        rf: &'static dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R1,
+        wf: &'static dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R2,
+        tf: &'static dyn Fn(crate::platform::PlatformFuture<'static, ()>) -> R3,
     ) -> TransformStream<I, O> {
         let (stream, rfut, wfut, tfut) = self.prepare();
         rf(Box::pin(rfut));

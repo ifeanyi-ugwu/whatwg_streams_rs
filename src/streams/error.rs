@@ -137,13 +137,19 @@ mod tests {
     }
 
     #[test]
-    fn test_question_mark_works() -> Result<(), Box<dyn Error>> {
+    fn test_question_mark_propagates() {
         fn returns_stream_error() -> Result<(), StreamError> {
             Err("stream error".into())
         }
 
-        returns_stream_error()?; // `?` works
-        Ok(())
+        // Verify that `?` propagates StreamError through Box<dyn Error>
+        fn propagate() -> Result<(), Box<dyn Error>> {
+            returns_stream_error()?;
+            Ok(())
+        }
+
+        let result = propagate();
+        assert!(result.is_err(), "StreamError should propagate via ?");
     }
 
     #[test]
@@ -172,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_error_handling() -> Result<(), StreamError> {
+    fn test_mixed_error_handling() {
         #[cfg(feature = "local")]
         fn might_fail_json() -> Result<(), Box<dyn Error>> {
             Err("json parse error".into())
@@ -196,10 +202,16 @@ mod tests {
             Err(CustomError("custom failure".to_string()))
         }
 
-        might_fail_json().map_err(StreamError::other_boxed)?;
-        might_fail_custom().map_err(StreamError::other)?;
-        might_fail_json()?; // via From<Box<dyn Error>>
+        // Verify all conversion paths produce StreamError
+        fn propagate_all() -> Result<(), StreamError> {
+            might_fail_json().map_err(StreamError::other_boxed)?;
+            might_fail_custom().map_err(StreamError::other)?;
+            might_fail_json()?; // via From<Box<dyn Error>>
+            Ok(())
+        }
 
-        Ok(())
+        // The first map_err should convert and propagate
+        let result = propagate_all();
+        assert!(result.is_err(), "mixed error handling should propagate");
     }
 }
