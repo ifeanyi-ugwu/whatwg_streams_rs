@@ -1607,7 +1607,7 @@ pub struct WritableStreamDefaultController {
 }
 
 impl WritableStreamDefaultController {
-    pub fn new(sender: UnboundedSender<ControllerMsg>) -> Self {
+    fn new(sender: UnboundedSender<ControllerMsg>) -> Self {
         Self {
             tx: sender,
             abort_requested: SharedPtr::new(AtomicBool::new(false)),

@@ -537,7 +537,7 @@ impl AsyncSignal {
     }
 }
 
-struct TeeSource<T: MaybeSend + 'static> {
+pub struct TeeSource<T: MaybeSend + 'static> {
     chunk_rx: UnboundedReceiver<TeeChunk<T>>,
     branch_id: TeeSourceId,
     branch_canceled: SharedPtr<AtomicBool>,
@@ -1925,7 +1925,7 @@ async fn readable_stream_task<T: 'static, Source>(
 }
 
 // ----------- Byte Stream Task Implementation -----------
-pub async fn readable_byte_stream_task<Source>(
+async fn readable_byte_stream_task<Source>(
     byte_state: SharedPtr<ByteStreamState<Source>>,
     mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
     mut controller: ReadableByteStreamController,
