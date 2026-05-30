@@ -163,6 +163,241 @@ async fn implements_futures_stream_trait() {
     assert_eq!(collected, items);
 }
 
+// ── controller.error() ────────────────────────────────────────────────────────
+
+// "ReadableStreamDefaultController: error() transitions stream to errored state"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_puts_stream_in_errored_state() {
+    struct ErroringSource;
+
+    impl ReadableSource<u32> for ErroringSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.error("controller error".into())?;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(ErroringSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    assert!(reader.read().await.is_err());
+}
+
+// "ReadableStreamDefaultController: error() rejects all pending reads"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_rejects_pending_read() {
+    use std::sync::{Arc, Mutex};
+
+    // Source blocks in pull so we can have a genuinely pending read
+    let fire = Arc::new(tokio::sync::Notify::new());
+    let fire2 = fire.clone();
+    let errored = Arc::new(Mutex::new(false));
+    let errored2 = errored.clone();
+
+    struct ControlledSource {
+        fire: Arc<tokio::sync::Notify>,
+        errored: Arc<Mutex<bool>>,
+    }
+
+    impl ReadableSource<u32> for ControlledSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.fire.notified().await;
+            *self.errored.lock().unwrap() = true;
+            controller.error("fired error".into())?;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(ControlledSource {
+        fire: fire2,
+        errored: errored2,
+    })
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    let read_fut = tokio::spawn(async move { reader.read().await });
+
+    // Let the read reach pending state, then fire the error
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    fire.notify_one();
+
+    let result = read_fut.await.unwrap();
+    assert!(result.is_err(), "pending read should be rejected by controller.error()");
+}
+
+// "ReadableStreamDefaultController: error() makes closed promise reject"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_rejects_closed_promise() {
+    struct ErroringSource;
+
+    impl ReadableSource<u32> for ErroringSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.error("bad".into())?;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(ErroringSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // trigger the error
+    assert!(reader.closed().await.is_err());
+}
+
+// "ReadableStreamDefaultController: error() after close() is a no-op"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_after_close_is_noop() {
+    struct CloseThenerrSource;
+
+    impl ReadableSource<u32> for CloseThenerrSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.close()?;
+            // Error after close — must be ignored by the implementation
+            let _ = controller.error("too late".into());
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(CloseThenerrSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // Stream should be closed, not errored
+    assert_eq!(reader.read().await.unwrap(), None);
+    reader.closed().await.unwrap();
+}
+
+// "ReadableStreamDefaultController: desired_size() is None when the stream is errored"
+// The check must happen after the task processes ControllerMsg::Error (which sets the
+// errored atomic). Cloning the controller shares the same Arc-backed atomics, so
+// checking the clone after a failed read is reliable.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_desired_size_is_none_after_error() {
+    use std::sync::{Arc, Mutex};
+
+    let captured_ctrl: Arc<Mutex<Option<ReadableStreamDefaultController<u32>>>> =
+        Arc::new(Mutex::new(None));
+    let captured2 = captured_ctrl.clone();
+
+    struct CapturingErrorSource {
+        captured: Arc<Mutex<Option<ReadableStreamDefaultController<u32>>>>,
+    }
+
+    impl ReadableSource<u32> for CapturingErrorSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Clone shares Arc-backed atomics — reads correct value once task updates them
+            *self.captured.lock().unwrap() = Some(controller.clone());
+            controller.error("err".into())?;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(CapturingErrorSource {
+        captured: captured2,
+    })
+    .strategy(CountQueuingStrategy::new(4))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // drives the task to process ControllerMsg::Error
+
+    let ctrl = captured_ctrl.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        ctrl.desired_size(),
+        None,
+        "desired_size() must be None when stream is errored"
+    );
+}
+
+// ── start() sequence ──────────────────────────────────────────────────────────
+
+// "ReadableStream: start() is called before pull()"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn start_is_called_before_pull() {
+    use std::sync::{Arc, Mutex};
+
+    let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let order2 = order.clone();
+
+    struct OrderTrackingSource {
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ReadableSource<u32> for OrderTrackingSource {
+        async fn start(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.order.lock().unwrap().push("start");
+            Ok(())
+        }
+
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.order.lock().unwrap().push("pull");
+            controller.close()?;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(OrderTrackingSource { order: order2 }).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // drive to closed
+
+    let calls = order.lock().unwrap().clone();
+    assert_eq!(calls[0], "start", "start() must be called before pull()");
+    assert!(calls.contains(&"pull"));
+}
+
+// "ReadableStream: start() can enqueue chunks via the controller"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn start_can_enqueue_via_controller() {
+    struct EnqueueingStart;
+
+    impl ReadableSource<u32> for EnqueueingStart {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(42u32)?;
+            controller.close()?;
+            Ok(())
+        }
+
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(EnqueueingStart).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    assert_eq!(reader.read().await.unwrap(), Some(42));
+    assert_eq!(reader.read().await.unwrap(), None);
+}
+
 // "ReadableStream: desired_size reflects HWM minus queue depth"
 #[cfg(feature = "send")]
 #[tokio::test]
