@@ -330,32 +330,60 @@ where
         let (_stream, reader) = self.get_reader()?;
 
         let pipe_loop = async {
+            use futures::FutureExt;
             loop {
-                // Wait until the writer is ready before pulling from the reader
+                // Check writer state before pulling (detects backpressure and errors
+                // from the *previous* iteration's fire-and-forget write, if they have
+                // already propagated by the time we loop back).
                 if let Err(write_err) = writer.ready().await {
-                    // Destination error - cancel source if allowed
                     if !options.prevent_cancel {
-                        if let Err(cancel_err) = reader.cancel(Some(write_err.to_string())).await {
-                            return Err(cancel_err);
-                        }
+                        let _ = reader.cancel(Some(write_err.to_string())).await;
                     }
                     return Err(write_err);
                 }
 
-                match reader.read().await {
+                // Race: wait for the next chunk vs. the writer reaching a final state.
+                //
+                // A fire-and-forget write that errors the sink propagates asynchronously.
+                // If the source then blocks in pull(), writer.ready() at the top of the
+                // next iteration will never be reached — the pipe deadlocks. Selecting
+                // writer.closed() alongside reader.read() breaks that deadlock: when the
+                // writer enters an errored state the closed arm fires immediately, we
+                // cancel the source, and the pipe terminates cleanly.
+                let read_result = {
+                    let read_fut = reader.read().fuse();
+                    let mut closed_fut = writer.closed().fuse();
+                    futures::pin_mut!(read_fut);
+
+                    futures::select! {
+                        r = read_fut => r,
+                        c = closed_fut => {
+                            match c {
+                                Err(write_err) => {
+                                    // A prior write errored the stream while source blocked
+                                    if !options.prevent_cancel {
+                                        let _ = reader.cancel(Some(write_err.to_string())).await;
+                                    }
+                                    return Err(write_err);
+                                }
+                                Ok(()) => return Ok(()), // writer closed externally
+                            }
+                        }
+                    }
+                };
+
+                match read_result {
                     Ok(Some(chunk)) => {
-                        // Fire-and-forget write (we know writer is ready at this point)
+                        // Fire-and-forget: spec-faithful pipelined write.
                         let _ = writer.write(chunk);
                     }
                     Ok(None) => {
-                        // Source completed normally - close destination if allowed
                         if !options.prevent_close {
                             writer.close().await?;
                         }
                         return Ok(());
                     }
                     Err(read_err) => {
-                        // Source error - abort destination if allowed
                         if !options.prevent_abort {
                             if let Err(abort_err) = writer.abort(Some(read_err.to_string())).await {
                                 return Err(abort_err);

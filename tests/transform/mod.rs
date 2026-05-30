@@ -220,3 +220,185 @@ async fn flush_called_on_writable_close() {
     assert_eq!(reader.read().await.unwrap(), None);
     assert!(*flushed.lock().unwrap());
 }
+
+// ── WPT: transform-streams/terminate.any.js ──────────────────────────────────
+// https://github.com/web-platform-tests/wpt/blob/master/streams/transform-streams/terminate.any.js
+
+// "TransformStream: controller.terminate() closes the readable side"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn terminate_closes_readable_side() {
+    struct TerminatingT;
+
+    impl Transformer<u32, u32> for TerminatingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)?;
+            controller.terminate()?; // close readable, error writable
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(TerminatingT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    writer.write(1u32).await.unwrap();
+
+    // First read returns the enqueued chunk
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+    // Second read returns None — readable is closed
+    assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// "TransformStream: controller.terminate() errors the writable side"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn terminate_errors_writable_side() {
+    struct TerminatingT;
+
+    impl Transformer<u32, u32> for TerminatingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)?;
+            controller.terminate()?;
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(TerminatingT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    // First write triggers terminate() — readable gets the chunk, writable errors
+    writer.write(1u32).await.unwrap();
+    let _ = reader.read().await; // consume the chunk
+
+    // Subsequent writes on the writable should now fail
+    assert!(
+        writer.write(2u32).await.is_err(),
+        "write() after terminate() must return an error"
+    );
+}
+
+// "TransformStream: controller.terminate() called in start() closes immediately"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn terminate_in_start_closes_immediately() {
+    struct TerminateOnStartT;
+
+    impl Transformer<u32, u32> for TerminateOnStartT {
+        async fn start(
+            &mut self,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.terminate()?;
+            Ok(())
+        }
+
+        async fn transform(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(TerminateOnStartT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    // Readable is already closed — reads return None immediately
+    assert_eq!(reader.read().await.unwrap(), None);
+    // Writable is errored — writes fail
+    assert!(writer.write(1u32).await.is_err());
+}
+
+// "TransformStream: terminate() in flush() closes the readable after all chunks"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn terminate_in_flush_closes_after_chunks() {
+    struct TerminateInFlushT;
+
+    impl Transformer<u32, u32> for TerminateInFlushT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn flush(
+            &mut self,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // terminate() in flush: readable closes, no sentinel chunk needed
+            controller.terminate()?;
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(TerminateInFlushT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    writer.write(1u32).await.unwrap();
+    writer.write(2u32).await.unwrap();
+    writer.close().await.unwrap();
+
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+    assert_eq!(reader.read().await.unwrap(), Some(2));
+    assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// "TransformStream: desired_size on the controller reflects the readable side's HWM"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_desired_size_reflects_readable_hwm() {
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
+    let captured2 = captured.clone();
+
+    struct CapturingT {
+        captured: Arc<Mutex<Option<isize>>>,
+    }
+
+    impl Transformer<u32, u32> for CapturingT {
+        async fn transform(
+            &mut self,
+            _chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.captured.lock().unwrap() = controller.desired_size();
+            controller.terminate()?;
+            Ok(())
+        }
+    }
+
+    use whatwg_streams::CountQueuingStrategy;
+    let ts = TransformStream::builder(CapturingT { captured: captured2 })
+        .readable_strategy(CountQueuingStrategy::new(4))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, _reader) = readable.get_reader().unwrap();
+
+    writer.write(1u32).await.unwrap();
+    tokio::task::yield_now().await;
+
+    // Readable HWM=4, queue was empty when transform ran → desired_size = 4
+    assert_eq!(*captured.lock().unwrap(), Some(4));
+}

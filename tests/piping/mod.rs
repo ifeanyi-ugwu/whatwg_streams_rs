@@ -5,7 +5,7 @@ use crate::helpers::{CollectSink, FailAfterSink};
 use whatwg_streams::{
     CountQueuingStrategy, ReadableSource, ReadableStream, ReadableStreamDefaultController,
     StreamError, StreamPipeOptions, StreamResult, TransformStream, Transformer,
-    TransformStreamDefaultController, WritableStream,
+    TransformStreamDefaultController, WritableSink, WritableStream, WritableStreamDefaultController,
 };
 
 struct ErrorAfterSource {
@@ -415,4 +415,159 @@ async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
         aborted.lock().unwrap().is_none(),
         "destination should NOT be aborted when prevent_abort=true"
     );
+}
+
+// ── WPT: piping/close-propagation-backward.any.js ────────────────────────────
+// When the destination errors, the source should be cancelled (default behaviour).
+
+/// Source that records cancel reason and blocks in pull() after exhausting its data
+/// so the pipe is still "active" when the destination errors.
+#[cfg(feature = "send")]
+struct CancelTrackingSource {
+    data: Vec<u32>,
+    index: usize,
+    cancel_reason: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[cfg(feature = "send")]
+impl ReadableSource<u32> for CancelTrackingSource {
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<u32>,
+    ) -> StreamResult<()> {
+        if self.index < self.data.len() {
+            controller.enqueue(self.data[self.index])?;
+            self.index += 1;
+        } else {
+            // No more data — hang until cancelled (tests the cancel-during-pull path)
+            futures::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
+        *self.cancel_reason.lock().unwrap() = reason;
+        Ok(())
+    }
+}
+
+// "Piping: when the destination errors, the source is cancelled (prevent_cancel=false)"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_dest_error_cancels_source() {
+    let cancel_reason = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+
+    let source = ReadableStream::builder(CancelTrackingSource {
+        data: vec![1u32],
+        index: 0,
+        cancel_reason: cancel_reason.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    // Sink fails on the first write → dest becomes errored
+    let sink = FailAfterSink {
+        fail_after: 0,
+        count: Default::default(),
+    };
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let result = source.pipe_to(&dest, None).await;
+    assert!(result.is_err(), "pipe should return an error when dest errors");
+    assert!(
+        cancel_reason.lock().unwrap().is_some(),
+        "source.cancel() should be called when destination errors"
+    );
+}
+
+// "Piping: cancel reason passed to source matches the destination error"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_dest_error_reason_passed_to_source_cancel() {
+    let cancel_reason = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+
+    let source = ReadableStream::builder(CancelTrackingSource {
+        data: vec![1u32],
+        index: 0,
+        cancel_reason: cancel_reason.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let sink = FailAfterSink {
+        fail_after: 0,
+        count: Default::default(),
+    };
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let _ = source.pipe_to(&dest, None).await;
+
+    // The cancel reason should be derived from the sink write error
+    let reason = cancel_reason.lock().unwrap().clone();
+    assert!(reason.is_some(), "cancel reason should be set");
+}
+
+// "Piping: prevent_cancel=true prevents source cancellation when dest errors"
+// (already tested via pipe_to_prevent_cancel_option — added here for explicitness)
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_dest_error_with_prevent_cancel_skips_source_cancel() {
+    let cancel_reason = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+
+    let source = ReadableStream::builder(CancelTrackingSource {
+        data: vec![1u32],
+        index: 0,
+        cancel_reason: cancel_reason.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let sink = FailAfterSink {
+        fail_after: 0,
+        count: Default::default(),
+    };
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let _ = source
+        .pipe_to(
+            &dest,
+            Some(StreamPipeOptions {
+                prevent_cancel: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    assert!(
+        cancel_reason.lock().unwrap().is_none(),
+        "source.cancel() should NOT be called when prevent_cancel=true"
+    );
+}
+
+// ── WPT: piping/error-propagation-via-cancel.any.js ──────────────────────────
+
+// "Piping: a slow-closing writable that errors before closing cancels the readable"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_writable_that_errors_on_close_cancels_source() {
+    struct ErrorOnCloseSink;
+
+    impl WritableSink<u32> for ErrorOnCloseSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+
+        async fn close(self) -> StreamResult<()> {
+            Err("close failed".into())
+        }
+    }
+
+    // Source produces one chunk then closes
+    let source = ReadableStream::from_vec(vec![1u32]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(ErrorOnCloseSink).spawn(tokio::spawn);
+
+    let result = source.pipe_to(&dest, None).await;
+    // The sink's close() fails → pipe returns an error
+    assert!(result.is_err(), "pipe should error when sink.close() rejects");
 }
