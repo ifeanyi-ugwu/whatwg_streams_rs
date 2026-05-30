@@ -466,3 +466,157 @@ async fn controller_desired_size_reflects_hwm() {
 
     assert_eq!(*captured.lock().unwrap(), Some(4));
 }
+
+// ── controller edge cases ─────────────────────────────────────────────────────
+
+// "ReadableStreamDefaultController: calling close() twice is a no-op on the second call"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_close_twice_is_noop() {
+    struct CloseTwiceSource;
+
+    impl ReadableSource<u32> for CloseTwiceSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // First close should succeed; second should be ignored (not panic)
+            let _ = controller.close();
+            let _ = controller.close(); // no-op or silently ignored
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(CloseTwiceSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // Stream should be closed, not errored
+    assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// "ReadableStreamDefaultController: enqueue() after close() is ignored"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_enqueue_after_close_is_noop() {
+    struct CloseThEnqueueSource;
+
+    impl ReadableSource<u32> for CloseThEnqueueSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.close()?;
+            // Enqueue after close — should be silently ignored (stream is closed)
+            let _ = controller.enqueue(42u32);
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(CloseThEnqueueSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // Stream closed — read returns None; the enqueued chunk is discarded
+    assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// "ReadableStreamDefaultController: enqueue() on an errored stream is ignored"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_enqueue_on_errored_stream_is_noop() {
+    struct ErrorThenEnqueueSource;
+
+    impl ReadableSource<u32> for ErrorThenEnqueueSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.error("boom".into())?;
+            // Enqueue after error — the stream is errored; should be a no-op
+            let _ = controller.enqueue(99u32);
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(ErrorThenEnqueueSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // Stream errored — read returns Err; the enqueued chunk is not surfaced
+    let result = reader.read().await;
+    assert!(result.is_err());
+    // Second read also errors (not returning the phantom chunk)
+    assert!(reader.read().await.is_err());
+}
+
+// "ReadableStream: pull() is not invoked while the queue is at or above the HWM"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pull_not_called_while_queue_full() {
+    use std::sync::{Arc, Mutex};
+
+    let pull_count = Arc::new(Mutex::new(0u32));
+    let pull_count2 = pull_count.clone();
+
+    struct CountingSource {
+        pull_count: Arc<Mutex<u32>>,
+        items: Vec<u32>,
+        index: usize,
+    }
+
+    impl ReadableSource<u32> for CountingSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Pre-fill the queue to HWM in start() — no further pulls should happen
+            // until the consumer drains below HWM.
+            for &item in &self.items {
+                controller.enqueue(item)?;
+            }
+            Ok(())
+        }
+
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.pull_count.lock().unwrap() += 1;
+            if self.index < self.items.len() {
+                controller.enqueue(self.items[self.index])?;
+                self.index += 1;
+            } else {
+                controller.close()?;
+            }
+            Ok(())
+        }
+    }
+
+    // HWM=2: start() enqueues 2 items — queue is at HWM, pull() must NOT be called
+    let stream = ReadableStream::builder(CountingSource {
+        pull_count: pull_count2,
+        items: vec![1u32, 2],
+        index: 0,
+    })
+    .strategy(CountQueuingStrategy::new(2))
+    .spawn(tokio::spawn);
+
+    // Give the task time to run start() (which pre-fills the queue to HWM=2)
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // The critical invariant: pull() must NOT fire while the queue is at HWM.
+    assert_eq!(
+        *pull_count.lock().unwrap(),
+        0,
+        "pull() must not be called before any reads when queue is pre-filled to HWM"
+    );
+
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Both reads return the items enqueued by start()
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+    assert_eq!(reader.read().await.unwrap(), Some(2));
+
+    // After draining, pull() is correctly triggered (queue empty)
+    let _ = reader.read().await;
+    assert!(
+        *pull_count.lock().unwrap() > 0,
+        "pull() must fire after the queue is drained"
+    );
+}

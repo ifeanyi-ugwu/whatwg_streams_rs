@@ -402,3 +402,194 @@ async fn controller_desired_size_reflects_readable_hwm() {
     // Readable HWM=4, queue was empty when transform ran → desired_size = 4
     assert_eq!(*captured.lock().unwrap(), Some(4));
 }
+
+// ── WPT: transform-streams/cancel.any.js ─────────────────────────────────────
+// https://github.com/web-platform-tests/wpt/blob/master/streams/transform-streams/cancel.any.js
+
+// "TransformStream: cancelling the readable side errors the writable side"
+// SPEC GAP: TransformReadableSource::cancel() is a no-op — it does not propagate
+// the cancellation to the writable side. The spec requires that cancelling the
+// readable side errors the writable side with the cancel reason.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "spec gap: readable cancel does not propagate to writable side of TransformStream"]
+async fn cancel_readable_errors_writable() {
+    let ts = TransformStream::builder(DoubleT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    reader.cancel(Some("consumer done".into())).await.unwrap();
+
+    // Per spec: writable side should now be errored
+    assert!(
+        writer.write(1u32).await.is_err(),
+        "write() must fail after the readable side is cancelled"
+    );
+}
+
+// "TransformStream: cancelling the readable side with a reason passes that reason to the writable"
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "spec gap: readable cancel does not propagate to writable side of TransformStream"]
+async fn cancel_readable_reason_propagates_to_writable() {
+    use std::sync::{Arc, Mutex};
+
+    let error_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let error_reason2 = error_reason.clone();
+
+    struct TrackingT {
+        error_reason: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Transformer<u32, u32> for TrackingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+    }
+
+    let ts = TransformStream::builder(TrackingT {
+        error_reason: error_reason2,
+    })
+    .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, _writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    reader.cancel(Some("the reason".into())).await.unwrap();
+
+    drop(error_reason); // suppress unused warning
+    // Per spec: writable should be errored with "the reason"
+    // (not testable until the gap is fixed)
+}
+
+// "TransformStream: read() after readable.cancel() returns None"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_readable_subsequent_reads_return_none() {
+    let ts = TransformStream::builder(DoubleT).spawn(tokio::spawn);
+    let (readable, _writable) = ts.split();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    reader.cancel(None).await.unwrap();
+    // After cancel, reads should return None (stream closed from reader's perspective)
+    assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// ── WPT: transform-streams/backpressure.any.js ───────────────────────────────
+// https://github.com/web-platform-tests/wpt/blob/master/streams/transform-streams/backpressure.any.js
+
+// "TransformStream: controller.desiredSize reflects the readable side's HWM"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn transform_desired_size_reflects_readable_hwm() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::CountQueuingStrategy;
+
+    let sizes: Arc<Mutex<Vec<Option<isize>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sizes2 = sizes.clone();
+
+    struct SizingT {
+        sizes: Arc<Mutex<Vec<Option<isize>>>>,
+    }
+
+    impl Transformer<u32, u32> for SizingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Record desired_size before enqueuing
+            self.sizes.lock().unwrap().push(controller.desired_size());
+            controller.enqueue(chunk)?;
+            // Record desired_size after enqueuing
+            self.sizes.lock().unwrap().push(controller.desired_size());
+            Ok(())
+        }
+    }
+
+    // Readable HWM=2: desiredSize starts at 2, decreases as chunks are enqueued
+    let ts = TransformStream::builder(SizingT { sizes: sizes2 })
+        .readable_strategy(CountQueuingStrategy::new(2))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    writer.write(1u32).await.unwrap();
+    writer.write(2u32).await.unwrap();
+    writer.close().await.unwrap();
+
+    // Consume all output
+    while reader.read().await.unwrap().is_some() {}
+
+    let recorded = sizes.lock().unwrap().clone();
+    // Before first enqueue: desiredSize=2; after: desiredSize=1
+    // Before second enqueue: desiredSize=1 (or depends on consumption); after: desiredSize=0
+    assert!(!recorded.is_empty(), "desired_size should have been recorded");
+    // First transform: before enqueue, desiredSize should be positive (HWM=2)
+    assert!(
+        recorded[0].unwrap_or(0) > 0,
+        "desired_size should be positive before any enqueue (HWM=2)"
+    );
+}
+
+// "TransformStream: enqueuing more than HWM chunks causes desired_size to go negative"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn transform_desired_size_goes_negative_when_over_hwm() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::CountQueuingStrategy;
+
+    let final_size: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
+    let final_size2 = final_size.clone();
+
+    struct OverfillT {
+        final_size: Arc<Mutex<Option<isize>>>,
+    }
+
+    impl Transformer<u32, u32> for OverfillT {
+        async fn transform(
+            &mut self,
+            _chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Enqueue 3 items on a HWM=1 readable — desired_size goes negative.
+            // enqueue() sends ctrl messages to the readable task asynchronously.
+            // Yield so the readable task processes them and updates the atomic
+            // before we read desired_size().
+            controller.enqueue(1u32)?;
+            controller.enqueue(2u32)?;
+            controller.enqueue(3u32)?;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            *self.final_size.lock().unwrap() = controller.desired_size();
+            controller.terminate()?;
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(OverfillT {
+        final_size: final_size2,
+    })
+    .readable_strategy(CountQueuingStrategy::new(1)) // HWM=1
+    .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    writer.write(0u32).await.unwrap();
+
+    // Consume all output
+    while reader.read().await.unwrap().is_some() {}
+
+    let ds = final_size.lock().unwrap().unwrap_or(0);
+    assert!(
+        ds < 0,
+        "desired_size must go negative when more than HWM chunks are enqueued (got {ds})"
+    );
+}

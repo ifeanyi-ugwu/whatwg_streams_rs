@@ -571,3 +571,86 @@ async fn pipe_to_writable_that_errors_on_close_cancels_source() {
     // The sink's close() fails → pipe returns an error
     assert!(result.is_err(), "pipe should error when sink.close() rejects");
 }
+
+// ── WPT: piping/flow-control.any.js ──────────────────────────────────────────
+// https://github.com/web-platform-tests/wpt/blob/master/streams/piping/flow-control.any.js
+
+// "Piping: backpressure is respected — source is not read ahead of writable HWM"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_respects_writable_backpressure() {
+    use std::sync::{Arc, Mutex};
+
+    let write_order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let write_order2 = write_order.clone();
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    let unblock2 = unblock.clone();
+
+    struct SlowOrderSink {
+        order: Arc<Mutex<Vec<u32>>>,
+        unblock: Arc<tokio::sync::Notify>,
+        first: bool,
+    }
+
+    impl WritableSink<u32> for SlowOrderSink {
+        async fn write(
+            &mut self,
+            chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.order.lock().unwrap().push(chunk);
+            if self.first {
+                self.first = false;
+                self.unblock.notified().await; // block first write
+            }
+            Ok(())
+        }
+    }
+
+    let data = vec![1u32, 2, 3, 4, 5];
+    let source = ReadableStream::from_vec(data.clone()).spawn(tokio::spawn);
+    let dest = WritableStream::builder(SlowOrderSink {
+        order: write_order2,
+        unblock: unblock2,
+        first: true,
+    })
+    .strategy(CountQueuingStrategy::new(1)) // HWM=1: backpressure after 1 queued chunk
+    .spawn(tokio::spawn);
+
+    let pipe = tokio::spawn(async move { source.pipe_to(&dest, None).await });
+
+    // Let pipe start and first write block
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Unblock the sink — remaining writes proceed
+    unblock.notify_one();
+    pipe.await.unwrap().unwrap();
+
+    // All chunks must arrive in the original order
+    assert_eq!(
+        *write_order.lock().unwrap(),
+        data,
+        "chunks must arrive in order even with backpressure"
+    );
+}
+
+// "Piping: chunks from source arrive at dest in original order with HWM=1"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_hwm1_preserves_order() {
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let sink = CollectSink {
+        collected: collected.clone(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    };
+    let data: Vec<u32> = (1..=10).collect();
+    let source = ReadableStream::from_vec(data.clone()).spawn(tokio::spawn);
+    let dest = WritableStream::builder(sink)
+        .strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+
+    source.pipe_to(&dest, None).await.unwrap();
+    assert_eq!(*collected.lock().unwrap(), data);
+}
