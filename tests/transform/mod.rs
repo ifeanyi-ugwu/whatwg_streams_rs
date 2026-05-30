@@ -155,6 +155,7 @@ async fn transform_error_errors_both_sides() {
 
 // WPT: transform-streams/general.any.js —
 // "TransformStream: abort() on the writable errors the readable"
+// Per spec: abort() itself resolves (Ok) — it's the readable that becomes errored.
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn abort_writable_errors_readable() {
@@ -166,10 +167,11 @@ async fn abort_writable_errors_readable() {
     writer.write(1u32).await.unwrap();
     assert_eq!(reader.read().await.unwrap(), Some(2));
 
-    // Abort signals an error on the writable side, which errors the readable too
+    // abort() itself resolves with Ok — it's the readable side that errors.
     let abort_result = writer.abort(Some("aborted".into())).await;
-    assert!(abort_result.is_err()); // abort itself returns the error
+    assert!(abort_result.is_ok(), "abort() must resolve per spec, got: {abort_result:?}");
 
+    // The readable side is now errored
     assert!(reader.read().await.is_err());
 }
 
@@ -478,6 +480,161 @@ async fn cancel_readable_subsequent_reads_return_none() {
     reader.cancel(None).await.unwrap();
     // After cancel, reads should return None (stream closed from reader's perspective)
     assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// "cancelling the readable side should call transformer.cancel()" (spec §6.3.2)
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_readable_calls_transformer_cancel() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::Transformer;
+
+    let cancel_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cancel_reason2 = cancel_reason.clone();
+
+    struct TrackingT {
+        cancel_reason: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Transformer<u32, u32> for TrackingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_reason.lock().unwrap() = reason;
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(TrackingT {
+        cancel_reason: cancel_reason2,
+    })
+    .spawn(tokio::spawn);
+    let (readable, _writable) = ts.split();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    reader.cancel(Some("done reading".into())).await.unwrap();
+
+    assert_eq!(
+        cancel_reason.lock().unwrap().as_deref(),
+        Some("done reading"),
+        "Transformer::cancel() must be called with the cancel reason when readable is cancelled"
+    );
+}
+
+// "aborting the writable side should call transformer.cancel()" (spec §6.3.2)
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn abort_writable_calls_transformer_cancel() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::Transformer;
+
+    let cancel_called: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let cancel_called2 = cancel_called.clone();
+
+    struct TrackingT {
+        cancel_called: Arc<Mutex<bool>>,
+    }
+
+    impl Transformer<u32, u32> for TrackingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_called.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(TrackingT {
+        cancel_called: cancel_called2,
+    })
+    .spawn(tokio::spawn);
+    let (_readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+
+    writer.abort(Some("aborting".into())).await.unwrap();
+
+    assert!(
+        *cancel_called.lock().unwrap(),
+        "Transformer::cancel() must be called when the writable side is aborted"
+    );
+}
+
+// "transformer.cancel() returning Err causes readable.cancel() to reject"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_that_throws_rejects_readable_cancel() {
+    use whatwg_streams::Transformer;
+
+    struct RejectingT;
+
+    impl Transformer<u32, u32> for RejectingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err("cancel failed".into())
+        }
+    }
+
+    let ts = TransformStream::builder(RejectingT).spawn(tokio::spawn);
+    let (readable, _writable) = ts.split();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    let result = reader.cancel(None).await;
+    assert!(
+        result.is_err(),
+        "readable.cancel() must reject when transformer.cancel() throws"
+    );
+}
+
+// "transformer.cancel() returning Err causes writable.abort() to reject"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn abort_that_throws_rejects_writable_abort() {
+    use whatwg_streams::Transformer;
+
+    struct RejectingT;
+
+    impl Transformer<u32, u32> for RejectingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err("cancel failed".into())
+        }
+    }
+
+    let ts = TransformStream::builder(RejectingT).spawn(tokio::spawn);
+    let (_readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+
+    let result = writer.abort(None).await;
+    assert!(
+        result.is_err(),
+        "writable.abort() must reject when transformer.cancel() throws"
+    );
 }
 
 // ── WPT: transform-streams/backpressure.any.js ───────────────────────────────

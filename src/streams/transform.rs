@@ -12,6 +12,7 @@ use futures::{
     },
     future::{self, Future},
     stream::StreamExt,
+    FutureExt,
 };
 
 use super::shared::StreamResult;
@@ -54,6 +55,7 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
         T: Transformer<I, O> + 'static,
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
+        let (cancel_tx, cancel_rx): (CancelTx, CancelRx) = unbounded();
 
         // Writable is created first so its controller can be handed to the readable
         // source — the readable source's cancel() needs it to error the writable side
@@ -61,7 +63,7 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
         let writable_sink = TransformWritableSink::new(transform_tx);
         let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
 
-        let readable_source = TransformReadableSource::new(writable.controller.clone());
+        let readable_source = TransformReadableSource::new(writable.controller.clone(), cancel_tx);
         let (readable, readable_fut) =
             ReadableStream::new_inner(readable_source, readable_strategy);
 
@@ -70,7 +72,7 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
             writable.controller.clone(),
         );
 
-        let transform_fut = transform_task(transformer, transform_rx, controller);
+        let transform_fut = transform_task(transformer, transform_rx, cancel_rx, controller);
 
         (
             TransformStream { readable, writable },
@@ -162,30 +164,56 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
         controller: &mut TransformStreamDefaultController<O>,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend;
 
-    /// Called when the writable side is closed
+    /// Called when the writable side is closed (before the readable is closed)
     fn flush(
         &mut self,
         #[allow(unused)] controller: &mut TransformStreamDefaultController<O>,
     ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         future::ready(Ok(()))
     }
+
+    /// Called when the readable side is cancelled **or** the writable side is aborted.
+    ///
+    /// This mirrors the spec's `[[cancelAlgorithm]]` (§6.3.2), which is invoked for
+    /// both `readable.cancel(reason)` and `writable.abort(reason)`. Use it to release
+    /// any resources the transformer holds (upstream handles, file descriptors, etc.).
+    ///
+    /// If this method returns `Err`, the cancel/abort promise rejects with that error.
+    fn cancel(
+        &mut self,
+        #[allow(unused)] reason: Option<String>,
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
+        future::ready(Ok(()))
+    }
 }
+
+// Type-erased channel for routing readable.cancel() into the transform task so
+// it can invoke Transformer::cancel(reason).  Using a separate channel (rather
+// than adding a Cancel variant to TransformCommand<I>) avoids making
+// TransformReadableSource generic over I, which would bleed into the public
+// ReadableStream type parameter.
+type CancelTx = UnboundedSender<(Option<String>, oneshot::Sender<StreamResult<()>>)>;
+type CancelRx = UnboundedReceiver<(Option<String>, oneshot::Sender<StreamResult<()>>)>;
 
 /// Readable source for the transform stream.
 ///
-/// Holds a reference to the writable controller so that when the readable side
-/// is cancelled (spec §6.3.4), the writable side is errored accordingly.
+/// Holds references to the writable controller and the cancel channel so that
+/// when the readable side is cancelled (spec §6.3.4), the writable side is
+/// errored and `Transformer::cancel()` is invoked in the transform task.
 pub struct TransformReadableSource<O: MaybeSend + 'static> {
     writable_controller: crate::platform::SharedPtr<WritableStreamDefaultController>,
+    cancel_tx: CancelTx,
     _phantom: std::marker::PhantomData<O>,
 }
 
 impl<O: MaybeSend + 'static> TransformReadableSource<O> {
     fn new(
         writable_controller: crate::platform::SharedPtr<WritableStreamDefaultController>,
+        cancel_tx: CancelTx,
     ) -> Self {
         Self {
             writable_controller,
+            cancel_tx,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -200,14 +228,21 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
     }
 
     async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
-        // Per WHATWG Streams spec §6.3.4: cancelling the readable side of a
-        // TransformStream must error the writable side with the cancel reason.
-        let error = match reason {
+        // Per spec §6.3.4: error the writable side with the cancel reason.
+        let error = match &reason {
             Some(r) => StreamError::from(r.as_str()),
             None => StreamError::Canceled,
         };
         self.writable_controller.error(error);
-        Ok(())
+
+        // Route the cancel reason into the transform task so it can call
+        // Transformer::cancel(reason). If the task is already gone, treat as Ok.
+        let (result_tx, result_rx) = oneshot::channel();
+        if self.cancel_tx.unbounded_send((reason, result_tx)).is_ok() {
+            result_rx.await.unwrap_or(Ok(()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -264,10 +299,15 @@ impl<I: MaybeSend + 'static> WritableSink<I> for TransformWritableSink<I> {
     }
 }
 
-/// Simple transform task
+/// Transform task — drives the transformer and handles commands from both sides.
+///
+/// Two channels are monitored concurrently with `select!`:
+/// - `transform_rx`: Write / Close / Abort commands from the writable sink
+/// - `cancel_rx`: cancel signal from the readable source when it is cancelled
 async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
     mut transformer: T,
     mut transform_rx: UnboundedReceiver<TransformCommand<I>>,
+    mut cancel_rx: CancelRx,
     mut controller: TransformStreamDefaultController<O>,
 ) where
     T: Transformer<I, O>,
@@ -278,40 +318,61 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
         return;
     }
 
-    // Process commands
-    while let Some(cmd) = transform_rx.next().await {
-        match cmd {
-            TransformCommand::Write { chunk, completion } => {
-                let result = transformer.transform(chunk, &mut controller).await;
-                match result {
-                    Ok(()) => {
-                        let _ = completion.send(Ok(()));
+    // Process commands from both channels concurrently.
+    loop {
+        futures::select! {
+            cmd = transform_rx.next().fuse() => {
+                match cmd {
+                    Some(TransformCommand::Write { chunk, completion }) => {
+                        let result = transformer.transform(chunk, &mut controller).await;
+                        match result {
+                            Ok(()) => { let _ = completion.send(Ok(())); }
+                            Err(error) => {
+                                let _ = controller.error(error.clone());
+                                let _ = completion.send(Err(error));
+                                break;
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let _ = controller.error(error.clone());
-                        let _ = completion.send(Err(error));
-                        break; // stop processing further writes
+
+                    Some(TransformCommand::Close { completion }) => {
+                        let flush_result = transformer.flush(&mut controller).await;
+                        if let Err(error) = flush_result {
+                            let _ = controller.error(error.clone());
+                            let _ = completion.send(Err(error));
+                        } else {
+                            let _ = controller.terminate();
+                            let _ = completion.send(Ok(()));
+                        }
+                        break;
                     }
+
+                    Some(TransformCommand::Abort { reason, completion }) => {
+                        // Call Transformer::cancel() — spec §6.3.2 uses the same
+                        // [[cancelAlgorithm]] for both readable.cancel() and writable.abort().
+                        let cancel_result = transformer.cancel(reason.clone()).await;
+                        // Error the readable side with the abort reason.
+                        // (The writable side is already being handled by the writable task.)
+                        let _ = controller.error(StreamError::Aborted(reason));
+                        // Per spec: abort() resolves/rejects with the cancel algorithm result.
+                        let _ = completion.send(cancel_result);
+                        break;
+                    }
+
+                    None => break,
                 }
             }
 
-            TransformCommand::Close { completion } => {
-                let flush_result = transformer.flush(&mut controller).await;
-                if let Err(error) = flush_result {
-                    let _ = controller.error(error.clone());
-                    let _ = completion.send(Err(error));
-                } else {
-                    let _ = controller.terminate();
-                    let _ = completion.send(Ok(()));
+            // readable.cancel() routes here so Transformer::cancel() is called.
+            cancel_msg = cancel_rx.next().fuse() => {
+                match cancel_msg {
+                    Some((reason, completion)) => {
+                        let result = transformer.cancel(reason).await;
+                        let _ = completion.send(result);
+                        break;
+                    }
+                    None => break,
                 }
-                break;
-            }
-
-            TransformCommand::Abort { reason, completion } => {
-                let error = StreamError::Aborted(reason);
-                let _ = controller.error(error.clone());
-                let _ = completion.send(Err(error));
-                break;
             }
         }
     }
@@ -682,9 +743,9 @@ mod tests {
         // Read one item
         assert_eq!(reader.read().await.unwrap(), Some("HELLO".to_string()));
 
-        // Abort the writer
+        // Per spec: abort() resolves with Ok — it's the readable that errors, not the abort call.
         let abort_result = writer.abort(Some("Test abort".to_string())).await;
-        assert!(abort_result.is_err()); // Abort should return error
+        assert!(abort_result.is_ok(), "abort() must resolve per spec");
 
         // Subsequent reads should fail
         let read_result = reader.read().await;
