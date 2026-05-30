@@ -108,9 +108,12 @@ pub struct ReadableStreamDefaultController<T: MaybeSend + 'static> {
     desired_size: SharedPtr<AtomicIsize>,
     closed: SharedPtr<AtomicBool>,
     errored: SharedPtr<AtomicBool>,
-    // Mirrors the spec's [[closeRequested]] flag. Set synchronously in close() so
-    // enqueue() can reject immediately — before the async task processes ControllerMsg::Close.
+    // Both flags are set synchronously by close()/error() so that enqueue(),
+    // close(), and error() can gate on them immediately — before the async
+    // task processes the corresponding ControllerMsg. This mirrors the spec's
+    // [[closeRequested]] flag and the synchronous state transitions in JS.
     close_requested: SharedPtr<AtomicBool>,
+    error_requested: SharedPtr<AtomicBool>,
 }
 
 impl<T: MaybeSend + 'static> Clone for ReadableStreamDefaultController<T> {
@@ -123,6 +126,7 @@ impl<T: MaybeSend + 'static> Clone for ReadableStreamDefaultController<T> {
             closed: self.closed.clone(),
             errored: self.errored.clone(),
             close_requested: self.close_requested.clone(),
+            error_requested: self.error_requested.clone(),
         }
     }
 }
@@ -136,6 +140,7 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
         closed: SharedPtr<AtomicBool>,
         errored: SharedPtr<AtomicBool>,
         close_requested: SharedPtr<AtomicBool>,
+        error_requested: SharedPtr<AtomicBool>,
     ) -> Self {
         Self {
             tx,
@@ -145,6 +150,7 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
             closed,
             errored,
             close_requested,
+            error_requested,
         }
     }
 
@@ -156,9 +162,19 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
         Some(self.desired_size.load(Ordering::Acquire))
     }
 
+    fn is_stream_unusable(&self) -> bool {
+        self.close_requested.load(Ordering::Acquire)
+            || self.closed.load(Ordering::Acquire)
+            || self.error_requested.load(Ordering::Acquire)
+            || self.errored.load(Ordering::Acquire)
+    }
+
     pub fn close(&self) -> StreamResult<()> {
-        // Set close_requested synchronously (spec §3.6.1 [[closeRequested]])
-        // so that any subsequent enqueue() calls are rejected immediately.
+        if self.is_stream_unusable() {
+            return Err(StreamError::from(
+                "Cannot close a ReadableStream that is already closed or errored",
+            ));
+        }
         self.close_requested.store(true, Ordering::Release);
         self.tx
             .unbounded_send(ControllerMsg::Close)
@@ -174,7 +190,7 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
                 "Cannot enqueue a chunk into a closed ReadableStream",
             ));
         }
-        if self.errored.load(Ordering::Acquire) {
+        if self.error_requested.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
             return Err(StreamError::from(
                 "Cannot enqueue a chunk into an errored ReadableStream",
             ));
@@ -187,6 +203,11 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
     }
 
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
+        // Per spec §3.6.5: if state is not "readable", return (no-op, no throw).
+        if self.is_stream_unusable() {
+            return Ok(());
+        }
+        self.error_requested.store(true, Ordering::Release);
         self.tx
             .unbounded_send(ControllerMsg::Error(error))
             .map_err(|_| StreamError::from("Failed to error stream"))?;
@@ -1203,6 +1224,7 @@ impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
         let inner = ReadableStreamInner::new(source, strategy);
 
         let close_requested = SharedPtr::new(AtomicBool::new(false));
+        let error_requested = SharedPtr::new(AtomicBool::new(false));
 
         let controller = ReadableStreamDefaultController::new(
             ctrl_tx.clone(),
@@ -1212,6 +1234,7 @@ impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
             SharedPtr::clone(&closed),
             SharedPtr::clone(&errored),
             SharedPtr::clone(&close_requested),
+            SharedPtr::clone(&error_requested),
         );
 
         let task_fut = readable_stream_task(

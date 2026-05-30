@@ -551,11 +551,8 @@ async fn controller_enqueue_on_errored_stream_returns_error() {
             &mut self,
             controller: &mut ReadableStreamDefaultController<u32>,
         ) -> StreamResult<()> {
-            // error() sends a ctrl message but doesn't set errored atomic synchronously.
-            // However enqueue() now also checks state via the async path.
-            // The key guarantee: once error() is called, the next enqueue() in the same
-            // pull() call sees errored=false still (async), BUT the stream will not
-            // surface the chunk — the error ctrl is processed first.
+            // error() sets error_requested synchronously before sending ControllerMsg::Error,
+            // so enqueue() in the same frame sees error_requested=true and returns Err.
             controller.error("boom".into())?;
             let ok = controller.enqueue(99u32).is_ok();
             *self.enqueue_result.lock().unwrap() = Some(ok);
@@ -569,12 +566,14 @@ async fn controller_enqueue_on_errored_stream_returns_error() {
     .spawn(tokio::spawn);
     let (_locked, reader) = stream.get_reader().unwrap();
     let result = reader.read().await;
-    // Stream errored — reads return Err
     assert!(result.is_err(), "read() on an errored stream must return Err");
     assert!(reader.read().await.is_err(), "subsequent reads must also return Err");
-    // Note: unlike close(), error() doesn't set an atomic synchronously, so
-    // enqueue() after error() in the same pull() call may return Ok (timing-dependent).
-    // The important guarantee is that the enqueued chunk is never surfaced to readers.
+
+    assert_eq!(
+        *enqueue_result.lock().unwrap(),
+        Some(false),
+        "enqueue() after error() must return Err (error_requested is set synchronously)"
+    );
 }
 
 // "ReadableStream: pull() is not invoked while the queue is at or above the HWM"
