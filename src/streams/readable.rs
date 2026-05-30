@@ -81,10 +81,6 @@ enum StreamCommand<T> {
     Read {
         completion: oneshot::Sender<StreamResult<Option<T>>>,
     },
-    ReadInto {
-        buffer: Vec<u8>,
-        completion: oneshot::Sender<StreamResult<(Vec<u8>, usize)>>,
-    },
     Cancel {
         reason: Option<String>,
         completion: oneshot::Sender<StreamResult<()>>,
@@ -243,7 +239,6 @@ struct ReadableStreamInner<T, Source> {
     cancel_reason: Option<String>,
     cancel_completions: Vec<oneshot::Sender<StreamResult<()>>>,
     pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<T>>>>,
-    pending_read_intos: VecDeque<(Vec<u8>, oneshot::Sender<StreamResult<(Vec<u8>, usize)>>)>,
     ready_wakers: WakerSet,
     closed_wakers: WakerSet,
     stored_error: Option<StreamError>,
@@ -262,7 +257,6 @@ impl<T: MaybeSend + 'static, Source> ReadableStreamInner<T, Source> {
             cancel_reason: None,
             cancel_completions: Vec::new(),
             pending_reads: VecDeque::new(),
-            pending_read_intos: VecDeque::new(),
             ready_wakers: WakerSet::new(),
             closed_wakers: WakerSet::new(),
             stored_error: None,
@@ -276,14 +270,6 @@ impl<T: MaybeSend + 'static, Source> ReadableStreamInner<T, Source> {
             .unwrap_or_else(|| StreamError::from("Stream is errored"))
     }
 
-    fn desired_size(&self) -> isize {
-        if self.state != StreamState::Readable {
-            return 0;
-        }
-        let hwm = self.strategy.high_water_mark() as isize;
-        let current = self.queue_total_size as isize;
-        hwm - current
-    }
 }
 
 // ----------- Main ReadableStream with Typestate -----------
@@ -307,30 +293,8 @@ where
 }
 
 impl<T: MaybeSend + 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
-    pub(crate) fn controller(&self) -> &ReadableStreamDefaultController<T> {
-        self.controller.as_ref()
-    }
-}
-
-impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
-    pub(crate) fn controller(&self) -> &ReadableByteStreamController {
-        self.controller.as_ref()
-    }
-}
-
-impl<T: MaybeSend + 'static, Source> ReadableStream<T, Source, DefaultStream, Unlocked> {
     pub fn locked(&self) -> bool {
         self.locked.load(Ordering::Acquire)
-    }
-
-    fn desired_size(&self) -> isize {
-        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
-            return 0;
-        }
-
-        let hwm = self.high_water_mark.load(Ordering::Acquire) as isize;
-        let current = self.queue_total_size.load(Ordering::Acquire) as isize;
-        hwm - current
     }
 }
 
@@ -437,12 +401,6 @@ where
 
 // ===== Tee implementation =====
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TeeSourceId {
-    Branch1,
-    Branch2,
-}
-
 #[derive(Debug, Clone)]
 enum TeeChunk<T> {
     Data(T),
@@ -543,7 +501,6 @@ impl AsyncSignal {
 
 pub struct TeeSource<T: MaybeSend + 'static> {
     chunk_rx: UnboundedReceiver<TeeChunk<T>>,
-    branch_id: TeeSourceId,
     branch_canceled: SharedPtr<AtomicBool>,
 
     // Optional fields used only for backpressure-aware modes.
@@ -1011,7 +968,6 @@ where
 
         let source1 = TeeSource {
             chunk_rx: branch1_rx,
-            branch_id: TeeSourceId::Branch1,
             branch_canceled: branch1_canceled,
             pending_count: branch1_pending,
             backpressure_signal: backpressure_signal.clone(),
@@ -1019,7 +975,6 @@ where
 
         let source2 = TeeSource {
             chunk_rx: branch2_rx,
-            branch_id: TeeSourceId::Branch2,
             branch_canceled: branch2_canceled,
             pending_count: branch2_pending,
             backpressure_signal,
@@ -1562,6 +1517,51 @@ where
         rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
+    /// Resolves when the next [`read()`] would return immediately — i.e. the queue
+    /// is non-empty, the stream is closed, or the stream is errored.
+    ///
+    /// Useful for back-pressure-aware producers that want to avoid building up an
+    /// unbounded queue of inflight reads.
+    pub fn ready(&self) -> impl Future<Output = StreamResult<()>> + '_ {
+        poll_fn(|cx| {
+            if self.0.errored.load(Ordering::Acquire) {
+                let error = self
+                    .0
+                    .stored_error
+                    .read()
+                    .clone()
+                    .unwrap_or_else(|| "Stream is errored".into());
+                return Poll::Ready(Err(error));
+            }
+            if self.0.closed.load(Ordering::Acquire)
+                || self.0.queue_total_size.load(Ordering::Acquire) > 0
+            {
+                return Poll::Ready(Ok(()));
+            }
+            let waker = cx.waker().clone();
+            let _ = self
+                .0
+                .command_tx
+                .unbounded_send(StreamCommand::RegisterReadyWaker { waker });
+            // Re-check after registration to close the race between checking and registering.
+            if self.0.errored.load(Ordering::Acquire) {
+                let error = self
+                    .0
+                    .stored_error
+                    .read()
+                    .clone()
+                    .unwrap_or_else(|| "Stream is errored".into());
+                return Poll::Ready(Err(error));
+            }
+            if self.0.closed.load(Ordering::Acquire)
+                || self.0.queue_total_size.load(Ordering::Acquire) > 0
+            {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        })
+    }
+
     pub async fn read(&self) -> StreamResult<Option<T>> {
         let (tx, rx) = oneshot::channel();
         self.0
@@ -1891,10 +1891,6 @@ async fn readable_stream_task<T: 'static, Source>(
                     if inner.state == StreamState::Closed || inner.state == StreamState::Errored {
                         inner.closed_wakers.wake_all();
                     }
-                }
-                StreamCommand::ReadInto { .. } => {
-                    // Default streams don't support ReadInto
-                    // This should probably be an error
                 }
             }
         }

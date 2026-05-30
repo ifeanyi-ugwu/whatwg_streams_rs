@@ -398,6 +398,40 @@ async fn start_can_enqueue_via_controller() {
     assert_eq!(reader.read().await.unwrap(), None);
 }
 
+// ── reader.ready() ────────────────────────────────────────────────────────────
+
+// "ReadableStream reader.ready() resolves when the queue has data"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn reader_ready_resolves_when_queue_has_data() {
+    let stream = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // Give the task time to pull data into the queue
+    tokio::task::yield_now().await;
+    reader.ready().await.unwrap();
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+}
+
+// "ReadableStream reader.ready() resolves immediately when stream is closed"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn reader_ready_resolves_when_stream_is_closed() {
+    let stream = ReadableStream::from_vec(Vec::<u32>::new()).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // drain to close
+    reader.ready().await.unwrap(); // closed → resolves Ok
+}
+
+// "ReadableStream reader.ready() rejects when stream is errored"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn reader_ready_rejects_when_stream_is_errored() {
+    let stream = ReadableStream::builder(FailingPullSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // trigger error
+    assert!(reader.ready().await.is_err());
+}
+
 // "ReadableStream: desired_size reflects HWM minus queue depth"
 #[cfg(feature = "send")]
 #[tokio::test]
