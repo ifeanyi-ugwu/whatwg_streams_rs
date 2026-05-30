@@ -1,4 +1,5 @@
 // WPT: streams/piping/
+// https://github.com/web-platform-tests/wpt/tree/master/streams/piping
 
 use crate::helpers::{CollectSink, FailAfterSink};
 use whatwg_streams::{
@@ -267,4 +268,118 @@ async fn pipe_through_chain() {
     assert_eq!(reader.read().await.unwrap(), Some(8));
     assert_eq!(reader.read().await.unwrap(), Some(12));
     assert_eq!(reader.read().await.unwrap(), None);
+}
+
+// ── WPT: piping/abort.any.js ──────────────────────────────────────────────────
+
+// "Piping: aborting via signal stops the pipe and returns an Aborted error"
+// Uses a pre-fired signal so the abort is deterministic: pipe_to checks the
+// signal at startup and immediately returns Err(Aborted) without any races.
+// (Mid-pipe abort requires cooperative source cancellation — tested separately
+// once the implementation supports interrupting an in-flight pull.)
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_signal_aborts_pipe() {
+    use futures::future::AbortHandle;
+    use whatwg_streams::StreamError;
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    abort_handle.abort(); // fire before the pipe even starts
+
+    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let sink = CollectSink::<u32> {
+        collected: Default::default(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    };
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let result = source
+        .pipe_to(
+            &dest,
+            Some(StreamPipeOptions {
+                signal: Some(abort_registration),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(StreamError::Aborted(_))),
+        "pipe_to should return Aborted when signal is pre-fired, got: {:?}",
+        result
+    );
+}
+
+// "Piping: abort signal fires before pipe starts — pipe errors immediately"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_pre_aborted_signal_errors_immediately() {
+    use futures::future::AbortHandle;
+    use whatwg_streams::StreamError;
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    // Fire the signal before piping even starts
+    abort_handle.abort();
+
+    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let sink = CollectSink::<u32> {
+        collected: Default::default(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    };
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let result = source
+        .pipe_to(
+            &dest,
+            Some(StreamPipeOptions {
+                signal: Some(abort_registration),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(StreamError::Aborted(_))),
+        "pre-fired signal should cause immediate Aborted error, got: {:?}",
+        result
+    );
+}
+
+// "Piping: prevent_abort=true — destination is not aborted when signal fires"
+// Uses a pre-fired signal for determinism (same reasoning as pipe_to_signal_aborts_pipe).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
+    use futures::future::AbortHandle;
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    abort_handle.abort(); // fire before pipe starts
+
+    let aborted = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let sink = CollectSink::<u32> {
+        collected: Default::default(),
+        closed: Default::default(),
+        aborted: aborted.clone(),
+    };
+
+    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let _ = source
+        .pipe_to(
+            &dest,
+            Some(StreamPipeOptions {
+                signal: Some(abort_registration),
+                prevent_abort: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    assert!(
+        aborted.lock().unwrap().is_none(),
+        "destination should NOT be aborted when prevent_abort=true"
+    );
 }
