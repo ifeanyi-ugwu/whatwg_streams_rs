@@ -108,6 +108,9 @@ pub struct ReadableStreamDefaultController<T: MaybeSend + 'static> {
     desired_size: SharedPtr<AtomicIsize>,
     closed: SharedPtr<AtomicBool>,
     errored: SharedPtr<AtomicBool>,
+    // Mirrors the spec's [[closeRequested]] flag. Set synchronously in close() so
+    // enqueue() can reject immediately — before the async task processes ControllerMsg::Close.
+    close_requested: SharedPtr<AtomicBool>,
 }
 
 impl<T: MaybeSend + 'static> Clone for ReadableStreamDefaultController<T> {
@@ -119,6 +122,7 @@ impl<T: MaybeSend + 'static> Clone for ReadableStreamDefaultController<T> {
             desired_size: self.desired_size.clone(),
             closed: self.closed.clone(),
             errored: self.errored.clone(),
+            close_requested: self.close_requested.clone(),
         }
     }
 }
@@ -131,6 +135,7 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
         desired_size: SharedPtr<AtomicIsize>,
         closed: SharedPtr<AtomicBool>,
         errored: SharedPtr<AtomicBool>,
+        close_requested: SharedPtr<AtomicBool>,
     ) -> Self {
         Self {
             tx,
@@ -139,6 +144,7 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
             desired_size,
             closed,
             errored,
+            close_requested,
         }
     }
 
@@ -151,6 +157,9 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
     }
 
     pub fn close(&self) -> StreamResult<()> {
+        // Set close_requested synchronously (spec §3.6.1 [[closeRequested]])
+        // so that any subsequent enqueue() calls are rejected immediately.
+        self.close_requested.store(true, Ordering::Release);
         self.tx
             .unbounded_send(ControllerMsg::Close)
             .map_err(|_| StreamError::from("Failed to close stream"))?;
@@ -158,11 +167,17 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
     }
 
     pub fn enqueue(&self, chunk: T) -> StreamResult<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(StreamError::from("Stream is closed"));
+        // Per spec §3.6.4: ReadableStreamDefaultControllerCanCloseOrEnqueue
+        // returns false when closeRequested or state is not "readable".
+        if self.close_requested.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            return Err(StreamError::from(
+                "Cannot enqueue a chunk into a closed ReadableStream",
+            ));
         }
         if self.errored.load(Ordering::Acquire) {
-            return Err(StreamError::from("Stream is errored"));
+            return Err(StreamError::from(
+                "Cannot enqueue a chunk into an errored ReadableStream",
+            ));
         }
 
         self.tx
@@ -1187,6 +1202,8 @@ impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
 
         let inner = ReadableStreamInner::new(source, strategy);
 
+        let close_requested = SharedPtr::new(AtomicBool::new(false));
+
         let controller = ReadableStreamDefaultController::new(
             ctrl_tx.clone(),
             SharedPtr::clone(&queue_total_size),
@@ -1194,6 +1211,7 @@ impl<T: MaybeSend + 'static, Source: ReadableSource<T>>
             SharedPtr::clone(&desired_size),
             SharedPtr::clone(&closed),
             SharedPtr::clone(&errored),
+            SharedPtr::clone(&close_requested),
         );
 
         let task_fut = readable_stream_task(
