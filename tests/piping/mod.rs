@@ -273,20 +273,27 @@ async fn pipe_through_chain() {
 // ── WPT: piping/abort.any.js ──────────────────────────────────────────────────
 
 // "Piping: aborting via signal stops the pipe and returns an Aborted error"
-// Uses a pre-fired signal so the abort is deterministic: pipe_to checks the
-// signal at startup and immediately returns Err(Aborted) without any races.
-// (Mid-pipe abort requires cooperative source cancellation — tested separately
-// once the implementation supports interrupting an in-flight pull.)
+// Source blocks forever in pull() — this is the exact scenario that previously
+// deadlocked when the signal fired and pipe_to called reader.cancel().
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_aborts_pipe() {
     use futures::future::AbortHandle;
     use whatwg_streams::StreamError;
 
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
-    abort_handle.abort(); // fire before the pipe even starts
+    struct BlockingSource;
+    impl ReadableSource<u32> for BlockingSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+    }
 
-    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let source = ReadableStream::builder(BlockingSource).spawn(tokio::spawn);
     let sink = CollectSink::<u32> {
         collected: Default::default(),
         closed: Default::default(),
@@ -294,19 +301,30 @@ async fn pipe_to_signal_aborts_pipe() {
     };
     let dest = WritableStream::builder(sink).spawn(tokio::spawn);
 
-    let result = source
-        .pipe_to(
-            &dest,
-            Some(StreamPipeOptions {
-                signal: Some(abort_registration),
-                ..Default::default()
-            }),
-        )
-        .await;
+    let pipe = tokio::spawn(async move {
+        source
+            .pipe_to(
+                &dest,
+                Some(StreamPipeOptions {
+                    signal: Some(abort_registration),
+                    ..Default::default()
+                }),
+            )
+            .await
+    });
 
+    // Let the pipe start and the source enter its blocking pull()
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Fire abort while source is stuck — previously this deadlocked because
+    // reader.cancel() could not resolve while pull_future was in flight.
+    abort_handle.abort();
+
+    let result = pipe.await.unwrap();
     assert!(
         matches!(result, Err(StreamError::Aborted(_))),
-        "pipe_to should return Aborted when signal is pre-fired, got: {:?}",
+        "pipe_to should return Aborted when signal fires during in-flight pull, got: {:?}",
         result
     );
 }
@@ -348,15 +366,23 @@ async fn pipe_to_pre_aborted_signal_errors_immediately() {
 }
 
 // "Piping: prevent_abort=true — destination is not aborted when signal fires"
-// Uses a pre-fired signal for determinism (same reasoning as pipe_to_signal_aborts_pipe).
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
     use futures::future::AbortHandle;
 
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
-    abort_handle.abort(); // fire before pipe starts
+    struct BlockingSource;
+    impl ReadableSource<u32> for BlockingSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+    }
 
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
     let aborted = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let sink = CollectSink::<u32> {
         collected: Default::default(),
@@ -364,20 +390,27 @@ async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
         aborted: aborted.clone(),
     };
 
-    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let source = ReadableStream::builder(BlockingSource).spawn(tokio::spawn);
     let dest = WritableStream::builder(sink).spawn(tokio::spawn);
 
-    let _ = source
-        .pipe_to(
-            &dest,
-            Some(StreamPipeOptions {
-                signal: Some(abort_registration),
-                prevent_abort: true,
-                ..Default::default()
-            }),
-        )
-        .await;
+    let pipe = tokio::spawn(async move {
+        source
+            .pipe_to(
+                &dest,
+                Some(StreamPipeOptions {
+                    signal: Some(abort_registration),
+                    prevent_abort: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+    });
 
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    abort_handle.abort();
+
+    let _ = pipe.await.unwrap();
     assert!(
         aborted.lock().unwrap().is_none(),
         "destination should NOT be aborted when prevent_abort=true"

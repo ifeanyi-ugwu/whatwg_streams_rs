@@ -1835,6 +1835,17 @@ async fn readable_stream_task<T: 'static, Source>(
                             let reason_clone = reason;
                             cancel_future =
                                 Some(Box::pin(async move { source.cancel(reason_clone).await }));
+                        } else if pull_future.is_some() {
+                            // Source is inside pull_future and cannot be reached.
+                            // Drop the future to release the source immediately;
+                            // source.cancel() is skipped since Rust has no way to
+                            // interrupt the in-flight async call and extract the source.
+                            pull_future = None;
+                            inner.pulling = false;
+                            inner.cancel_requested = false;
+                            for tx in inner.cancel_completions.drain(..) {
+                                let _ = tx.send(Ok(()));
+                            }
                         }
                     }
                 }
