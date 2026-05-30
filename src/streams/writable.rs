@@ -1370,6 +1370,33 @@ where
         rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
+    /// Wait until every chunk currently enqueued (and any chunk in-flight) has been
+    /// processed by the underlying sink.
+    ///
+    /// Unlike [`close()`], this does not tear the stream down — the writer remains
+    /// usable after `flush` returns. Use this when a long-lived producer needs a
+    /// mid-life barrier: "everything I've handed off so far is now in the sink."
+    ///
+    /// [`ready()`] does not answer the same question: it signals that the stream can
+    /// accept more data, not that prior writes have landed.
+    ///
+    /// **Not part of the WHATWG Streams specification.** The spec exposes only
+    /// `close()` on the writer. This helper is provided for the same reason as
+    /// [`enqueue_when_ready()`] — convenience that the spec intentionally omits but
+    /// Rust callers routinely need.
+    ///
+    /// [`close()`]: Self::close
+    /// [`ready()`]: Self::ready
+    /// [`enqueue_when_ready()`]: Self::enqueue_when_ready
+    pub async fn flush(&self) -> StreamResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.stream
+            .command_tx
+            .unbounded_send(StreamCommand::Flush { completion: tx })
+            .map_err(|_| StreamError::TaskDropped)?;
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
+    }
+
     /// Abort the stream asynchronously with an optional reason
     pub async fn abort(&self, reason: Option<String>) -> StreamResult<()> {
         let (tx, rx) = oneshot::channel();
