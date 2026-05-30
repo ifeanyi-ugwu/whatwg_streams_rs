@@ -1678,6 +1678,35 @@ fn update_desired_size(
     desired_size.store(new_desired_size, Ordering::Release);
 }
 
+// Drives source.pull() while also listening for an internal cancel signal.
+//
+// Using select! here means that when the cancel channel fires, the pull future
+// is dropped (releasing the &mut borrow on source), and the source is returned
+// to the caller intact. This lets the task call source.cancel() afterwards
+// without ever losing access to the source — no API change to ReadableSource needed.
+async fn pull_with_cancel<T, Source>(
+    source: &mut Source,
+    controller: &mut ReadableStreamDefaultController<T>,
+    cancel: oneshot::Receiver<()>,
+) -> StreamResult<()>
+where
+    T: MaybeSend + 'static,
+    Source: ReadableSource<T>,
+{
+    use futures::FutureExt;
+
+    let pull_fut = source.pull(controller).fuse();
+    let mut cancel_fut = cancel.fuse();
+    futures::pin_mut!(pull_fut);
+
+    futures::select! {
+        r = pull_fut => r,
+        // Cancel signal fired — return Ok so the caller treats this as a clean
+        // early exit rather than a stream error.
+        _ = cancel_fut => Ok(()),
+    }
+}
+
 // ----------- Stream Task Implementation -----------
 async fn readable_stream_task<T: 'static, Source>(
     mut command_rx: UnboundedReceiver<StreamCommand<T>>,
@@ -1722,6 +1751,9 @@ async fn readable_stream_task<T: 'static, Source>(
     let mut pull_future: Option<
         crate::platform::PlatformBoxFutureStatic<(Source, StreamResult<()>)>,
     > = None;
+    // Sender half of the in-flight pull's cancel channel. Dropping it signals
+    // pull_with_cancel to abort the pull and return the source cleanly.
+    let mut pull_cancel_tx: Option<oneshot::Sender<()>> = None;
     let mut cancel_future: Option<crate::platform::PlatformBoxFutureStatic<StreamResult<()>>> =
         None;
 
@@ -1835,17 +1867,13 @@ async fn readable_stream_task<T: 'static, Source>(
                             let reason_clone = reason;
                             cancel_future =
                                 Some(Box::pin(async move { source.cancel(reason_clone).await }));
-                        } else if pull_future.is_some() {
-                            // Source is inside pull_future and cannot be reached.
-                            // Drop the future to release the source immediately;
-                            // source.cancel() is skipped since Rust has no way to
-                            // interrupt the in-flight async call and extract the source.
-                            pull_future = None;
-                            inner.pulling = false;
-                            inner.cancel_requested = false;
-                            for tx in inner.cancel_completions.drain(..) {
-                                let _ = tx.send(Ok(()));
-                            }
+                        } else if let Some(tx) = pull_cancel_tx.take() {
+                            // Source is inside pull_with_cancel. Signal the cancel channel:
+                            // pull_with_cancel will drop the pull future (releasing source)
+                            // and return Ok(()), restoring source to inner.source.
+                            // The poll_fn re-enters and the Ok(()) branch below starts
+                            // cancel_future so source.cancel() is called normally.
+                            drop(tx);
                         }
                     }
                 }
@@ -1894,10 +1922,12 @@ async fn readable_stream_task<T: 'static, Source>(
         {
             if let Some(source) = inner.source.take() {
                 inner.pulling = true;
-                let mut controller = controller.clone();
+                let mut ctrl = controller.clone();
+                let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                pull_cancel_tx = Some(cancel_tx);
                 pull_future = Some(Box::pin(async move {
                     let mut source = source;
-                    let result = source.pull(&mut controller).await;
+                    let result = pull_with_cancel(&mut source, &mut ctrl, cancel_rx).await;
                     (source, result)
                 }));
             }
@@ -1908,12 +1938,14 @@ async fn readable_stream_task<T: 'static, Source>(
             match fut.as_mut().poll(cx) {
                 Poll::Ready((source, result)) => {
                     inner.pulling = false;
+                    pull_cancel_tx = None; // pull is done; cancel channel no longer needed
                     match result {
                         Ok(()) => {
+                            // This branch covers both normal pull completion AND the case
+                            // where pull_with_cancel returned Ok(()) because the cancel
+                            // signal fired. Either way, source is back and cancel_future
+                            // can be started if cancel was requested.
                             inner.source = Some(source);
-                            // Cancel may have arrived while this pull was in flight.
-                            // The Cancel command handler couldn't set cancel_future then
-                            // (source was None). Start it now that source is back.
                             if inner.cancel_requested && cancel_future.is_none() {
                                 if let Some(mut src) = inner.source.take() {
                                     let reason = inner.cancel_reason.clone();

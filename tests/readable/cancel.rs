@@ -103,45 +103,56 @@ async fn stream_cancel_on_locked_stream_rejects() {
     );
 }
 
-// "ReadableStream: cancel() while pull() is blocking resolves without deadlock"
+// "ReadableStream: cancel() while pull() is in flight calls source.cancel() with the reason"
 //
-// When cancel() arrives while the source is blocked inside pull_future, the
-// implementation drops the pull_future immediately (releasing the source) and
-// resolves the cancel completion. source.cancel() is NOT called — the source is
-// unreachable once it is inside the async pull future.
-//
-// Contrast with `cancel_reason_passed_to_source`: there pull() completes BEFORE
-// the cancel command is processed, so the source is back in inner.source and
-// source.cancel() IS called normally.
+// pull_with_cancel uses select! so when the cancel signal fires, the pull future
+// is dropped (releasing the &mut source borrow) and source is returned to the
+// task. The task then calls source.cancel() normally — fully spec-compliant,
+// no API change to ReadableSource required.
 #[cfg(feature = "send")]
 #[tokio::test]
-async fn cancel_while_pull_blocking_resolves_immediately() {
-    struct BlockingSource;
+async fn cancel_while_pull_in_flight_calls_source_cancel() {
+    use std::sync::{Arc, Mutex};
+
+    let cancel_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    struct BlockingSource {
+        cancel_reason: Arc<Mutex<Option<String>>>,
+    }
 
     impl ReadableSource<u32> for BlockingSource {
         async fn pull(
             &mut self,
             _controller: &mut ReadableStreamDefaultController<u32>,
         ) -> StreamResult<()> {
-            // Block forever — simulates a slow I/O source
             futures::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_reason.lock().unwrap() = reason;
             Ok(())
         }
     }
 
-    let stream = ReadableStream::builder(BlockingSource).spawn(tokio::spawn);
+    let source = BlockingSource {
+        cancel_reason: cancel_reason.clone(),
+    };
+    let stream = ReadableStream::builder(source).spawn(tokio::spawn);
     let (_locked, reader) = stream.get_reader().unwrap();
 
-    // Spawn cancel so the test can drive both the cancel and the stream task.
     let cancel_fut = tokio::spawn(async move {
         reader.cancel(Some("in-flight".into())).await
     });
 
-    // Let the stream task start and enter pull() (which blocks forever).
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
-    // Without the fix this would deadlock. The fix drops pull_future and resolves
-    // cancel immediately.
     cancel_fut.await.unwrap().unwrap();
+
+    assert_eq!(
+        cancel_reason.lock().unwrap().as_deref(),
+        Some("in-flight"),
+        "source.cancel() must be called even when cancel() arrived during a blocking pull()"
+    );
 }
