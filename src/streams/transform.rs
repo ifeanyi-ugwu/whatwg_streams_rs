@@ -55,12 +55,15 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
 
-        let readable_source = TransformReadableSource::new();
+        // Writable is created first so its controller can be handed to the readable
+        // source — the readable source's cancel() needs it to error the writable side
+        // per spec §6.3.4 (cancelling the readable errors the writable).
         let writable_sink = TransformWritableSink::new(transform_tx);
+        let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
 
+        let readable_source = TransformReadableSource::new(writable.controller.clone());
         let (readable, readable_fut) =
             ReadableStream::new_inner(readable_source, readable_strategy);
-        let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
 
         let controller = TransformStreamDefaultController::new(
             readable.controller.clone(),
@@ -168,14 +171,21 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
     }
 }
 
-/// Readable source for the transform stream
+/// Readable source for the transform stream.
+///
+/// Holds a reference to the writable controller so that when the readable side
+/// is cancelled (spec §6.3.4), the writable side is errored accordingly.
 pub struct TransformReadableSource<O: MaybeSend + 'static> {
+    writable_controller: crate::platform::SharedPtr<WritableStreamDefaultController>,
     _phantom: std::marker::PhantomData<O>,
 }
 
 impl<O: MaybeSend + 'static> TransformReadableSource<O> {
-    fn new() -> Self {
+    fn new(
+        writable_controller: crate::platform::SharedPtr<WritableStreamDefaultController>,
+    ) -> Self {
         Self {
+            writable_controller,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -186,6 +196,17 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
         &mut self,
         _controller: &mut ReadableStreamDefaultController<O>,
     ) -> StreamResult<()> {
+        Ok(())
+    }
+
+    async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
+        // Per WHATWG Streams spec §6.3.4: cancelling the readable side of a
+        // TransformStream must error the writable side with the cancel reason.
+        let error = match reason {
+            Some(r) => StreamError::from(r.as_str()),
+            None => StreamError::Canceled,
+        };
+        self.writable_controller.error(error);
         Ok(())
     }
 }

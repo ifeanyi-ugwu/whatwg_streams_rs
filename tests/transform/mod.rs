@@ -406,13 +406,9 @@ async fn controller_desired_size_reflects_readable_hwm() {
 // ── WPT: transform-streams/cancel.any.js ─────────────────────────────────────
 // https://github.com/web-platform-tests/wpt/blob/master/streams/transform-streams/cancel.any.js
 
-// "TransformStream: cancelling the readable side errors the writable side"
-// SPEC GAP: TransformReadableSource::cancel() is a no-op — it does not propagate
-// the cancellation to the writable side. The spec requires that cancelling the
-// readable side errors the writable side with the cancel reason.
+// "TransformStream: cancelling the readable side errors the writable side" (spec §6.3.4)
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore = "spec gap: readable cancel does not propagate to writable side of TransformStream"]
 async fn cancel_readable_errors_writable() {
     let ts = TransformStream::builder(DoubleT).spawn(tokio::spawn);
     let (readable, writable) = ts.split();
@@ -431,7 +427,6 @@ async fn cancel_readable_errors_writable() {
 // "TransformStream: cancelling the readable side with a reason passes that reason to the writable"
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore = "spec gap: readable cancel does not propagate to writable side of TransformStream"]
 async fn cancel_readable_reason_propagates_to_writable() {
     use std::sync::{Arc, Mutex};
 
@@ -457,14 +452,19 @@ async fn cancel_readable_reason_propagates_to_writable() {
     })
     .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
-    let (_locked, _writer) = writable.get_writer().unwrap();
+    let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
 
     reader.cancel(Some("the reason".into())).await.unwrap();
 
-    drop(error_reason); // suppress unused warning
-    // Per spec: writable should be errored with "the reason"
-    // (not testable until the gap is fixed)
+    // Writable must be errored — write() should fail
+    let write_err = writer.write(1u32).await.unwrap_err();
+    // The error message should reflect the cancel reason
+    assert!(
+        write_err.to_string().contains("the reason"),
+        "writable error should contain the cancel reason, got: {write_err}"
+    );
+    drop(error_reason);
 }
 
 // "TransformStream: read() after readable.cancel() returns None"

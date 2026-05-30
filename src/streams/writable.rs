@@ -1616,6 +1616,7 @@ fn process_controller_msgs<T, Sink>(
         match msg {
             ControllerMsg::Error(err) => {
                 inner.state = StreamState::Errored;
+                *inner.stored_error.write() = Some(err.clone());
                 inner.abort_reason = Some(format!("Controller error: {:?}", err));
                 inner.queue.clear();
                 inner.queue_total_size = 0;
