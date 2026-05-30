@@ -339,6 +339,10 @@ where
     S: StreamTypeMarker,
 {
     pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
+        // Per WHATWG Streams spec §3.3.3 step 1.
+        if self.locked.load(Ordering::Acquire) {
+            return Err(StreamError::from("Cannot cancel a locked ReadableStream"));
+        }
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .unbounded_send(StreamCommand::Cancel {
@@ -1896,6 +1900,16 @@ async fn readable_stream_task<T: 'static, Source>(
                     match result {
                         Ok(()) => {
                             inner.source = Some(source);
+                            // Cancel may have arrived while this pull was in flight.
+                            // The Cancel command handler couldn't set cancel_future then
+                            // (source was None). Start it now that source is back.
+                            if inner.cancel_requested && cancel_future.is_none() {
+                                if let Some(mut src) = inner.source.take() {
+                                    let reason = inner.cancel_reason.clone();
+                                    cancel_future =
+                                        Some(Box::pin(async move { src.cancel(reason).await }));
+                                }
+                            }
                         }
                         Err(err) => {
                             inner.state = StreamState::Errored;
@@ -1907,6 +1921,14 @@ async fn readable_stream_task<T: 'static, Source>(
                             }
                             while let Some(tx) = inner.pending_reads.pop_front() {
                                 let _ = tx.send(Err(err.clone()));
+                            }
+                            // Pull failed while cancel was pending: stream is now errored,
+                            // source is dropped, so resolve cancel completions immediately.
+                            if inner.cancel_requested {
+                                inner.cancel_requested = false;
+                                for tx in inner.cancel_completions.drain(..) {
+                                    let _ = tx.send(Ok(()));
+                                }
                             }
                             inner.closed_wakers.wake_all();
                             inner.ready_wakers.wake_all();
