@@ -103,6 +103,27 @@ impl fmt::Display for StreamError {
     }
 }
 
+impl PartialEq for StreamError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Canceled, Self::Canceled) => true,
+            (Self::Closing, Self::Closing) => true,
+            (Self::Closed, Self::Closed) => true,
+            (Self::TaskDropped, Self::TaskDropped) => true,
+            (Self::Aborted(a), Self::Aborted(b)) => a == b,
+            // Two `Other` errors are equal only if they wrap the same allocation.
+            // Comparing by Display would be misleading (different errors can format identically).
+            #[cfg(feature = "send")]
+            (Self::Other(a), Self::Other(b)) => std::sync::Arc::ptr_eq(a, b),
+            #[cfg(feature = "local")]
+            (Self::Other(a), Self::Other(b)) => std::rc::Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for StreamError {}
+
 impl Error for StreamError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
