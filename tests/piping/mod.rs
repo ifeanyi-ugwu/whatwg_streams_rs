@@ -164,7 +164,12 @@ async fn pipe_to_source_error_aborts_dest() {
     .spawn(tokio::spawn);
     let dest = WritableStream::builder(sink).spawn(tokio::spawn);
     assert!(source.pipe_to(&dest, None).await.is_err());
-    assert!(aborted.lock().unwrap().is_some());
+    let abort_reason = aborted.lock().unwrap().clone();
+    assert!(abort_reason.is_some(), "destination must be aborted when source errors");
+    assert!(
+        abort_reason.unwrap().contains("source error"),
+        "abort reason must carry the source error message"
+    );
 }
 
 // "Piping: prevent_abort=true keeps destination alive when source errors"
@@ -410,10 +415,13 @@ async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
     tokio::task::yield_now().await;
     abort_handle.abort();
 
-    let _ = pipe.await.unwrap();
+    assert!(
+        pipe.await.unwrap().is_err(),
+        "pipe must reject when the abort signal fires"
+    );
     assert!(
         aborted.lock().unwrap().is_none(),
-        "destination should NOT be aborted when prevent_abort=true"
+        "destination must NOT be aborted when prevent_abort=true"
     );
 }
 
@@ -500,9 +508,12 @@ async fn pipe_to_dest_error_reason_passed_to_source_cancel() {
 
     let _ = source.pipe_to(&dest, None).await;
 
-    // The cancel reason should be derived from the sink write error
-    let reason = cancel_reason.lock().unwrap().clone();
-    assert!(reason.is_some(), "cancel reason should be set");
+    // Cancel reason must equal the sink write error forwarded by the pipe
+    let reason = cancel_reason.lock().unwrap().clone().expect("cancel reason must be set");
+    assert!(
+        reason.contains("sink write failed"),
+        "cancel reason must carry the sink error message, got: {reason:?}"
+    );
 }
 
 // "Piping: prevent_cancel=true prevents source cancellation when dest errors"

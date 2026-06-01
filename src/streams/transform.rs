@@ -154,9 +154,17 @@ impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
         Ok(())
     }
 
-    /// Get desired size to fill the readable side of the stream's internal queue
+    /// Get desired size to fill the readable side of the stream's internal queue.
+    ///
+    /// Computed from the SpaceSignal's `pending` counter rather than the readable
+    /// controller's async-updated atomic, so the value is accurate immediately
+    /// after `enqueue()` within the same `transform()` call.
     pub fn desired_size(&self) -> Option<isize> {
-        self.readable_controller.desired_size()
+        if self.readable_controller.is_closed_or_errored() {
+            return None;
+        }
+        let pending = self.space_signal.pending.load(std::sync::atomic::Ordering::Acquire);
+        Some(self.space_signal.hwm as isize - pending as isize)
     }
 
     pub(super) async fn wait_for_readable_space(&self) {

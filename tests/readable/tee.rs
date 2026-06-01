@@ -103,12 +103,49 @@ async fn tee_cancelling_one_branch_does_not_affect_the_other() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn tee_cancelling_both_branches_cancels_original() {
-    let stream = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    use std::sync::{Arc, Mutex};
+
+    let cancel_count = Arc::new(Mutex::new(0u32));
+    let cancel_count2 = cancel_count.clone();
+
+    struct TrackingSource {
+        cancel_count: Arc<Mutex<u32>>,
+    }
+
+    impl ReadableSource<u32> for TrackingSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            controller.enqueue(3)?;
+            Ok(())
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_count.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(TrackingSource {
+        cancel_count: cancel_count2,
+    })
+    .spawn(tokio::spawn);
     let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
     let (_locked, r1) = branch1.get_reader().unwrap();
     let (_locked, r2) = branch2.get_reader().unwrap();
+
     r1.cancel(None).await.unwrap();
     r2.cancel(None).await.unwrap();
+
+    // Both branches cancelled → source cancel() must have been called exactly once
+    assert_eq!(
+        *cancel_count.lock().unwrap(),
+        1,
+        "source cancel() must be invoked exactly once when both tee branches cancel"
+    );
 }
 
 // "ReadableStream tee(): error from source propagates to both branches"
@@ -127,13 +164,20 @@ async fn tee_source_error_propagates_to_both_branches() {
     let (_locked, r2) = branch2.get_reader().unwrap();
 
     assert_eq!(r1.read().await.unwrap(), Some(1));
-    assert!(r1.read().await.is_err());
+    let err1 = r1.read().await.expect_err("r1 should receive the source error");
 
-    match r2.read().await {
-        Ok(Some(_)) => assert!(r2.read().await.is_err()),
-        Ok(None) => panic!("expected error or chunk, got EOF"),
-        Err(_) => {}
-    }
+    // r2 may deliver the buffered chunk before the error, or error immediately
+    let err2 = match r2.read().await {
+        Ok(Some(_)) => r2.read().await.expect_err("r2 second read should be the source error"),
+        Err(e) => e,
+        Ok(None) => panic!("expected source error, got EOF on r2"),
+    };
+
+    assert_eq!(
+        err1.to_string(),
+        err2.to_string(),
+        "both tee branches must receive the same source error"
+    );
 }
 
 // "ReadableStream tee(): SlowestConsumer mode requires concurrent consumption"

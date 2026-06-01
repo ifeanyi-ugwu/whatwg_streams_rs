@@ -706,13 +706,13 @@ async fn transform_desired_size_reflects_readable_hwm() {
     while reader.read().await.unwrap().is_some() {}
 
     let recorded = sizes.lock().unwrap().clone();
-    // Before first enqueue: desiredSize=2; after: desiredSize=1
-    // Before second enqueue: desiredSize=1 (or depends on consumption); after: desiredSize=0
-    assert!(!recorded.is_empty(), "desired_size should have been recorded");
-    // First transform: before enqueue, desiredSize should be positive (HWM=2)
-    assert!(
-        recorded[0].unwrap_or(0) > 0,
-        "desired_size should be positive before any enqueue (HWM=2)"
+    // HWM=2, two transforms each recording [before_enqueue, after_enqueue].
+    // desired_size is computed synchronously from the SpaceSignal pending counter,
+    // so values are exact regardless of async readable-task scheduling.
+    assert_eq!(
+        recorded,
+        vec![Some(2), Some(1), Some(1), Some(0)],
+        "desired_size must track HWM minus pending enqueues exactly"
     );
 }
 
@@ -737,14 +737,11 @@ async fn transform_desired_size_goes_negative_when_over_hwm() {
             controller: &mut TransformStreamDefaultController<u32>,
         ) -> StreamResult<()> {
             // Enqueue 3 items on a HWM=1 readable — desired_size goes negative.
-            // enqueue() sends ctrl messages to the readable task asynchronously.
-            // Yield so the readable task processes them and updates the atomic
-            // before we read desired_size().
+            // desired_size() is computed synchronously from the SpaceSignal pending
+            // counter, so no yield is needed.
             controller.enqueue(1u32)?;
             controller.enqueue(2u32)?;
             controller.enqueue(3u32)?;
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
             *self.final_size.lock().unwrap() = controller.desired_size();
             controller.terminate()?;
             Ok(())
@@ -765,10 +762,11 @@ async fn transform_desired_size_goes_negative_when_over_hwm() {
     // Consume all output
     while reader.read().await.unwrap().is_some() {}
 
-    let ds = final_size.lock().unwrap().unwrap_or(0);
-    assert!(
-        ds < 0,
-        "desired_size must go negative when more than HWM chunks are enqueued (got {ds})"
+    // HWM=1, 3 items enqueued → desired_size = 1 - 3 = -2
+    assert_eq!(
+        final_size.lock().unwrap().unwrap(),
+        -2,
+        "desired_size must equal HWM - pending (1 - 3 = -2)"
     );
 }
 

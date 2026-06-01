@@ -71,10 +71,13 @@ async fn ready_is_pending_during_backpressure() {
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
-    // Verify ready() works (doesn't panic regardless of backpressure state)
+    // ready() must be Pending while backpressure is active (queue at HWM=1)
     {
         use futures::FutureExt;
-        let _ = writer.ready().now_or_never();
+        assert!(
+            writer.ready().now_or_never().is_none(),
+            "ready() must return Pending when the writable queue is at HWM"
+        );
     }
 
     unblock.notify_one();
