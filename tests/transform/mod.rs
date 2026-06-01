@@ -868,3 +868,128 @@ async fn transform_no_backpressure_when_reader_keeps_up() {
     }
     assert_eq!(out, vec![2, 4, 6, 8, 10]);
 }
+
+// "transform() should keep being called as long as there is no backpressure"
+// A transformer that discards all chunks never enqueues, so pending stays 0,
+// has_space stays true, and all writes complete immediately.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn transform_discard_keeps_all_writes_completing() {
+    use whatwg_streams::CountQueuingStrategy;
+
+    struct DiscardT;
+    impl Transformer<u32, u32> for DiscardT {
+        async fn transform(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(()) // discard — never enqueues
+        }
+    }
+
+    let ts = TransformStream::builder(DiscardT)
+        .readable_strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (_readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+
+    // All 4 writes must complete — discard means no backpressure ever builds
+    for i in 0u32..4 {
+        writer.write(i).await.unwrap();
+    }
+}
+
+// "writer.closed should resolve after readable is canceled"
+// WPT: backpressure.any.js — tests 8 and 10
+// Cancelling the readable errors the writable, which should cause writer.closed() to reject.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn writer_closed_rejects_after_readable_cancel() {
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(whatwg_streams::CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    reader
+        .cancel(Some("consumer cancelled".into()))
+        .await
+        .unwrap();
+
+    // Readable cancel errors the writable — writer.closed() must reject
+    assert!(
+        writer.closed().await.is_err(),
+        "writer.closed() must reject after the readable side is cancelled"
+    );
+}
+
+// "cancelling the readable should cause a pending write to resolve"
+// WPT: backpressure.any.js test 11
+// A write blocked by backpressure (HWM=1 queue full) must complete (not hang) after
+// readable.cancel() fires pull_fired().  The write may succeed or error depending on
+// whether the transform task picks it before the cancel message, but it must not hang.
+//
+// We use a no-enqueue transformer so the transform itself never blocks; the test
+// verifies that cancel clears the backpressure gate and writer.closed() rejects.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn readable_cancel_clears_backpressure_and_closes_writer() {
+    use whatwg_streams::CountQueuingStrategy;
+
+    // EnqueueOnceT fills the queue on the first write (creating backpressure),
+    // then discards subsequent writes so transform() on a cancelled readable never
+    // tries to enqueue again.
+    struct EnqueueOnceT {
+        first: bool,
+    }
+
+    impl Transformer<u32, u32> for EnqueueOnceT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            if self.first {
+                self.first = false;
+                // enqueue — fills the HWM=1 queue, triggering backpressure
+                controller.enqueue(chunk)?;
+            }
+            // subsequent calls: discard so we don't enqueue on the cancelled readable
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(EnqueueOnceT { first: true })
+        .readable_strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    // First write fills the readable queue (HWM=1) → has_space becomes false
+    writer.write(1u32).await.unwrap();
+
+    // Second write is now blocked by backpressure; spawn it concurrently
+    let w = std::sync::Arc::new(writer);
+    let wc = w.clone();
+    let write2 = tokio::spawn(async move { wc.write(2u32).await });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Cancel the readable — pull_fired() clears the backpressure gate,
+    // unblocking write2 (which will not hang).
+    reader.cancel(None).await.unwrap();
+
+    // write2 must complete (resolve or error) — it must not hang
+    let _ = write2.await.unwrap();
+
+    // writer.closed() must reject (writable errored by cancel)
+    assert!(
+        w.closed().await.is_err(),
+        "writer.closed() must reject after readable cancel"
+    );
+}
