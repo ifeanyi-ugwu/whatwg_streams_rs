@@ -64,7 +64,11 @@ impl Transformer<i32, i32> for ErrorOnThreeT {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn transform_passes_chunks_through() {
-    let ts = TransformStream::builder(DoubleT).spawn(tokio::spawn);
+    use whatwg_streams::CountQueuingStrategy;
+    // HWM=10 so sequential writes don't block on backpressure (not testing bp here)
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(CountQueuingStrategy::new(10))
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
@@ -84,7 +88,10 @@ async fn transform_passes_chunks_through() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn transform_changes_chunk_type() {
-    let ts = TransformStream::builder(UppercaseT).spawn(tokio::spawn);
+    use whatwg_streams::CountQueuingStrategy;
+    let ts = TransformStream::builder(UppercaseT)
+        .readable_strategy(CountQueuingStrategy::new(10))
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
@@ -102,7 +109,10 @@ async fn transform_changes_chunk_type() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn transform_can_filter_chunks() {
-    let ts = TransformStream::builder(FilterOddT).spawn(tokio::spawn);
+    use whatwg_streams::CountQueuingStrategy;
+    let ts = TransformStream::builder(FilterOddT)
+        .readable_strategy(CountQueuingStrategy::new(10))
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
@@ -142,15 +152,19 @@ async fn transform_error_errors_both_sides() {
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
 
-    writer.write(1i32).await.unwrap();
-    writer.write(2i32).await.unwrap();
-    assert_eq!(reader.read().await.unwrap(), Some(1));
-    assert_eq!(reader.read().await.unwrap(), Some(2));
-
-    // This write triggers the error
-    assert!(writer.write(3i32).await.is_err());
-    // Readable side is now errored too
-    assert!(reader.read().await.is_err());
+    // JS WPT fires all writes and reads concurrently via Promise.all(). With HWM=1,
+    // write(2) blocks until chunk 1 is consumed, so the two sides must run concurrently.
+    let write_side = async {
+        writer.write(1i32).await.unwrap();
+        writer.write(2i32).await.unwrap();
+        assert!(writer.write(3i32).await.is_err());
+    };
+    let read_side = async {
+        assert_eq!(reader.read().await.unwrap(), Some(1));
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+        assert!(reader.read().await.is_err());
+    };
+    tokio::join!(write_side, read_side);
 }
 
 // WPT: transform-streams/general.any.js —
@@ -356,13 +370,20 @@ async fn terminate_in_flush_closes_after_chunks() {
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
 
-    writer.write(1u32).await.unwrap();
-    writer.write(2u32).await.unwrap();
-    writer.close().await.unwrap();
-
-    assert_eq!(reader.read().await.unwrap(), Some(1));
-    assert_eq!(reader.read().await.unwrap(), Some(2));
-    assert_eq!(reader.read().await.unwrap(), None);
+    // JS WPT uses Promise.all([write1, write2, close, read1, read2, read3]) — all
+    // concurrent.  With HWM=1 write(2) blocks until chunk 1 is consumed, so the
+    // write and read sides must run concurrently, matching the spec's intent.
+    let write_and_close = async {
+        writer.write(1u32).await.unwrap();
+        writer.write(2u32).await.unwrap();
+        writer.close().await.unwrap();
+    };
+    let read_all = async {
+        assert_eq!(reader.read().await.unwrap(), Some(1));
+        assert_eq!(reader.read().await.unwrap(), Some(2));
+        assert_eq!(reader.read().await.unwrap(), None);
+    };
+    tokio::join!(write_and_close, read_all);
 }
 
 // "TransformStream: desired_size on the controller reflects the readable side's HWM"
@@ -749,4 +770,103 @@ async fn transform_desired_size_goes_negative_when_over_hwm() {
         ds < 0,
         "desired_size must go negative when more than HWM chunks are enqueued (got {ds})"
     );
+}
+
+// ── WPT: transform-streams/backpressure.any.js (newly testable) ──────────────
+
+// "backpressure: only one transform() fires per HWM=1 until consumer reads"
+// With HWM=1 on the readable and no active reader consuming, writing two chunks
+// to the writable should only run transform() once — the second write should
+// block on backpressure until the first transformed chunk is consumed.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn transform_backpressure_blocks_second_write_until_consumer_reads() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::CountQueuingStrategy;
+
+    let transform_count = Arc::new(Mutex::new(0u32));
+    let transform_count2 = transform_count.clone();
+
+    struct CountingT {
+        count: Arc<Mutex<u32>>,
+    }
+
+    impl Transformer<u32, u32> for CountingT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.count.lock().unwrap() += 1;
+            controller.enqueue(chunk)
+        }
+    }
+
+    // Readable HWM=1: after one enqueue, desired_size=0 → backpressure
+    let ts = TransformStream::builder(CountingT {
+        count: transform_count2,
+    })
+    .readable_strategy(CountQueuingStrategy::new(1))
+    .spawn(tokio::spawn);
+
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    // First write: transform fires, chunk enqueued into readable
+    writer.write(1u32).await.unwrap();
+    assert_eq!(*transform_count.lock().unwrap(), 1, "first transform must have fired");
+
+    // Queue is now full (HWM=1). Second write should block until we read.
+    // Spawn the write so it can proceed concurrently with the read.
+    let w = std::sync::Arc::new(writer);
+    let wc = w.clone();
+    let write2 = tokio::spawn(async move { wc.write(2u32).await });
+
+    // Let the write task start and hit the backpressure wait
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // transform() must NOT have fired a second time yet (backpressure is active)
+    assert_eq!(
+        *transform_count.lock().unwrap(),
+        1,
+        "transform() must not fire while readable queue is full (HWM=1)"
+    );
+
+    // Consume the first chunk → queue drains → pull() fires → backpressure clears
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+
+    // Now the second write can proceed
+    write2.await.unwrap().unwrap();
+    assert_eq!(*transform_count.lock().unwrap(), 2, "transform() must fire after backpressure clears");
+
+    // Consume second chunk
+    assert_eq!(reader.read().await.unwrap(), Some(2));
+}
+
+// "backpressure: writes resolve as soon as transform completes when HWM allows"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn transform_no_backpressure_when_reader_keeps_up() {
+    use whatwg_streams::CountQueuingStrategy;
+
+    // HWM=10: plenty of room, writes should all complete without blocking
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(CountQueuingStrategy::new(10))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    for i in 1u32..=5 {
+        writer.write(i).await.unwrap();
+    }
+    writer.close().await.unwrap();
+
+    let mut out = Vec::new();
+    while let Some(v) = reader.read().await.unwrap() {
+        out.push(v);
+    }
+    assert_eq!(out, vec![2, 4, 6, 8, 10]);
 }

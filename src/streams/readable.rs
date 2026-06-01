@@ -154,6 +154,12 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
         }
     }
 
+    /// Returns true when the stream is in any terminal or terminal-bound state.
+    /// Useful for breaking out of waits (e.g. backpressure loops) early.
+    pub fn is_closed_or_errored(&self) -> bool {
+        self.is_stream_unusable()
+    }
+
     pub fn desired_size(&self) -> Option<isize> {
         if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
             return None;

@@ -10,10 +10,11 @@ use futures::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
         oneshot,
     },
-    future::{self, Future},
+    future::{self, Future, poll_fn},
     stream::StreamExt,
     FutureExt,
 };
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use super::shared::StreamResult;
 
@@ -56,6 +57,8 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
         let (cancel_tx, cancel_rx): (CancelTx, CancelRx) = unbounded();
+        let hwm = readable_strategy.high_water_mark().max(1);
+        let space_signal = SharedPtr::new(SpaceSignal::new(hwm));
 
         // Writable is created first so its controller can be handed to the readable
         // source — the readable source's cancel() needs it to error the writable side
@@ -63,13 +66,18 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
         let writable_sink = TransformWritableSink::new(transform_tx);
         let (writable, writable_fut) = WritableStream::new_inner(writable_sink, writable_strategy);
 
-        let readable_source = TransformReadableSource::new(writable.controller.clone(), cancel_tx);
+        let readable_source = TransformReadableSource::new(
+            writable.controller.clone(),
+            cancel_tx,
+            space_signal.clone(),
+        );
         let (readable, readable_fut) =
             ReadableStream::new_inner(readable_source, readable_strategy);
 
         let controller = TransformStreamDefaultController::new(
             readable.controller.clone(),
             writable.controller.clone(),
+            space_signal,
         );
 
         let transform_fut = transform_task(transformer, transform_rx, cancel_rx, controller);
@@ -109,22 +117,27 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
 pub struct TransformStreamDefaultController<O: MaybeSend + 'static> {
     readable_controller: SharedPtr<ReadableStreamDefaultController<O>>,
     writable_controller: SharedPtr<WritableStreamDefaultController>,
+    space_signal: SharedPtr<SpaceSignal>,
 }
 
 impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
     fn new(
         readable_controller: SharedPtr<ReadableStreamDefaultController<O>>,
         writable_controller: SharedPtr<WritableStreamDefaultController>,
+        space_signal: SharedPtr<SpaceSignal>,
     ) -> Self {
         Self {
             readable_controller,
             writable_controller,
+            space_signal,
         }
     }
 
     /// Enqueue to readable side
     pub fn enqueue(&self, chunk: O) -> StreamResult<()> {
-        self.readable_controller.enqueue(chunk)
+        let result = self.readable_controller.enqueue(chunk);
+        self.space_signal.record_enqueue();
+        result
     }
 
     /// Errors both the readable and writable side of the transform stream
@@ -144,6 +157,18 @@ impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
     /// Get desired size to fill the readable side of the stream's internal queue
     pub fn desired_size(&self) -> Option<isize> {
         self.readable_controller.desired_size()
+    }
+
+    pub(super) async fn wait_for_readable_space(&self) {
+        if self.readable_controller.is_closed_or_errored() {
+            return;
+        }
+        // Race both exit conditions so a cancel or abort unblocks the transform
+        // task even when the readable queue is still full.
+        futures::select! {
+            _ = poll_fn(|cx| self.space_signal.poll_space(cx)).fuse() => {}
+            _ = self.writable_controller.abort_future().fuse() => {}
+        }
     }
 }
 
@@ -195,14 +220,66 @@ pub trait Transformer<I: MaybeSend + 'static, O: MaybeSend + 'static>: MaybeSend
 type CancelTx = UnboundedSender<(Option<String>, oneshot::Sender<StreamResult<()>>)>;
 type CancelRx = UnboundedReceiver<(Option<String>, oneshot::Sender<StreamResult<()>>)>;
 
+/// Backpressure signal between the transform task and the readable side.
+///
+/// `pull()` fires (readable task) only when the queue is empty, so it resets
+/// `pending` to 0.  Comparing `pending` against `hwm` gives a synchronous
+/// answer about whether another enqueue would exceed the high-water mark —
+/// without an async round-trip through the readable task's channel.
+struct SpaceSignal {
+    has_space: AtomicBool,
+    waker: futures::task::AtomicWaker,
+    pending: std::sync::atomic::AtomicUsize,
+    hwm: usize,
+}
+
+impl SpaceSignal {
+    fn new(hwm: usize) -> Self {
+        Self {
+            has_space: AtomicBool::new(true),
+            waker: futures::task::AtomicWaker::new(),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            hwm,
+        }
+    }
+
+    fn record_enqueue(&self) {
+        let prev = self.pending.fetch_add(1, AtomicOrdering::AcqRel);
+        if prev + 1 >= self.hwm {
+            self.has_space.store(false, AtomicOrdering::Release);
+        }
+    }
+
+    fn pull_fired(&self) {
+        self.pending.store(0, AtomicOrdering::Release);
+        self.has_space.store(true, AtomicOrdering::Release);
+        self.waker.wake();
+    }
+
+    fn poll_space(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.has_space.load(AtomicOrdering::Acquire) {
+            return std::task::Poll::Ready(());
+        }
+        self.waker.register(cx.waker());
+        if self.has_space.load(AtomicOrdering::Acquire) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
 /// Readable source for the transform stream.
 ///
-/// Holds references to the writable controller and the cancel channel so that
-/// when the readable side is cancelled (spec §6.3.4), the writable side is
-/// errored and `Transformer::cancel()` is invoked in the transform task.
+/// Holds references to the writable controller, the cancel channel, and the
+/// shared `SpaceSignal` so that:
+/// - `pull()` fires the space signal (readable has room → transform can proceed)
+/// - `cancel()` errors the writable side, fires the signal (unblocks transform),
+///   and invokes `Transformer::cancel()` via the cancel channel
 pub struct TransformReadableSource<O: MaybeSend + 'static> {
     writable_controller: crate::platform::SharedPtr<WritableStreamDefaultController>,
     cancel_tx: CancelTx,
+    space_signal: SharedPtr<SpaceSignal>,
     _phantom: std::marker::PhantomData<O>,
 }
 
@@ -210,10 +287,12 @@ impl<O: MaybeSend + 'static> TransformReadableSource<O> {
     fn new(
         writable_controller: crate::platform::SharedPtr<WritableStreamDefaultController>,
         cancel_tx: CancelTx,
+        space_signal: SharedPtr<SpaceSignal>,
     ) -> Self {
         Self {
             writable_controller,
             cancel_tx,
+            space_signal,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -224,6 +303,7 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
         &mut self,
         _controller: &mut ReadableStreamDefaultController<O>,
     ) -> StreamResult<()> {
+        self.space_signal.pull_fired();
         Ok(())
     }
 
@@ -234,6 +314,8 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
             None => StreamError::Canceled,
         };
         self.writable_controller.error(error);
+
+        self.space_signal.pull_fired();
 
         // Route the cancel reason into the transform task so it can call
         // Transformer::cancel(reason). If the task is already gone, treat as Ok.
@@ -324,6 +406,8 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
             cmd = transform_rx.next().fuse() => {
                 match cmd {
                     Some(TransformCommand::Write { chunk, completion }) => {
+                        controller.wait_for_readable_space().await;
+
                         let result = transformer.transform(chunk, &mut controller).await;
                         match result {
                             Ok(()) => { let _ = completion.send(Ok(())); }
@@ -588,8 +672,9 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn test_basic_transform() {
         let transformer = UppercaseTransformer;
-        let transform_stream =
-            TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(transformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -622,8 +707,9 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn test_numeric_transform() {
         let transformer = DoubleTransformer;
-        let transform_stream =
-            TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(transformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -644,8 +730,9 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn test_filtering_transform() {
         let transformer = OddFilterTransformer;
-        let transform_stream =
-            TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(transformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -668,8 +755,9 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn test_transform_error_handling() {
         let transformer = ErrorOnThreeTransformer;
-        let transform_stream =
-            TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(transformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -710,8 +798,9 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn test_multiple_writes_before_read() {
         let transformer = DoubleTransformer;
-        let transform_stream =
-            TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(transformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -754,8 +843,9 @@ mod tests {
 
     #[tokio_localset_test::localset_test]
     async fn test_identity_transform_default() {
-        let transform_stream =
-            TransformStream::builder(IdentityTransformer::new()).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(IdentityTransformer::new())
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_stream, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -790,8 +880,9 @@ mod builder_tests {
 
     #[tokio_localset_test::localset_test]
     async fn test_builder_spawn() {
-        let transform_stream =
-            TransformStream::builder(DoubleTransformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(DoubleTransformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn(tokio::task::spawn_local);
 
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
@@ -808,11 +899,13 @@ mod builder_tests {
 
     #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_parts() {
-        let transform_stream = TransformStream::builder(DoubleTransformer).spawn_parts(
-            tokio::task::spawn_local, // readable
-            tokio::task::spawn_local, // writable
-            tokio::task::spawn_local, // transform
-        );
+        let transform_stream = TransformStream::builder(DoubleTransformer)
+            .readable_strategy(CountQueuingStrategy::new(10))
+            .spawn_parts(
+                tokio::task::spawn_local, // readable
+                tokio::task::spawn_local, // writable
+                tokio::task::spawn_local, // transform
+            );
 
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
