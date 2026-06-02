@@ -259,3 +259,181 @@ async fn tee_spawn_parts() {
     assert_eq!(b1, data);
     assert_eq!(b2, data);
 }
+
+// ── WPT gaps (tee.any.js) ─────────────────────────────────────────────────────
+
+// "ReadableStream teeing: canceling branch2 should not impact branch1"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_cancelling_branch2_does_not_affect_branch1() {
+    let data = vec![1u32, 2, 3];
+    let stream = ReadableStream::from_vec(data.clone()).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_locked, r1) = branch1.get_reader().unwrap();
+    let (_locked, r2) = branch2.get_reader().unwrap();
+
+    r2.cancel(Some("branch2 done".into())).await.unwrap();
+
+    let mut collected = Vec::new();
+    while let Some(v) = r1.read().await.unwrap() {
+        collected.push(v);
+    }
+    assert_eq!(collected, data);
+}
+
+// "ReadableStream teeing: closing the original should close the branches"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_closing_source_closes_both_branches() {
+    struct FiniteSource {
+        items: Vec<u32>,
+        idx: usize,
+    }
+
+    impl ReadableSource<u32> for FiniteSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            if self.idx < self.items.len() {
+                controller.enqueue(self.items[self.idx])?;
+                self.idx += 1;
+            } else {
+                controller.close()?;
+            }
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(FiniteSource {
+        items: vec![1u32, 2],
+        idx: 0,
+    })
+    .spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_locked, r1) = branch1.get_reader().unwrap();
+    let (_locked, r2) = branch2.get_reader().unwrap();
+
+    let mut b1 = Vec::new();
+    while let Some(v) = r1.read().await.unwrap() {
+        b1.push(v);
+    }
+    let mut b2 = Vec::new();
+    while let Some(v) = r2.read().await.unwrap() {
+        b2.push(v);
+    }
+    assert_eq!(b1, vec![1, 2]);
+    assert_eq!(b2, vec![1, 2]);
+}
+
+// "ReadableStream teeing: erroring the original should error both branches with the same error"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_erroring_source_errors_both_branches_with_same_error() {
+    use std::sync::{Arc, Mutex};
+
+    let emitted = Arc::new(Mutex::new(0u32));
+    let source = ErroringSource {
+        emitted: emitted.clone(),
+        max: 0, // error immediately, no chunks
+    };
+    let stream = ReadableStream::builder(source).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_locked, r1) = branch1.get_reader().unwrap();
+    let (_locked, r2) = branch2.get_reader().unwrap();
+
+    let err1 = r1.read().await.expect_err("branch1 must get source error");
+    let err2 = r2.read().await.expect_err("branch2 must get source error");
+
+    assert_eq!(
+        err1.to_string(),
+        err2.to_string(),
+        "both tee branches must receive the same error"
+    );
+}
+
+// "ReadableStream teeing: canceling branch1 should finish when branch2 reads to end"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_cancel_branch1_resolves_when_branch2_exhausts_source() {
+    let data = vec![1u32, 2, 3];
+    let stream = ReadableStream::from_vec(data.clone()).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_locked, r1) = branch1.get_reader().unwrap();
+    let (_locked, r2) = branch2.get_reader().unwrap();
+
+    let cancel = tokio::spawn(async move { r1.cancel(None).await });
+
+    let mut collected = Vec::new();
+    while let Some(v) = r2.read().await.unwrap() {
+        collected.push(v);
+    }
+    assert_eq!(collected, data);
+
+    cancel.await.unwrap().unwrap();
+}
+
+// "ReadableStream teeing: canceling branch1 should finish when original stream errors"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_cancel_branch1_resolves_when_source_errors() {
+    use std::sync::{Arc, Mutex};
+
+    let emitted = Arc::new(Mutex::new(0u32));
+    let source = ErroringSource {
+        emitted: emitted.clone(),
+        max: 1, // one chunk then error
+    };
+    let stream = ReadableStream::builder(source).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_locked, r1) = branch1.get_reader().unwrap();
+    let (_locked, r2) = branch2.get_reader().unwrap();
+
+    // Cancel branch1 — must resolve even though source later errors
+    r1.cancel(None).await.unwrap();
+
+    // Branch2 sees the chunk then the source error
+    assert_eq!(r2.read().await.unwrap(), Some(1));
+    assert!(r2.read().await.is_err(), "branch2 must see source error");
+}
+
+// "ReadableStream teeing: failing to cancel should propagate error to branches"
+// Ignored: TeeCoordinator discards source.cancel() errors (let _ = reader.cancel(...)).
+// Propagating them back requires a cancel-result channel — tracked as a known gap.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore]
+async fn tee_failing_source_cancel_propagates_to_branch_cancel() {
+    struct ThrowingCancelSource;
+
+    impl ReadableSource<u32> for ThrowingCancelSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            controller.enqueue(3)?;
+            Ok(())
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err(StreamError::from("cancel threw"))
+        }
+    }
+
+    let stream = ReadableStream::builder(ThrowingCancelSource).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_locked, r1) = branch1.get_reader().unwrap();
+    let (_locked, r2) = branch2.get_reader().unwrap();
+
+    let r1_cancel = r1.cancel(None).await;
+    let r2_cancel = r2.cancel(None).await;
+
+    // Source cancel() throws — the error must propagate to at least one branch
+    assert!(
+        r1_cancel.is_err() || r2_cancel.is_err(),
+        "source cancel() error must reach at least one branch cancel: \
+         r1={r1_cancel:?} r2={r2_cancel:?}"
+    );
+}
