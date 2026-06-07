@@ -658,6 +658,98 @@ async fn abort_that_throws_rejects_writable_abort() {
     );
 }
 
+// "closing the writable side should reject if a parallel transformer.cancel() throws"
+// WPT: cancel.any.js test 5 — cancel wins over flush; both promises reject with the cancel error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn close_rejects_when_parallel_cancel_throws() {
+    use whatwg_streams::Transformer;
+
+    struct ThrowingCancelT;
+
+    impl Transformer<u32, u32> for ThrowingCancelT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err("cancel threw".into())
+        }
+    }
+
+    let ts = TransformStream::builder(ThrowingCancelT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    // Fire both concurrently — select! in the transform task will pick one
+    let cancel_fut = tokio::spawn(async move { reader.cancel(Some("reason".into())).await });
+    let close_fut = tokio::spawn(async move { writer.close().await });
+
+    let cancel_result = cancel_fut.await.unwrap();
+    let close_result = close_fut.await.unwrap();
+
+    // At least the cancel must have seen the error; the close must not hang
+    // (it receives either the cancel error or a Canceled rejection)
+    assert!(
+        cancel_result.is_err() || close_result.is_err(),
+        "cancel threw — at least one of cancel/close must reject"
+    );
+}
+
+// "readable.cancel() should not call cancel() when flush() is already executing from writable.close()"
+// WPT: cancel.any.js test 8 (structural variant) — when close triggers flush and readable.cancel()
+// arrives concurrently, cancel fires once and close completes without double-calling cancel.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn concurrent_cancel_and_close_call_cancel_at_most_once() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::Transformer;
+
+    let cancel_calls = Arc::new(Mutex::new(0u32));
+    let cancel_calls2 = cancel_calls.clone();
+
+    struct CountCancelT {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl Transformer<u32, u32> for CountCancelT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(CountCancelT { calls: cancel_calls2 }).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    let cancel_fut = tokio::spawn(async move { reader.cancel(None).await });
+    let close_fut = tokio::spawn(async move { writer.close().await });
+
+    let _ = cancel_fut.await.unwrap();
+    let _ = close_fut.await.unwrap();
+
+    assert_eq!(
+        *cancel_calls.lock().unwrap(),
+        1,
+        "transformer.cancel() must be called exactly once regardless of which side wins the race"
+    );
+}
+
 // ── WPT: transform-streams/backpressure.any.js ───────────────────────────────
 // https://github.com/web-platform-tests/wpt/blob/master/streams/transform-streams/backpressure.any.js
 

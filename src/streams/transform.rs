@@ -427,14 +427,31 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
                         }
                     }
 
-                    Some(TransformCommand::Close { completion }) => {
+                    Some(TransformCommand::Close { completion: close_completion }) => {
+                        // If readable.cancel() arrived at the same time as writable.close(),
+                        // cancel wins — the spec forbids calling flush() while the cancel
+                        // algorithm is in flight (cancel.any.js test 5).
+                        if let Some(Some((reason, cancel_completion))) =
+                            cancel_rx.next().now_or_never()
+                        {
+                            let result = transformer.cancel(reason).await;
+                            let reject_err = result
+                                .clone()
+                                .err()
+                                .unwrap_or(StreamError::Canceled);
+                            let _ = cancel_completion.send(result);
+                            let _ = controller.error(reject_err.clone());
+                            let _ = close_completion.send(Err(reject_err));
+                            break;
+                        }
+
                         let flush_result = transformer.flush(&mut controller).await;
                         if let Err(error) = flush_result {
                             let _ = controller.error(error.clone());
-                            let _ = completion.send(Err(error));
+                            let _ = close_completion.send(Err(error));
                         } else {
                             let _ = controller.terminate();
-                            let _ = completion.send(Ok(()));
+                            let _ = close_completion.send(Ok(()));
                         }
                         break;
                     }
@@ -460,7 +477,32 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
                 match cancel_msg {
                     Some((reason, completion)) => {
                         let result = transformer.cancel(reason).await;
+                        let cancel_err = result.clone().err();
                         let _ = completion.send(result);
+
+                        // If cancel threw, error both sides so concurrent cancel+close
+                        // or cancel+write callers get a proper rejection (cancel.any.js test 5).
+                        if let Some(ref e) = cancel_err {
+                            let _ = controller.error(e.clone());
+                        }
+
+                        // Drain any writable commands that arrived concurrently so their
+                        // callers don't hang waiting for a response that will never come.
+                        let reject_err = cancel_err.unwrap_or(StreamError::Canceled);
+                        while let Some(Some(cmd)) = transform_rx.next().now_or_never() {
+                            match cmd {
+                                TransformCommand::Write { completion, .. } => {
+                                    let _ = completion.send(Err(reject_err.clone()));
+                                }
+                                TransformCommand::Close { completion } => {
+                                    let _ = completion.send(Err(reject_err.clone()));
+                                }
+                                TransformCommand::Abort { completion, .. } => {
+                                    let _ = completion.send(Err(reject_err.clone()));
+                                }
+                            }
+                        }
+
                         break;
                     }
                     None => break,
