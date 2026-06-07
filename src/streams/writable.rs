@@ -867,6 +867,9 @@ enum InFlight<Sink> {
     Write {
         fut: crate::platform::PlatformBoxFutureStatic<(Sink, StreamResult<()>)>,
         completion: Option<oneshot::Sender<StreamResult<()>>>,
+        // Held so queue_total_size can be decremented when the write completes,
+        // not when it moves from queue to inflight.
+        chunk_size: usize,
     },
     Close {
         fut: crate::platform::PlatformBoxFutureStatic<StreamResult<()>>,
@@ -958,7 +961,9 @@ async fn stream_task<T, Sink>(
             // Cancel inflight write or close operations immediately
             if let Some(inflight_op) = &mut inflight {
                 match inflight_op {
-                    InFlight::Write { completion, .. } => {
+                    InFlight::Write { completion, chunk_size, .. } => {
+                        inner.queue_total_size = inner.queue_total_size.saturating_sub(*chunk_size);
+                        update_atomic_counters(&inner, &queue_total_size);
                         if let Some(sender) = completion.take() {
                             let _ = sender.send(Err(StreamError::Aborted(None)));
                         }
@@ -1017,10 +1022,9 @@ async fn stream_task<T, Sink>(
         if inflight.is_none() && inner.state == StreamState::Writable {
             if let Some(pw) = inner.queue.pop_front() {
                 let chunk_size = inner.strategy.size(&pw.chunk);
-                inner.queue_total_size -= chunk_size;
-                inner.update_backpressure();
-                update_atomic_counters(&inner, &queue_total_size);
-                update_flags(&inner, &backpressure, &closed, &errored);
+                // Do NOT decrement queue_total_size here — keep the write counted
+                // against backpressure until sink.write() completes (spec §4.5.2).
+                // The decrement happens in the Poll::Ready arm below.
 
                 if let Some(mut sink) = inner.sink.take() {
                     let mut ctrl = controller.clone();
@@ -1033,8 +1037,12 @@ async fn stream_task<T, Sink>(
                             (sink, result)
                         }),
                         completion,
+                        chunk_size,
                     });
                 } else {
+                    // Sink missing — undo queue accounting and error the stream
+                    inner.queue_total_size -= chunk_size;
+                    update_atomic_counters(&inner, &queue_total_size);
                     if let Some(tx) = pw.completion_tx {
                         let _ = tx.send(Err("Sink missing".into()));
                     }
@@ -1047,10 +1055,14 @@ async fn stream_task<T, Sink>(
         if let Some(inflight_op) = &mut inflight {
             match inflight_op {
                 InFlight::Write {
-                    fut, completion, ..
+                    fut, completion, chunk_size,
                 } => {
                     match fut.as_mut().poll(cx) {
                         Poll::Ready((mut sink, result)) => {
+                            // Decrement here — write is done, release backpressure now.
+                            // Use saturating_sub: the stream may have been errored mid-write
+                            // (e.g. terminate() inside transform()), which zeroes queue_total_size.
+                            inner.queue_total_size = inner.queue_total_size.saturating_sub(*chunk_size);
                             decrement_flush_counters(&mut inner);
 
                             if inner.abort_requested {
@@ -1075,7 +1087,6 @@ async fn stream_task<T, Sink>(
                                         inner.set_stored_error(e);
                                     }
                                     inner.state = StreamState::Errored;
-                                    // don’t restore sink on error
                                 } else {
                                     inner.sink = Some(sink);
                                 }
@@ -2059,18 +2070,21 @@ mod tests {
         let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
         let writer = SharedPtr::new(writer);
 
-        // First write starts but blocks in sink
+        // First write starts but blocks in sink.
+        // With spec-correct inflight accounting, the in-flight write keeps
+        // queue_total_size=1 (HWM=1), so backpressure is active immediately.
         let writer_clone = writer.clone();
         let write1 = tokio::task::spawn_local(async move { writer_clone.write(vec![1]).await });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         assert!(
-            !stream
+            stream
                 .backpressure
-                .load(std::sync::atomic::Ordering::Acquire)
+                .load(std::sync::atomic::Ordering::Acquire),
+            "backpressure must be active while a write is in-flight (HWM=1)"
         );
 
-        // Second write should queue and trigger backpressure
+        // Second write queues on top — backpressure remains active
         let writer_clone_2 = writer.clone();
         let write2 = tokio::task::spawn_local(async move { writer_clone_2.write(vec![2]).await });
 
