@@ -993,3 +993,38 @@ async fn readable_cancel_clears_backpressure_and_closes_writer() {
         "writer.closed() must reject after readable cancel"
     );
 }
+
+// "calling pull() before the first write() with backpressure should work"
+// WPT: transform-streams/backpressure.any.js test 5
+//
+// reader.read() is issued before any writer.write().  The read creates a
+// pending_read in the readable task; when transform() later enqueues, the
+// chunk is delivered directly to the pending read without touching the queue.
+// This path is independent of HWM (the WPT uses HWM=0 but our .max(1)
+// substitution is invisible here because the pending-read path bypasses the
+// queue entirely).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_before_write_delivers_chunk() {
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(whatwg_streams::CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    // Spawn the read first — it will pend until a chunk arrives
+    let read_fut = tokio::spawn(async move { reader.read().await });
+
+    // Yield so the read request reaches the readable task before the write
+    tokio::task::yield_now().await;
+
+    writer.write(1u32).await.unwrap();
+
+    // The pending read must have been satisfied with the transformed chunk
+    assert_eq!(
+        read_fut.await.unwrap().unwrap(),
+        Some(2),
+        "pending read must receive the transformed chunk delivered before the queue"
+    );
+}
