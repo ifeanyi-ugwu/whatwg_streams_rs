@@ -789,17 +789,13 @@ fn process_command<T, Sink>(
                 let _ = completion.send(Err(inner.get_stored_error()));
                 return;
             }
-            if inner.state == StreamState::Closed {
-                let _ = completion.send(Ok(()));
+            // Already closed or a close is already in-flight — reject per spec
+            if inner.state == StreamState::Closed || inner.close_requested {
+                let _ = completion.send(Err(StreamError::from("stream is already closing or closed")));
                 return;
             }
-            // If close already requested, add this completion to waiters
-            if inner.close_requested {
-                inner.close_completions.push(completion);
-            } else {
-                inner.close_requested = true;
-                inner.close_completions.push(completion);
-            }
+            inner.close_requested = true;
+            inner.close_completions.push(completion);
             update_atomic_counters(&inner, &queue_total_size);
             update_flags(&inner, backpressure, closed, errored);
         }
@@ -2263,9 +2259,11 @@ mod tests {
             .spawn(tokio::task::spawn_local);
         let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
 
+        // Per spec: first close() succeeds; subsequent close() calls on an already-closed
+        // or closing stream must reject (WPT close.any.js tests 24 and 25).
         writer.close().await.expect("first close failed");
-        writer.close().await.expect("second close failed");
-        writer.close().await.expect("third close failed");
+        assert!(writer.close().await.is_err(), "second close() must reject after stream is closed");
+        assert!(writer.close().await.is_err(), "third close() must reject after stream is closed");
 
         let closed_res = writer.closed().await;
         assert!(
@@ -2682,9 +2680,10 @@ mod sink_integration_tests {
 
         sink_handle.send("item1".to_string()).await.unwrap();
 
+        // Per spec: first close() succeeds; subsequent ones reject (WPT close.any.js tests 24/25)
         sink_handle.close().await.unwrap();
-        sink_handle.close().await.unwrap();
-        sink_handle.close().await.unwrap();
+        assert!(sink_handle.close().await.is_err(), "second close() must reject");
+        assert!(sink_handle.close().await.is_err(), "third close() must reject");
 
         let log = sink.get_operation_log();
         let close_count = log

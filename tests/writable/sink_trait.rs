@@ -109,8 +109,8 @@ async fn sink_close_on_already_closed_is_ok() {
 
     let mut stream = WritableStream::builder(LifecycleSink::default()).spawn(tokio::spawn);
     stream.close().await.unwrap();
-    // Second close via the Sink trait — should not panic
-    stream.close().await.unwrap();
+    // Per spec (WPT close.any.js test 24): second close rejects — does not panic or hang
+    assert!(stream.close().await.is_err(), "second close() must reject per spec");
 }
 
 // ── poll_ready ────────────────────────────────────────────────────────────────
