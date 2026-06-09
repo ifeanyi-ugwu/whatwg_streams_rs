@@ -1076,6 +1076,8 @@ async fn stream_task<T, Sink>(
                                     fut: abort_fut,
                                     completions,
                                 });
+                                // Wake so InFlight::Abort is polled in the next pass
+                                cx.waker().wake_by_ref();
                             } else {
                                 // Normal case: restore sink
                                 if result.is_err() {
