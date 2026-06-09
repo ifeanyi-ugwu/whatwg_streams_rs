@@ -1985,11 +1985,13 @@ async fn readable_stream_task<T: 'static, Source>(
             }
         }
 
-        // Pull data if needed
+        // Pull data if needed — spec: ReadableStreamDefaultControllerShouldCallPull
+        // fires when desired_size > 0, not just when the queue is empty.
+        let current_ds = desired_size.load(std::sync::atomic::Ordering::Acquire);
         if inner.state == StreamState::Readable
             && !inner.pulling
             && !inner.cancel_requested
-            && (inner.queue.is_empty() || !inner.pending_reads.is_empty())
+            && (current_ds > 0 || !inner.pending_reads.is_empty())
         {
             if let Some(source) = inner.source.take() {
                 inner.pulling = true;

@@ -1086,6 +1086,84 @@ async fn readable_cancel_clears_backpressure_and_closes_writer() {
     );
 }
 
+// "backpressure allows no transforms with a default identity transform and no reader"
+// WPT: transform-streams/backpressure.any.js test 1
+// With HWM=0 (readable strategy), the SpaceSignal starts closed and pull() only fires
+// when a pending read exists.  Writes block indefinitely without a reader.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn no_transforms_without_reader_at_hwm0() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::CountQueuingStrategy;
+
+    let transform_count = Arc::new(Mutex::new(0u32));
+    let transform_count2 = transform_count.clone();
+
+    struct CountingPassT {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl Transformer<u32, u32> for CountingPassT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.calls.lock().unwrap() += 1;
+            controller.enqueue(chunk)
+        }
+    }
+
+    let ts = TransformStream::builder(CountingPassT {
+        calls: transform_count2,
+    })
+    .readable_strategy(CountQueuingStrategy::new(0)) // HWM=0 → no transforms without reader
+    .spawn(tokio::spawn);
+    let (_readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+
+    // Spawn a write — it must stay pending because has_space=false (HWM=0, no reader)
+    let w = Arc::new(writer);
+    let wc = w.clone();
+    let write_fut = tokio::spawn(async move { wc.write(1u32).await });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        *transform_count.lock().unwrap(),
+        0,
+        "transform() must not fire with HWM=0 and no reader"
+    );
+
+    // Abort the write task — the write will stay blocked indefinitely without a reader
+    write_fut.abort();
+    let _ = write_fut.await;
+}
+
+// "writer.closed should resolve after readable is canceled with HWM=0 backpressure"
+// WPT: transform-streams/backpressure.any.js test 9
+// Same invariant as tests 8/10 (already covered) but specifically for HWM=0.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn writer_closed_rejects_after_readable_cancel_hwm0() {
+    use whatwg_streams::CountQueuingStrategy;
+
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(CountQueuingStrategy::new(0))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    reader.cancel(Some("done".into())).await.unwrap();
+
+    assert!(
+        writer.closed().await.is_err(),
+        "writer.closed() must reject after readable cancel (HWM=0)"
+    );
+}
+
 // "calling pull() before the first write() with backpressure should work"
 // WPT: transform-streams/backpressure.any.js test 5
 //

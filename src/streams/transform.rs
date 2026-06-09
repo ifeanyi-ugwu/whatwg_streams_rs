@@ -57,7 +57,7 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static> TransformStream<I, O> {
     {
         let (transform_tx, transform_rx) = unbounded::<TransformCommand<I>>();
         let (cancel_tx, cancel_rx): (CancelTx, CancelRx) = unbounded();
-        let hwm = readable_strategy.high_water_mark().max(1);
+        let hwm = readable_strategy.high_water_mark();
         let space_signal = SharedPtr::new(SpaceSignal::new(hwm));
 
         // Writable is created first so its controller can be handed to the readable
@@ -230,10 +230,12 @@ type CancelRx = UnboundedReceiver<(Option<String>, oneshot::Sender<StreamResult<
 
 /// Backpressure signal between the transform task and the readable side.
 ///
-/// `pull()` fires (readable task) only when the queue is empty, so it resets
-/// `pending` to 0.  Comparing `pending` against `hwm` gives a synchronous
-/// answer about whether another enqueue would exceed the high-water mark —
-/// without an async round-trip through the readable task's channel.
+/// `pending` counts chunks sent via `enqueue()` but not yet drained from the
+/// readable queue.  `pull()` now fires whenever `desired_size > 0` (not only
+/// on empty queue), so `sync_from_desired_size()` recomputes `pending` from
+/// the actual readable desired_size rather than resetting to zero.
+/// For HWM=0 the signal starts closed; `has_space` only opens when `pull()`
+/// fires due to a pending read request.
 struct SpaceSignal {
     has_space: AtomicBool,
     waker: futures::task::AtomicWaker,
@@ -244,21 +246,40 @@ struct SpaceSignal {
 impl SpaceSignal {
     fn new(hwm: usize) -> Self {
         Self {
-            has_space: AtomicBool::new(true),
+            // HWM=0 → no space until a reader's read() creates a pending_read;
+            // HWM>0 → initially open (empty queue, full headroom).
+            has_space: AtomicBool::new(hwm > 0),
             waker: futures::task::AtomicWaker::new(),
             pending: std::sync::atomic::AtomicUsize::new(0),
             hwm,
         }
     }
 
+    /// Called by `enqueue()` — increments pending and closes the gate at HWM.
     fn record_enqueue(&self) {
         let prev = self.pending.fetch_add(1, AtomicOrdering::AcqRel);
-        if prev + 1 >= self.hwm {
+        if self.hwm == 0 || prev + 1 >= self.hwm {
             self.has_space.store(false, AtomicOrdering::Release);
         }
     }
 
-    fn pull_fired(&self) {
+    /// Called by `pull()` — syncs `pending` from the actual readable desired_size
+    /// so that the SpaceSignal stays accurate when pull fires mid-queue (HWM > 1).
+    /// For HWM=0, pull fires only when pending_reads exist; treat as 1 free slot.
+    fn sync_from_desired_size(&self, ds: isize) {
+        let actual_pending = (self.hwm as isize - ds).max(0) as usize;
+        self.pending.store(actual_pending, AtomicOrdering::Release);
+        // has_space = room for ≥1 more enqueue, or HWM=0 with a pending read
+        let open = actual_pending < self.hwm || self.hwm == 0;
+        self.has_space.store(open, AtomicOrdering::Release);
+        if open {
+            self.waker.wake();
+        }
+    }
+
+    /// Called by `cancel()` — unconditionally unblocks the transform task.
+    /// After cancel the task will break anyway, so exact pending count is irrelevant.
+    fn cancel_fired(&self) {
         self.pending.store(0, AtomicOrdering::Release);
         self.has_space.store(true, AtomicOrdering::Release);
         self.waker.wake();
@@ -309,9 +330,14 @@ impl<O: MaybeSend + 'static> TransformReadableSource<O> {
 impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
     async fn pull(
         &mut self,
-        _controller: &mut ReadableStreamDefaultController<O>,
+        controller: &mut ReadableStreamDefaultController<O>,
     ) -> StreamResult<()> {
-        self.space_signal.pull_fired();
+        // pull() fires whenever desired_size > 0 (spec-correct, not just on empty queue).
+        // Sync pending from the actual desired_size so the SpaceSignal stays accurate
+        // when pull fires mid-queue (HWM > 1) or when a pending read creates a free slot.
+        if let Some(ds) = controller.desired_size() {
+            self.space_signal.sync_from_desired_size(ds);
+        }
         Ok(())
     }
 
@@ -323,7 +349,7 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
         };
         self.writable_controller.error(error);
 
-        self.space_signal.pull_fired();
+        self.space_signal.cancel_fired();
 
         // Route the cancel reason into the transform task so it can call
         // Transformer::cancel(reason). If the task is already gone, treat as Ok.
