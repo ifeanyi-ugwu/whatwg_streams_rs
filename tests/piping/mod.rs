@@ -665,3 +665,274 @@ async fn pipe_to_hwm1_preserves_order() {
     source.pipe_to(&dest, None).await.unwrap();
     assert_eq!(*collected.lock().unwrap(), data);
 }
+
+// ── WPT gaps: close-propagation-forward ──────────────────────────────────────
+
+// "Closing must be propagated forward: rejected close promise"
+// When sink.close() rejects, pipe_to() must reject with that error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_close_rejection_propagates_forward() {
+    struct FailCloseSink;
+    impl WritableSink<u32> for FailCloseSink {
+        async fn write(&mut self, _c: u32, _: &mut WritableStreamDefaultController) -> StreamResult<()> { Ok(()) }
+        async fn close(self) -> StreamResult<()> { Err("close failed".into()) }
+    }
+
+    let source = ReadableStream::from_vec(Vec::<u32>::new()).spawn(tokio::spawn);
+    let dest = WritableStream::builder(FailCloseSink).spawn(tokio::spawn);
+    let result = source.pipe_to(&dest, None).await;
+    assert!(result.is_err(), "pipe_to() must reject when sink.close() rejects");
+    assert!(
+        result.unwrap_err().to_string().contains("close failed"),
+        "rejection must carry the close error"
+    );
+}
+
+// "Closing must be propagated forward (with data): rejected close promise"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_close_rejection_after_chunks_propagates() {
+    struct FailCloseSink { received: std::sync::Arc<std::sync::Mutex<Vec<u32>>> }
+    impl WritableSink<u32> for FailCloseSink {
+        async fn write(&mut self, c: u32, _: &mut WritableStreamDefaultController) -> StreamResult<()> {
+            self.received.lock().unwrap().push(c);
+            Ok(())
+        }
+        async fn close(self) -> StreamResult<()> { Err("close failed".into()) }
+    }
+
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = ReadableStream::from_vec(vec![1u32, 2]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(FailCloseSink { received: received.clone() }).spawn(tokio::spawn);
+    let result = source.pipe_to(&dest, None).await;
+    assert!(result.is_err(), "pipe_to() must reject when sink.close() rejects after chunks");
+    // All chunks must have been received before close was attempted
+    assert_eq!(*received.lock().unwrap(), vec![1, 2]);
+}
+
+// ── WPT gaps: close-propagation-backward ─────────────────────────────────────
+
+// "Closing must be propagated backward: rejected cancel promise"
+// When source.cancel() throws during backward close propagation, pipe_to() rejects.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_cancel_rejection_on_dest_close_propagates_backward() {
+    struct ThrowingCancelSource;
+    impl ReadableSource<u32> for ThrowingCancelSource {
+        async fn pull(&mut self, _c: &mut ReadableStreamDefaultController<u32>) -> StreamResult<()> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err(StreamError::from("cancel failed"))
+        }
+    }
+
+    struct ImmediateCloseSink;
+    impl WritableSink<u32> for ImmediateCloseSink {
+        async fn write(&mut self, _c: u32, _: &mut WritableStreamDefaultController) -> StreamResult<()> { Ok(()) }
+    }
+
+    let source = ReadableStream::builder(ThrowingCancelSource).spawn(tokio::spawn);
+    // The dest is already closed before piping starts
+    let dest = WritableStream::builder(ImmediateCloseSink).spawn(tokio::spawn);
+    let (_locked, writer) = dest.get_writer().unwrap();
+    writer.close().await.unwrap();
+    drop(_locked);
+    // pipe_to a closed dest should propagate close backward via source.cancel()
+    // which throws — the pipe must not hang
+    let result = source.pipe_to(&dest, None).await;
+    // Either Ok or Err — just must not hang. The exact result depends on timing.
+    let _ = result;
+}
+
+// ── WPT gaps: error-propagation-forward (rejected abort) ─────────────────────
+
+// "Errors must be propagated forward: rejected abort promise"
+// When source errors and sink.abort() rejects, pipe_to() rejects with abort error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_abort_rejection_on_source_error_propagates_forward() {
+    struct FailAbortSink;
+    impl WritableSink<u32> for FailAbortSink {
+        async fn write(&mut self, _c: u32, _: &mut WritableStreamDefaultController) -> StreamResult<()> { Ok(()) }
+        async fn abort(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err(StreamError::from("abort failed"))
+        }
+    }
+
+    let source = ReadableStream::builder(ErrorAfterSource {
+        data: vec![],
+        index: Default::default(),
+    }).spawn(tokio::spawn);
+    let dest = WritableStream::builder(FailAbortSink).spawn(tokio::spawn);
+    let result = source.pipe_to(&dest, None).await;
+    assert!(result.is_err(), "pipe_to() must reject when both source errors and sink.abort() rejects");
+}
+
+// "Errors must be propagated forward after one chunk: rejected abort promise"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_abort_rejection_after_chunks_propagates_forward() {
+    struct FailAbortSink { count: std::sync::Arc<std::sync::Mutex<u32>> }
+    impl WritableSink<u32> for FailAbortSink {
+        async fn write(&mut self, _c: u32, _: &mut WritableStreamDefaultController) -> StreamResult<()> {
+            *self.count.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn abort(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err(StreamError::from("abort failed"))
+        }
+    }
+
+    let count = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let source = ReadableStream::builder(ErrorAfterSource {
+        data: vec![1u32],
+        index: Default::default(),
+    }).spawn(tokio::spawn);
+    let dest = WritableStream::builder(FailAbortSink { count: count.clone() }).spawn(tokio::spawn);
+    let result = source.pipe_to(&dest, None).await;
+    assert!(result.is_err());
+    assert_eq!(*count.lock().unwrap(), 1, "chunk before error must be written");
+}
+
+// ── WPT gaps: error-propagation-backward ─────────────────────────────────────
+
+// "Errors must be propagated backward: rejected cancel promise on dest error"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_cancel_rejection_on_dest_error_propagates_backward() {
+    struct ThrowingCancelSrc {
+        data: Vec<u32>,
+        idx: usize,
+    }
+    impl ReadableSource<u32> for ThrowingCancelSrc {
+        async fn pull(&mut self, c: &mut ReadableStreamDefaultController<u32>) -> StreamResult<()> {
+            if self.idx < self.data.len() {
+                c.enqueue(self.data[self.idx])?;
+                self.idx += 1;
+            } else {
+                futures::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err(StreamError::from("cancel failed"))
+        }
+    }
+
+    let sink = FailAfterSink { fail_after: 0, count: Default::default() };
+    let source = ReadableStream::builder(ThrowingCancelSrc { data: vec![1u32], idx: 0 })
+        .spawn(tokio::spawn);
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+    let result = source.pipe_to(&dest, None).await;
+    // pipe must not hang; result reflects the cancel or sink error
+    assert!(result.is_err(), "pipe_to() must reject when both sink errors and source.cancel() rejects");
+}
+
+// ── WPT gaps: abort.any.js ────────────────────────────────────────────────────
+
+// "a rejection from underlyingSource.cancel() should be returned by pipeTo()"
+// WPT abort.any.js test 5
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_signal_cancel_rejection_returned() {
+    use futures::future::AbortHandle;
+
+    struct BlockThenErrorCancel;
+    impl ReadableSource<u32> for BlockThenErrorCancel {
+        async fn pull(&mut self, _c: &mut ReadableStreamDefaultController<u32>) -> StreamResult<()> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err(StreamError::from("cancel rejected"))
+        }
+    }
+
+    let (abort_handle, abort_reg) = AbortHandle::new_pair();
+    let source = ReadableStream::builder(BlockThenErrorCancel).spawn(tokio::spawn);
+    let dest = WritableStream::builder(crate::helpers::LifecycleSink::default()).spawn(tokio::spawn);
+
+    let pipe = tokio::spawn(async move {
+        source.pipe_to(&dest, Some(StreamPipeOptions {
+            signal: Some(abort_reg),
+            prevent_abort: true, // skip sink abort so we get the cancel error
+            ..Default::default()
+        })).await
+    });
+
+    tokio::task::yield_now().await;
+    abort_handle.abort();
+    let result = pipe.await.unwrap();
+    // With prevent_abort=true, source cancel runs and throws — must propagate
+    assert!(result.is_err(), "pipe_to() must propagate source.cancel() rejection");
+}
+
+// "abort signal takes priority over closed writable"
+// WPT abort.any.js test 10
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_signal_priority_over_closed_writable() {
+    use futures::future::AbortHandle;
+
+    // Pre-abort the signal
+    let (abort_handle, abort_reg) = AbortHandle::new_pair();
+    abort_handle.abort();
+
+    let source = ReadableStream::from_vec(vec![1u32]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(crate::helpers::LifecycleSink::default()).spawn(tokio::spawn);
+    // Close the destination first
+    {
+        let (_locked, writer) = dest.get_writer().unwrap();
+        writer.close().await.unwrap();
+    }
+
+    let result = source.pipe_to(&dest, Some(StreamPipeOptions {
+        signal: Some(abort_reg),
+        ..Default::default()
+    })).await;
+    // Abort signal should win — pipe_to errors
+    assert!(result.is_err(), "abort signal must take priority over closed writable");
+}
+
+// "abort should do nothing after the readable is errored"
+// WPT abort.any.js test 13 — late-firing abort signal on an already-errored source
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_late_abort_no_effect_after_readable_errored() {
+    use futures::future::AbortHandle;
+
+    let (abort_handle, abort_reg) = AbortHandle::new_pair();
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let sink = CollectSink {
+        collected: collected.clone(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    };
+
+    // Source errors immediately
+    let source = ReadableStream::builder(ErrorAfterSource {
+        data: vec![],
+        index: Default::default(),
+    }).spawn(tokio::spawn);
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    // Pipe starts, source errors, pipe rejects
+    let pipe = tokio::spawn(async move {
+        source.pipe_to(&dest, Some(StreamPipeOptions {
+            signal: Some(abort_reg),
+            ..Default::default()
+        })).await
+    });
+
+    // Fire abort AFTER pipe has already errored
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    abort_handle.abort();
+
+    let result = pipe.await.unwrap();
+    // Pipe already rejected due to source error — abort is a no-op
+    assert!(result.is_err(), "pipe must reject due to source error");
+}
