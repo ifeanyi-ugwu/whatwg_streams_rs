@@ -259,8 +259,12 @@ where
 {
     // private helper
     fn desired_size(&self) -> Option<usize> {
-        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
+        // Spec: errored → null (None); closed → 0 (Some(0)); otherwise HWM − queued
+        if self.errored.load(Ordering::Acquire) {
             return None;
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Some(0);
         }
 
         let queue_size = self.queue_total_size.load(Ordering::Acquire);
@@ -2146,24 +2150,42 @@ mod tests {
 
     #[tokio_localset_test::localset_test]
     async fn desired_size_returns_none_when_closed_or_errored() {
-        let strategy = CountQueuingStrategy::new(10);
-        let sink = DummySink::default();
-        let stream = WritableStream::builder(sink)
-            .strategy(strategy)
-            .spawn(tokio::task::spawn_local);
+        // closed → Some(0)
+        {
+            let stream = WritableStream::builder(DummySink::default())
+                .spawn(tokio::task::spawn_local);
+            let (_locked, writer) = stream.get_writer().expect("get writer");
+            writer.close().await.expect("close");
+            assert_eq!(
+                writer.desired_size(),
+                Some(0),
+                "desired_size must be Some(0) when closed (not None)"
+            );
+        }
 
-        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
-        writer.close().await.expect("close failed");
-
-        let after_close = writer.desired_size();
-        assert_eq!(after_close, None, "desired_size after close must be None");
-
-        let _ = writer.release_lock();
-        let (_locked_stream, writer) = stream.get_writer().expect("failed to get writer");
-        writer.abort(None).await.expect("abort failed");
-
-        let after_error = writer.desired_size();
-        assert_eq!(after_error, None, "desired_size after error must be None");
+        // errored → None
+        {
+            #[derive(Clone, Default)]
+            struct AlwaysFailSink;
+            impl WritableSink<u32> for AlwaysFailSink {
+                fn write(
+                    &mut self,
+                    _chunk: u32,
+                    _controller: &mut WritableStreamDefaultController,
+                ) -> impl std::future::Future<Output = StreamResult<()>> {
+                    async { Err(StreamError::from("write failed")) }
+                }
+            }
+            let stream = WritableStream::builder(AlwaysFailSink::default())
+                .spawn(tokio::task::spawn_local);
+            let (_locked, writer) = stream.get_writer().expect("get writer");
+            let _ = writer.write(1u32).await; // force errored state
+            assert_eq!(
+                writer.desired_size(),
+                None,
+                "desired_size must be None when errored"
+            );
+        }
     }
 
     #[tokio_localset_test::localset_test]

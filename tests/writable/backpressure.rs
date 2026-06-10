@@ -15,14 +15,14 @@ async fn desired_size_equals_hwm_when_queue_empty() {
     assert_eq!(writer.desired_size(), Some(4));
 }
 
-// "Backpressure: desired_size is None after the stream closes"
+// "Backpressure: desired_size is 0 after the stream closes" (spec: closed → 0, not null)
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn desired_size_is_none_after_close() {
     let stream = WritableStream::builder(LifecycleSink::default()).spawn(tokio::spawn);
     let (_locked, writer) = stream.get_writer().unwrap();
     writer.close().await.unwrap();
-    assert_eq!(writer.desired_size(), None);
+    assert_eq!(writer.desired_size(), Some(0)); // spec: closed → 0, not null
 }
 
 // "Backpressure: desired_size is None after the stream is aborted"

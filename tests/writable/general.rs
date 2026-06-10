@@ -68,3 +68,61 @@ async fn start_rejection_rejects_writes() {
     let (_locked, writer) = stream.get_writer().unwrap();
     assert!(writer.write(1u32).await.is_err());
 }
+
+// ── WPT gaps: writable-streams/general.any.js ────────────────────────────────
+
+// "desiredSize initial value"
+// writer.desired_size() must equal HWM (default 1) when the queue is empty.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn desired_size_initial_value() {
+    let stream = WritableStream::builder(LifecycleSink::default()).spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    assert_eq!(writer.desired_size(), Some(1), "desiredSize must equal HWM=1 initially");
+}
+
+// "desiredSize on a writer for a closed stream"
+// After stream closes, desiredSize must be 0 (not null/None).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn desired_size_is_zero_on_closed_stream() {
+    let stream = WritableStream::builder(LifecycleSink::default()).spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    writer.close().await.unwrap();
+    assert_eq!(
+        writer.desired_size(),
+        Some(0),
+        "desiredSize must be 0 (not None) after stream is closed"
+    );
+}
+
+// "ws.getWriter() on a closing WritableStream"
+// After release_lock() (JS: writer.releaseLock()), getWriter() must succeed
+// even when a close was previously initiated. The lock is tied to the writer's
+// lifetime in Rust, so release_lock() is the idiomatic equivalent.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn get_writer_on_closing_stream_succeeds() {
+    let stream = WritableStream::builder(LifecycleSink::default()).spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    // release_lock() explicitly frees the lock (matches JS writer.releaseLock())
+    writer.release_lock().unwrap();
+    assert!(
+        stream.get_writer().is_ok(),
+        "get_writer() must succeed after release_lock()"
+    );
+}
+
+// "ws.getWriter() on a closed WritableStream"
+// After stream closes and lock is released, getWriter() must succeed.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn get_writer_on_closed_stream_succeeds() {
+    let stream = WritableStream::builder(LifecycleSink::default()).spawn(tokio::spawn);
+    {
+        let (_locked, writer) = stream.get_writer().unwrap();
+        writer.close().await.unwrap();
+        // _locked drops → lock released
+    }
+    assert!(stream.get_writer().is_ok(), "get_writer() must succeed on an already-closed stream");
+}

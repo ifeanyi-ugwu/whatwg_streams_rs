@@ -315,3 +315,50 @@ async fn desired_size_tracks_queue_depth() {
     writer.write(1u32).await.unwrap();
     assert_eq!(writer.desired_size(), Some(3), "desired_size should recover after write completes");
 }
+
+// ── WPT gaps: writable-streams/write.any.js ──────────────────────────────────
+
+// "WritableStream should transition to waiting until write is acknowledged"
+// desiredSize = HWM before write, drops to 0 while write is in-flight,
+// returns to HWM once sink.write() completes.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn desired_size_tracks_queue_depth_with_inflight() {
+    use std::sync::Arc;
+    use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableSink, WritableStreamDefaultController};
+
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    let unblock2 = unblock.clone();
+
+    struct BlockingSink { unblock: Arc<tokio::sync::Notify> }
+    impl WritableSink<u32> for BlockingSink {
+        async fn write(&mut self, _c: u32, _: &mut WritableStreamDefaultController) -> StreamResult<()> {
+            self.unblock.notified().await;
+            Ok(())
+        }
+    }
+
+    let stream = WritableStream::builder(BlockingSink { unblock: unblock2 })
+        .strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    // Before any write: desiredSize = HWM = 1
+    assert_eq!(writer.desired_size(), Some(1), "desiredSize must start at HWM");
+
+    let w = Arc::new(writer);
+    let wc = w.clone();
+    let write_fut = tokio::spawn(async move { wc.write(1u32).await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // While write is in-flight: desiredSize = 0 (write is counted until sink.write() completes)
+    assert_eq!(w.desired_size(), Some(0), "desiredSize must be 0 while write is in-flight");
+
+    // Unblock sink — write completes, slot freed
+    unblock.notify_one();
+    write_fut.await.unwrap().unwrap();
+
+    // After write completes: desiredSize = HWM = 1 again
+    assert_eq!(w.desired_size(), Some(1), "desiredSize must restore to HWM after write completes");
+}
