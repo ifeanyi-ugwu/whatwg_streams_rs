@@ -398,11 +398,10 @@ async fn tee_cancel_branch1_resolves_when_source_errors() {
 }
 
 // "ReadableStream teeing: failing to cancel should propagate error to branches"
-// Ignored: TeeCoordinator discards source.cancel() errors (let _ = reader.cancel(...)).
-// Propagating them back requires a cancel-result channel — tracked as a known gap.
+// The second branch cancel() waits for the coordinator to call source.cancel() and
+// returns its result. At least one branch cancel must reject when source.cancel() throws.
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore]
 async fn tee_failing_source_cancel_propagates_to_branch_cancel() {
     struct ThrowingCancelSource;
 

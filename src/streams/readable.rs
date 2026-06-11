@@ -569,9 +569,47 @@ impl AsyncSignal {
     }
 }
 
+/// Shared cancel coordination for a tee pair.
+///
+/// When both tee branches cancel, the coordinator calls source.cancel() and
+/// broadcasts the result here.  The "second" branch cancel() waits on this
+/// so the caller receives the source cancel error rather than Ok(()).
+/// `complete()` is idempotent — the first call wins; subsequent calls are no-ops.
+struct TeeCancelResult {
+    result: Mutex<Option<StreamResult<()>>>,
+    waker: futures::task::AtomicWaker,
+}
+
+impl TeeCancelResult {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            waker: futures::task::AtomicWaker::new(),
+        }
+    }
+
+    fn complete(&self, result: StreamResult<()>) {
+        let mut lock = self.result.lock();
+        if lock.is_some() {
+            return; // already completed — first call wins
+        }
+        *lock = Some(result);
+        drop(lock);
+        self.waker.wake();
+    }
+
+    fn is_done(&self) -> bool {
+        self.result.lock().is_some()
+    }
+}
+
 pub struct TeeSource<T: MaybeSend + 'static> {
     chunk_rx: UnboundedReceiver<TeeChunk<T>>,
     branch_canceled: SharedPtr<AtomicBool>,
+
+    // Cancel coordination — both TeeSource instances share these.
+    first_cancel_done: SharedPtr<AtomicBool>,
+    cancel_result: SharedPtr<TeeCancelResult>,
 
     // Optional fields used only for backpressure-aware modes.
     // None for the Unbounded fast-path.
@@ -624,7 +662,31 @@ impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
         if let Some(sig) = &self.backpressure_signal {
             sig.signal();
         }
-        Ok(())
+
+        // first_cancel_done.swap(true) returns the OLD value.
+        // If false → we are the FIRST branch to cancel; return Ok(()) immediately.
+        // If true  → we are the SECOND branch; wait for the coordinator to call
+        //            source.cancel() and propagate its result.
+        let is_second = self.first_cancel_done.swap(true, Ordering::AcqRel);
+        if !is_second {
+            return Ok(());
+        }
+
+        let cancel_result = SharedPtr::clone(&self.cancel_result);
+        poll_fn(move |cx| {
+            if cancel_result.is_done() {
+                return std::task::Poll::Ready(());
+            }
+            cancel_result.waker.register(cx.waker());
+            if cancel_result.is_done() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+
+        self.cancel_result.result.lock().clone().unwrap_or(Ok(()))
     }
 }
 
@@ -640,6 +702,8 @@ where
 
     branch1_canceled: SharedPtr<AtomicBool>,
     branch2_canceled: SharedPtr<AtomicBool>,
+
+    cancel_result: SharedPtr<TeeCancelResult>,
 
     // Backpressure configuration
     backpressure_mode: BackpressureMode,
@@ -746,6 +810,13 @@ where
     }
 
     async fn run(self) {
+        self.run_inner().await;
+        // Ensure the cancel_result is always completed so any branch cancel()
+        // waiting on it doesn't hang (e.g. when coordinator exits via EOF or error).
+        self.cancel_result.complete(Ok(()));
+    }
+
+    async fn run_inner(&self) {
         loop {
             // termination check
             let branch1_dead =
@@ -754,10 +825,12 @@ where
                 self.branch2_canceled.load(Ordering::Acquire) || self.branch2_tx.is_closed();
 
             if branch1_dead && branch2_dead {
-                let _ = self
+                let result = self
                     .reader
                     .cancel(Some("Both tee branches terminated".to_string()))
                     .await;
+                // Broadcast the source cancel result to whichever branch is waiting.
+                self.cancel_result.complete(result);
                 break;
             }
 
@@ -777,10 +850,11 @@ where
                 let branch2_dead =
                     self.branch2_canceled.load(Ordering::Acquire) || self.branch2_tx.is_closed();
                 if branch1_dead && branch2_dead {
-                    let _ = self
+                    let result = self
                         .reader
                         .cancel(Some("Both tee branches terminated".to_string()))
                         .await;
+                    self.cancel_result.complete(result);
                     return;
                 }
             }
@@ -1022,12 +1096,16 @@ where
         let branch1_hwm = branch1_strategy.high_water_mark();
         let branch2_hwm = branch2_strategy.high_water_mark();
 
+        let first_cancel_done = SharedPtr::new(AtomicBool::new(false));
+        let cancel_result = SharedPtr::new(TeeCancelResult::new());
+
         let coordinator = TeeCoordinator {
             reader,
             branch1_tx: branch1_tx.clone(),
             branch2_tx: branch2_tx.clone(),
             branch1_canceled: branch1_canceled.clone(),
             branch2_canceled: branch2_canceled.clone(),
+            cancel_result: cancel_result.clone(),
             backpressure_mode: mode,
             branch1_pending_count: branch1_pending.clone(),
             branch2_pending_count: branch2_pending.clone(),
@@ -1039,6 +1117,8 @@ where
         let source1 = TeeSource {
             chunk_rx: branch1_rx,
             branch_canceled: branch1_canceled,
+            first_cancel_done: first_cancel_done.clone(),
+            cancel_result: cancel_result.clone(),
             pending_count: branch1_pending,
             backpressure_signal: backpressure_signal.clone(),
         };
@@ -1046,6 +1126,8 @@ where
         let source2 = TeeSource {
             chunk_rx: branch2_rx,
             branch_canceled: branch2_canceled,
+            first_cancel_done,
+            cancel_result,
             pending_count: branch2_pending,
             backpressure_signal,
         };
