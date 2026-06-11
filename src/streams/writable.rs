@@ -969,9 +969,24 @@ async fn stream_task<T, Sink>(
                         }
                     }
                     InFlight::Close { completions, .. } => {
+                        // Reject the in-flight close completions.
+                        let abort_reason = inner.abort_reason.take();
+                        let abort_err = StreamError::Aborted(abort_reason);
                         for sender in completions.drain(..) {
-                            let _ = sender.send(Err(StreamError::Aborted(None)));
+                            let _ = sender.send(Err(abort_err.clone()));
                         }
+                        // Error the stream immediately with the abort reason.
+                        // Per spec: sink.abort() is NOT called once sink.close() has started.
+                        // Resolve abort completions with Ok so abort() callers don't hang.
+                        inner.state = StreamState::Errored;
+                        inner.set_stored_error(abort_err);
+                        update_flags(&inner, &backpressure, &closed, &errored);
+                        inner.abort_requested = false;
+                        for sender in inner.abort_completions.drain(..) {
+                            let _ = sender.send(Ok(()));
+                        }
+                        // The close future keeps running; Poll::Ready will see Errored state
+                        // and skip the normal close-success path.
                     }
                     _ => {}
                 }
@@ -1110,32 +1125,31 @@ async fn stream_task<T, Sink>(
                 }
                 InFlight::Close { fut, completions } => match fut.as_mut().poll(cx) {
                     Poll::Ready(res) => {
-                        // Update state and flags based on result of sink.close()
-                        match &res {
-                            Ok(()) => {
-                                // Successful close: mark stream Closed
-                                inner.state = StreamState::Closed;
+                        // completions.is_empty() means they were already drained by the abort
+                        // handler.  If they're still present we must send them now (normal close
+                        // or close that errored via controller.error() / terminate()).
+                        if completions.is_empty() && inner.state == StreamState::Errored {
+                            // Aborted during close — state and completions already handled.
+                        } else {
+                            match &res {
+                                Ok(()) => inner.state = StreamState::Closed,
+                                Err(err) => {
+                                    inner.state = StreamState::Errored;
+                                    inner.set_stored_error(err.clone());
+                                }
                             }
-                            Err(err) => {
-                                // Close failed: mark stream Errored with stored error
-                                inner.state = StreamState::Errored;
-                                inner.set_stored_error(err.clone());
+                            for sender in completions.drain(..) {
+                                let _ = sender.send(res.clone());
                             }
                         }
 
                         inner.close_requested = false;
-                        // Clear queue and reset backpressure
                         inner.queue.clear();
                         inner.queue_total_size = 0;
                         inner.backpressure = false;
 
                         update_atomic_counters(&inner, &queue_total_size);
                         update_flags(&inner, &backpressure, &closed, &errored);
-
-                        // Notify all waiting close callers with the actual close result
-                        for sender in completions.drain(..) {
-                            let _ = sender.send(res.clone());
-                        }
 
                         inflight = None;
                         cx.waker().wake_by_ref();

@@ -147,13 +147,12 @@ async fn ready_is_fulfilled_when_close_is_called() {
 // WPT close.any.js test 18 (structural: verifies close waits for pending writes)
 // Already covered by close_drains_writes_first — confirmed.
 
-// WPT close.any.js test 14: "the abort() promise during a pending close() should resolve"
-// Ignored: writable task cannot cancel an in-flight InFlight::Close future when abort()
-// arrives; sink.close() runs to completion first, so abort() hangs until close finishes.
-// Fix requires select!-based cancellation of the close future in stream_task.
+// "the abort() promise during a pending close() should resolve"
+// WPT close.any.js test 14
+// abort() during in-flight close resolves immediately — stream is errored with the abort
+// reason, close completions are rejected, and sink.abort() is NOT called per spec.
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore]
 async fn abort_during_pending_close_resolves() {
     use std::sync::Arc;
     let unblock = Arc::new(tokio::sync::Notify::new());
