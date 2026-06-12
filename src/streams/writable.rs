@@ -1116,6 +1116,14 @@ async fn stream_task<T, Sink>(
                                     let _ = sender.send(result);
                                 }
 
+                                // A write failure errors the whole stream: reject the
+                                // writes and close still queued behind it, or they hang.
+                                if inner.state == StreamState::Errored {
+                                    inner.reject_pending_after_error();
+                                    update_atomic_counters(&inner, &queue_total_size);
+                                    update_flags(&inner, &backpressure, &closed, &errored);
+                                }
+
                                 inflight = None;
                                 cx.waker().wake_by_ref();
                             }
@@ -1578,6 +1586,31 @@ impl<T: MaybeSend + 'static, Sink> WritableStreamInner<T, Sink> {
     fn set_stored_error(&self, err: StreamError) {
         let mut guard = self.stored_error.write();
         *guard = Some(err);
+    }
+
+    /// Reject every request still waiting on the stream with the stored error.
+    ///
+    /// When a `sink.write()` failure transitions the stream to Errored, the spec's
+    /// erroring procedure clears *all* pending write requests plus the close
+    /// request — not only the write whose sink call failed. Without this, a write
+    /// queued behind the failing one (and a close queued behind that) would wait on
+    /// a completion that is never sent. `close_requested` is cleared too, so the
+    /// post-error poll does not mistake the drained close queue for a clean close.
+    fn reject_pending_after_error(&mut self) {
+        let error = self.get_stored_error();
+        while let Some(pw) = self.queue.pop_front() {
+            if let Some(tx) = pw.completion_tx {
+                let _ = tx.send(Err(error.clone()));
+            }
+        }
+        self.queue_total_size = 0;
+        self.close_requested = false;
+        for c in self.close_completions.drain(..) {
+            let _ = c.send(Err(error.clone()));
+        }
+        for (c, _) in self.flush_completions.drain(..) {
+            let _ = c.send(Err(error.clone()));
+        }
     }
 }
 
