@@ -936,3 +936,142 @@ async fn pipe_to_late_abort_no_effect_after_readable_errored() {
     // Pipe already rejected due to source error — abort is a no-op
     assert!(result.is_err(), "pipe must reject due to source error");
 }
+
+// ── WPT: piping/general.any.js ───────────────────────────────────────────────
+
+// "Piping must lock both the ReadableStream and WritableStream" +
+// "Piping finishing must unlock both"
+// pipe_to() acquires a writer on the destination for the pipe's duration and
+// drops it on completion. The readable side is locked by *move* — pipe_to takes
+// the readable by value — so only the writable's runtime lock is observable here.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_locks_destination_during_and_unlocks_after() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    let unblock2 = unblock.clone();
+
+    struct BlockFirstWriteSink {
+        unblock: Arc<tokio::sync::Notify>,
+        first: bool,
+    }
+    impl WritableSink<u32> for BlockFirstWriteSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            if self.first {
+                self.first = false;
+                self.unblock.notified().await; // hold the pipe in-flight
+            }
+            Ok(())
+        }
+    }
+
+    let source = ReadableStream::from_vec(vec![1u32]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(BlockFirstWriteSink { unblock: unblock2, first: true })
+        .spawn(tokio::spawn);
+
+    assert!(!dest.locked(), "destination is unlocked before the pipe starts");
+
+    let mut pipe = Box::pin(source.pipe_to(&dest, None));
+    // Drive the pipe until it blocks in the first write: it has acquired the
+    // writer (locking dest) and the fire-and-forget write is parked in the sink.
+    let _ = tokio::time::timeout(Duration::from_millis(100), &mut pipe).await;
+    assert!(dest.locked(), "destination is locked while the pipe runs");
+
+    unblock.notify_one();
+    pipe.await.unwrap();
+    assert!(!dest.locked(), "destination is unlocked once the pipe finishes");
+}
+
+// "pipeTo must fail if the WritableStream is locked"
+// The destination already has a writer, so pipe_to's internal get_writer() fails.
+// (The readable-locked case — "pipeTo must fail if the RS is locked" — is enforced
+// at compile time: pipe_to consumes an Unlocked readable by value, so a locked one
+// cannot be passed.)
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_fails_if_destination_already_locked() {
+    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(CollectSink::<u32> {
+        collected: Default::default(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    })
+    .spawn(tokio::spawn);
+
+    // Hold a writer so the destination is locked.
+    let (_held, _writer) = dest.get_writer().expect("first get_writer succeeds");
+
+    assert!(
+        source.pipe_to(&dest, None).await.is_err(),
+        "pipe_to must fail when the destination is already locked"
+    );
+}
+
+// ── WPT: piping/flow-control.any.js ──────────────────────────────────────────
+
+// "Piping from a non-empty ReadableStream into a WritableStream that does not
+//  desire chunks"
+// HWM=0 means perpetual backpressure: the pipe blocks at writer.ready() and must
+// read nothing (no read-ahead). Erroring the destination resolves ready() with the
+// error, so the pipe rejects without ever writing. prevent_cancel mirrors the WPT
+// option and keeps the (already-exhausted) source untouched.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_into_zero_hwm_writable_reads_nothing_then_error_rejects() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let collected = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+    let sink = CollectSink {
+        collected: collected.clone(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    };
+    let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
+    let dest = WritableStream::builder(sink)
+        .strategy(CountQueuingStrategy::new(0)) // HWM=0: never desires chunks
+        .spawn(tokio::spawn);
+
+    let mut pipe = Box::pin(source.pipe_to(
+        &dest,
+        Some(StreamPipeOptions { prevent_cancel: true, ..Default::default() }),
+    ));
+
+    // Give the pipe time to block on backpressure. It must not write anything.
+    let _ = tokio::time::timeout(Duration::from_millis(100), &mut pipe).await;
+    assert!(
+        collected.lock().unwrap().is_empty(),
+        "a zero-HWM destination must receive no writes — the pipe must not read ahead"
+    );
+
+    // Error the destination; the blocked ready() now rejects, ending the pipe.
+    dest.abort(Some("boom".into())).await.unwrap();
+    assert!(pipe.await.is_err(), "pipe must reject once the destination errors");
+    assert!(
+        collected.lock().unwrap().is_empty(),
+        "no chunk should ever reach a destination that never desired one"
+    );
+}
+
+// Skipped from general.any.js — untranslatable to the Rust API, not coverage gaps:
+//
+// - "pipeTo must check the brand of its ReadableStream this value" / "...its
+//   WritableStream argument": brand checks guard against passing a non-stream
+//   object. Rust generics fix the types at compile time; there is no wrong-type
+//   value to pass.
+// - "pipeTo must fail if the ReadableStream is locked": pipe_to consumes an
+//   Unlocked readable by value, so a locked one cannot be passed — enforced by the
+//   type-state at compile time rather than a runtime check. (The WritableStream
+//   side is a runtime check and is covered by
+//   pipe_to_fails_if_destination_already_locked.)
+// - "pipeTo() should reject if an option getter grabs a writer": exercises a side
+//   effect of evaluating the options object's accessor properties. StreamPipeOptions
+//   is a plain struct of booleans — no getters, no side effects.
+// - "pipeTo() promise should resolve if null is passed": passing null options.
+//   The Rust equivalent is None, exercised by nearly every pipe test here.
