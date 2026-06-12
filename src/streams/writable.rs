@@ -188,13 +188,18 @@ where
         let high_water_mark = SharedPtr::new(AtomicUsize::new(strategy.high_water_mark()));
         let stored_error = SharedPtr::new(RwLock::new(None));
 
+        // Spec: backpressure is set at construction from the initial desiredSize
+        // (HWM − 0). A HWM of 0 means desiredSize 0, so the stream applies
+        // backpressure immediately and ready() is pending until a write drains.
+        let initial_backpressure = strategy.high_water_mark() == 0;
+
         let inner = WritableStreamInner {
             state: StreamState::Writable,
             queue: VecDeque::new(),
             queue_total_size: 0,
             strategy,
             sink: Some(sink),
-            backpressure: false,
+            backpressure: initial_backpressure,
             close_requested: false,
             close_completions: Vec::new(),
             abort_reason: None,
@@ -207,7 +212,7 @@ where
             pending_flush_commands: Vec::new(),
         };
 
-        let backpressure = SharedPtr::new(AtomicBool::new(false));
+        let backpressure = SharedPtr::new(AtomicBool::new(initial_backpressure));
         let closed = SharedPtr::new(AtomicBool::new(false));
         let errored = SharedPtr::new(AtomicBool::new(false));
         let locked = SharedPtr::new(AtomicBool::new(false));
