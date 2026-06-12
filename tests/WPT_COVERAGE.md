@@ -98,3 +98,26 @@ Covered in `writable/write.rs`, including close-waits-for-pending-writes, large-
 draining, and write-rejection clearing the queue and pending close. Skipped:
 write-to-released-writer (§2), thenable from `write()` (§4), and manual /
 failing-constructor writer tests (§6).
+
+### `piping/general.any.js`
+
+Covered in `piping/mod.rs`: `pipe_to` locks the destination for the pipe's duration
+and unlocks on completion, and fails when the destination is already locked.
+
+A note on locking, because the Rust shape differs from JS: `pipe_to(self, &dest)`
+consumes the readable by value and borrows the writable. The readable is therefore
+locked by *move* — "pipeTo must fail if the RS is locked" is compile-enforced, not a
+runtime check — while the writable keeps a runtime lock that the tests observe.
+
+Skipped: brand checks on the `this`/argument types (Rust generics fix types at
+compile time); the option-getter side-effect test (`StreamPipeOptions` is a plain
+boolean struct, no accessors); and null-options (the Rust `None`, exercised by nearly
+every pipe test).
+
+### `piping/flow-control.any.js`
+
+Covered in `piping/mod.rs`: backpressure block-then-drain and in-order delivery, plus
+piping into a zero-HWM destination — which must read nothing (no read-ahead) and
+reject once the destination errors. The zero-HWM case surfaced a construction bug:
+backpressure was hardcoded off at init, so a fresh HWM-0 writable wrongly reported
+`ready`. The remaining tests overlap the covered backpressure behaviour.
