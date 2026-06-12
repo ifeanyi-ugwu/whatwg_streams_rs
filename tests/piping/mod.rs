@@ -866,8 +866,13 @@ async fn pipe_to_signal_cancel_rejection_returned() {
     tokio::task::yield_now().await;
     abort_handle.abort();
     let result = pipe.await.unwrap();
-    // With prevent_abort=true, source cancel runs and throws — must propagate
-    assert!(result.is_err(), "pipe_to() must propagate source.cancel() rejection");
+    // With prevent_abort=true, source cancel runs and throws — the cancel rejection
+    // itself must be returned, not a generic Aborted error.
+    let msg = format!("{result:?}");
+    assert!(
+        msg.contains("cancel rejected"),
+        "pipe_to() must return the source.cancel() rejection, got {result:?}"
+    );
 }
 
 // "abort signal takes priority over closed writable"
@@ -1212,4 +1217,68 @@ async fn pipe_to_abort_waits_for_in_flight_write() {
     assert_eq!(log.len(), 2, "exactly one write then one abort");
     assert_eq!(log[0], "write:1");
     assert!(log[1].starts_with("abort:"), "abort must follow the completed write, got {:?}", log[1]);
+}
+
+// ── WPT: piping/abort.any.js ─────────────────────────────────────────────────
+
+// "a rejection from underlyingSink.abort() should be returned by pipeTo()"
+// When the signal fires and the pipe aborts the destination, a failure from
+// sink.abort() is the error pipeTo() rejects with — not a generic Aborted error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_signal_abort_returns_sink_abort_rejection() {
+    use futures::future::AbortHandle;
+
+    struct BlockingSource;
+    impl ReadableSource<u32> for BlockingSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    struct FailingAbortSink;
+    impl WritableSink<u32> for FailingAbortSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+        async fn abort(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            Err("sink abort failed".into())
+        }
+    }
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let source = ReadableStream::builder(BlockingSource).spawn(tokio::spawn);
+    let dest = WritableStream::builder(FailingAbortSink).spawn(tokio::spawn);
+
+    let pipe = tokio::spawn(async move {
+        source
+            .pipe_to(
+                &dest,
+                Some(StreamPipeOptions {
+                    signal: Some(abort_registration),
+                    ..Default::default()
+                }),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    abort_handle.abort();
+
+    let result = pipe.await.unwrap();
+    assert!(result.is_err(), "pipe must reject");
+    let msg = format!("{result:?}");
+    assert!(
+        msg.contains("sink abort failed"),
+        "pipeTo must reject with the sink.abort() rejection, got {result:?}"
+    );
 }

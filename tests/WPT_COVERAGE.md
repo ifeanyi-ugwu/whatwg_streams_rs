@@ -136,3 +136,24 @@ cases reduce to a handful: "starts closed" collapses to the empty-source close t
 "starts errored" to the source-error abort test, and "writable errors while flushing"
 to the rejected-close test. Permutations that only re-run a covered behaviour with a
 different option flag are not duplicated.
+
+### `piping/abort.any.js`
+
+Signal-driven abort is covered across the existing piping suite: a fired signal
+aborts the pipe, a pre-fired signal rejects immediately, the prevent-options gate the
+cancel/abort, and abort is a no-op after the readable has already terminated. Added:
+when the signal fires and `sink.abort()` rejects, `pipeTo` returns that rejection
+(preferred over a `source.cancel()` rejection) rather than a generic Aborted error —
+the signal-abort path had been discarding both action results.
+
+Skipped: the teed-byte-stream priority case (byte sources are a separate area), and
+the JS getter/duck-typing checks shared with pipe-through.
+
+### `piping/pipe-through.any.js`
+
+`pipe_through` data flow, close propagation, and chaining are covered. The
+prevent-option cases reduce to the `pipe_to` prevent tests (`pipe_through` pipes the
+source into the transform's writable). Skipped: duck-typed pass-through (JS structural
+typing of `{readable, writable}`); unhandled-rejection accounting; not-calling-`pipeTo`
+on the prototype; getter rethrow / option-getter side effects; and the locked-`this`
+check (the readable is consumed by move).
