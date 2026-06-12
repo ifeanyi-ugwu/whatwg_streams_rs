@@ -1227,6 +1227,22 @@ fn update_flags<T, Sink>(
 
 pub struct WritableStreamDefaultWriter<T: MaybeSend + 'static, Sink> {
     stream: WritableStream<T, Sink, Locked>,
+    // Refcounted lock guard. The writer is Clone — ready()/closed()/write() clone
+    // it internally to build 'static futures — so releasing on the first clone's
+    // Drop would free the stream's writer lock while the original handle is still
+    // live, letting a second get_writer() wrongly succeed mid-use. The lock clears
+    // only when the last handle (this guard's final refcount) drops.
+    lock: SharedPtr<WriterLockGuard>,
+}
+
+struct WriterLockGuard {
+    locked: SharedPtr<AtomicBool>,
+}
+
+impl Drop for WriterLockGuard {
+    fn drop(&mut self) {
+        self.locked.store(false, Ordering::Release);
+    }
 }
 
 impl<T: MaybeSend + 'static, Sink> WritableStreamDefaultWriter<T, Sink>
@@ -1235,7 +1251,10 @@ where
 {
     /// Create a new writer linked to the stream
     fn new(stream: WritableStream<T, Sink, Locked>) -> Self {
-        Self { stream }
+        let lock = SharedPtr::new(WriterLockGuard {
+            locked: SharedPtr::clone(&stream.locked),
+        });
+        Self { stream, lock }
     }
 
     /// Write a chunk to the stream by immediately enqueueing it for writing.
@@ -1519,15 +1538,11 @@ where
     Sink: WritableSink<T> + 'static,
 {
     pub fn release_lock(self) -> StreamResult<()> {
-        self.stream.locked.store(false, Ordering::Release);
-
+        // Dropping self releases this handle's share of the lock guard. The lock
+        // clears once the last writer handle — including any held by in-flight
+        // ready()/closed() futures — is gone.
+        drop(self);
         Ok(())
-    }
-}
-
-impl<T: MaybeSend + 'static, Sink> Drop for WritableStreamDefaultWriter<T, Sink> {
-    fn drop(&mut self) {
-        self.stream.locked.store(false, Ordering::Release);
     }
 }
 
@@ -1535,6 +1550,7 @@ impl<T: MaybeSend + 'static, Sink> Clone for WritableStreamDefaultWriter<T, Sink
     fn clone(&self) -> Self {
         Self {
             stream: self.stream.clone(),
+            lock: SharedPtr::clone(&self.lock),
         }
     }
 }
