@@ -442,14 +442,23 @@ where
             match Abortable::new(pipe_loop, reg).await {
                 Ok(result) => result,
                 Err(Aborted) => {
-                    // Handle abort signal - cancel source and abort destination
+                    // Spec shutdown-with-action: cancel the source and abort the
+                    // destination, then reject with the action's failure if one
+                    // occurred — a sink.abort() rejection preferred over a
+                    // source.cancel() one — otherwise with the abort reason.
+                    let mut action_error = None;
                     if !options.prevent_cancel {
-                        let _ = reader.cancel(Some("Aborted".to_string())).await;
+                        if let Err(e) = reader.cancel(Some("Aborted".to_string())).await {
+                            action_error = Some(e);
+                        }
                     }
                     if !options.prevent_abort {
-                        let _ = writer.abort(Some("Aborted".to_string())).await;
+                        if let Err(e) = writer.abort(Some("Aborted".to_string())).await {
+                            action_error = Some(e);
+                        }
                     }
-                    Err(StreamError::Aborted(Some("Pipe operation aborted".into())))
+                    Err(action_error
+                        .unwrap_or_else(|| StreamError::Aborted(Some("Pipe operation aborted".into()))))
                 }
             }
         } else {
