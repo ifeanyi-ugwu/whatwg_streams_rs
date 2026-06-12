@@ -1,7 +1,7 @@
 // WPT: streams/writable-streams/write.any.js
 // https://github.com/web-platform-tests/wpt/blob/master/streams/writable-streams/write.any.js
 
-use crate::helpers::{CollectSink, LifecycleSink, SlowSink};
+use crate::helpers::{CollectSink, FailAfterSink, LifecycleSink};
 use whatwg_streams::{CountQueuingStrategy, StreamResult, WritableSink, WritableStream, WritableStreamDefaultController};
 
 // ── Write ordering ────────────────────────────────────────────────────────────
@@ -362,3 +362,125 @@ async fn desired_size_tracks_queue_depth_with_inflight() {
     // After write completes: desiredSize = HWM = 1 again
     assert_eq!(w.desired_size(), Some(1), "desiredSize must restore to HWM after write completes");
 }
+
+// "WritableStream should complete asynchronous writes before close resolves"
+// close() resolves only after every queued write has been drained through the sink.
+// The sink yields inside write() to force a genuine async boundary — if close did
+// not wait, the collected vector would be short when close() resolves.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn close_waits_for_all_pending_writes() {
+    use std::sync::{Arc, Mutex};
+
+    let collected = Arc::new(Mutex::new(Vec::<u32>::new()));
+    let collected2 = collected.clone();
+
+    struct YieldSink {
+        collected: Arc<Mutex<Vec<u32>>>,
+    }
+    impl WritableSink<u32> for YieldSink {
+        async fn write(
+            &mut self,
+            chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            tokio::task::yield_now().await;
+            self.collected.lock().unwrap().push(chunk);
+            Ok(())
+        }
+    }
+
+    let stream = WritableStream::builder(YieldSink { collected: collected2 })
+        .strategy(CountQueuingStrategy::new(10))
+        .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    // Queue five writes fire-and-forget, then close without awaiting them individually.
+    for i in 1u32..=5 {
+        writer.enqueue(i).unwrap();
+    }
+    writer.close().await.unwrap();
+
+    assert_eq!(
+        *collected.lock().unwrap(),
+        vec![1, 2, 3, 4, 5],
+        "close() must resolve only after all queued writes have drained"
+    );
+}
+
+// "a large queue of writes should be processed completely"
+// Stress the queue with a high HWM and many chunks; every one must reach the sink
+// in order, and close() must wait for the whole backlog.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn large_queue_processed_completely() {
+    use std::sync::{Arc, Mutex};
+
+    let collected = Arc::new(Mutex::new(Vec::<u32>::new()));
+    let sink = CollectSink {
+        collected: collected.clone(),
+        closed: Default::default(),
+        aborted: Default::default(),
+    };
+    let stream = WritableStream::builder(sink)
+        .strategy(CountQueuingStrategy::new(1000))
+        .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    for i in 0u32..1000 {
+        writer.enqueue(i).unwrap();
+    }
+    writer.close().await.unwrap();
+
+    let got = collected.lock().unwrap();
+    assert_eq!(got.len(), 1000, "every queued chunk must reach the sink");
+    assert_eq!(got.first(), Some(&0));
+    assert_eq!(got.last(), Some(&999));
+    assert!(got.iter().copied().eq(0u32..1000), "chunks must arrive in enqueue order");
+}
+
+// "when write returns a rejected promise, queued writes and close should be cleared"
+// A write queued behind a failing write must itself reject, and a pending close()
+// must reject too — a sink error tears down the whole backlog, not just the chunk
+// that failed.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn write_rejection_clears_pending_queue_and_close() {
+    let sink = FailAfterSink {
+        fail_after: 0, // the very first sink.write() rejects
+        count: Default::default(),
+    };
+    let stream = WritableStream::builder(sink)
+        .strategy(CountQueuingStrategy::new(10))
+        .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    // Chunk 1 is queued first (ordered command channel) and will fail in the sink.
+    writer.enqueue(1u32).unwrap();
+
+    // Chunk 2 is queued behind it; its write() future must reject — not hang —
+    // once chunk 1 errors the stream. The timeout turns a regression (queued
+    // completions never sent) into a fast failure instead of a hung suite.
+    let timeout = std::time::Duration::from_secs(5);
+    let queued_write = tokio::time::timeout(timeout, writer.write(2u32))
+        .await
+        .expect("write queued behind a failing write must resolve, not hang");
+    assert!(queued_write.is_err(), "a write queued behind a failing write must be rejected");
+
+    let pending_close = tokio::time::timeout(timeout, writer.close())
+        .await
+        .expect("close behind a failing write must resolve, not hang");
+    assert!(pending_close.is_err(), "a pending close must reject when an earlier write fails");
+}
+
+// Skipped from write.any.js — untranslatable to the Rust API, not coverage gaps:
+//
+// - "writing to a released writer should reject": release_lock(self) consumes the
+//   writer by move, so calling write() on a released writer is a compile error, not
+//   a runtime rejection — the state is unrepresentable.
+// - "returning a thenable from write() should work": JS awaits any object with a
+//   .then method. A Rust sink's write() returns a concrete Future bound by the
+//   trait; there is no thenable duck-typing to exercise.
+// - "WritableStreamDefaultWriter should work when manually constructed", "failing
+//   DefaultWriter constructor should not release an existing writer": writers are
+//   obtained only via get_writer(); there is no public constructor to misuse.
