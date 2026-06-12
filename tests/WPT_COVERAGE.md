@@ -121,3 +121,18 @@ piping into a zero-HWM destination — which must read nothing (no read-ahead) a
 reject once the destination errors. The zero-HWM case surfaced a construction bug:
 backpressure was hardcoded off at init, so a fresh HWM-0 writable wrongly reported
 `ready`. The remaining tests overlap the covered backpressure behaviour.
+
+### `piping/close-propagation-forward.any.js` + `error-propagation-forward.any.js`
+
+Forward close/error propagation, the prevent-option variants, and rejected
+close/abort propagation are covered by the existing piping suite. The added tests
+cover the one behaviour those did not: shutdown must wait for an in-flight write to
+drain before closing (close-forward) or aborting (error-forward) the destination —
+the pipe's `ready()` gate enforces this.
+
+These files are large because they cross every prevent-option permutation with
+fulfilled/rejected promises and three source timings. The behaviourally distinct
+cases reduce to a handful: "starts closed" collapses to the empty-source close test,
+"starts errored" to the source-error abort test, and "writable errors while flushing"
+to the rejected-close test. Permutations that only re-run a covered behaviour with a
+different option flag are not duplicated.

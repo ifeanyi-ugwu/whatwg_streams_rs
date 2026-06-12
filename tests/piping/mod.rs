@@ -1075,3 +1075,141 @@ async fn pipe_to_into_zero_hwm_writable_reads_nothing_then_error_rejects() {
 //   is a plain struct of booleans — no getters, no side effects.
 // - "pipeTo() promise should resolve if null is passed": passing null options.
 //   The Rust equivalent is None, exercised by nearly every pipe test here.
+
+// ── WPT: piping/close-propagation-forward.any.js +
+//        piping/error-propagation-forward.any.js ───────────────────────────────
+
+// Recording sink whose write() blocks until released, logging the order of
+// write / close / abort so the "shutdown waits for the final write" invariant is
+// observable.
+#[cfg(feature = "send")]
+struct OrderRecordingSink {
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    write_started: std::sync::Arc<tokio::sync::Notify>,
+    unblock: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "send")]
+impl WritableSink<u32> for OrderRecordingSink {
+    async fn write(
+        &mut self,
+        chunk: u32,
+        _controller: &mut WritableStreamDefaultController,
+    ) -> StreamResult<()> {
+        self.events.lock().unwrap().push(format!("write:{chunk}"));
+        self.write_started.notify_one();
+        self.unblock.notified().await; // hold the write in-flight
+        Ok(())
+    }
+
+    async fn close(self) -> StreamResult<()> {
+        self.events.lock().unwrap().push("close".into());
+        Ok(())
+    }
+
+    async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
+        self.events.lock().unwrap().push(format!("abort:{}", reason.unwrap_or_default()));
+        Ok(())
+    }
+}
+
+// "Closing must be propagated forward: shutdown must not occur until the final
+//  write completes"
+// The source closes while a write is still in-flight. The pipe gates each read on
+// writer.ready(), which stays pending until the in-flight write drains, so close()
+// cannot reach the destination before the write finishes.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_close_waits_for_in_flight_write() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let write_started = Arc::new(tokio::sync::Notify::new());
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    let done = Arc::new(AtomicBool::new(false));
+
+    let source = ReadableStream::from_vec(vec![1u32]).spawn(tokio::spawn); // enqueues 1, then closes
+    let dest = WritableStream::builder(OrderRecordingSink {
+        events: events.clone(),
+        write_started: write_started.clone(),
+        unblock: unblock.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let done2 = done.clone();
+    let pipe = tokio::spawn(async move {
+        let r = source.pipe_to(&dest, None).await;
+        done2.store(true, Ordering::Release);
+        r
+    });
+
+    // Wait until the write is in-flight, then confirm no shutdown has happened.
+    write_started.notified().await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["write:1"], "destination must not be closed mid-write");
+    assert!(!done.load(Ordering::Acquire), "pipe must not complete while the write is in-flight");
+
+    // Release the write; close now propagates, after the write.
+    unblock.notify_one();
+    pipe.await.unwrap().unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["write:1", "close"],
+        "close must follow the completed write, never precede it"
+    );
+}
+
+// "Errors must be propagated forward: shutdown must not occur until the final
+//  write completes"
+// Symmetric to the close case: the source errors while a write is in-flight. The
+// pipe waits for the write to drain, then aborts the destination with the error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_abort_waits_for_in_flight_write() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let write_started = Arc::new(tokio::sync::Notify::new());
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Source enqueues 1, then errors on the next pull.
+    let source = ReadableStream::builder(ErrorAfterSource {
+        data: vec![1u32],
+        index: Default::default(),
+    })
+    .spawn(tokio::spawn);
+    let dest = WritableStream::builder(OrderRecordingSink {
+        events: events.clone(),
+        write_started: write_started.clone(),
+        unblock: unblock.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let done2 = done.clone();
+    let pipe = tokio::spawn(async move {
+        let r = source.pipe_to(&dest, None).await;
+        done2.store(true, Ordering::Release);
+        r
+    });
+
+    write_started.notified().await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["write:1"], "destination must not be aborted mid-write");
+    assert!(!done.load(Ordering::Acquire), "pipe must not complete while the write is in-flight");
+
+    unblock.notify_one();
+    let result = pipe.await.unwrap();
+    assert!(result.is_err(), "pipe must reject with the source error");
+
+    let log = events.lock().unwrap();
+    assert_eq!(log.len(), 2, "exactly one write then one abort");
+    assert_eq!(log[0], "write:1");
+    assert!(log[1].starts_with("abort:"), "abort must follow the completed write, got {:?}", log[1]);
+}
