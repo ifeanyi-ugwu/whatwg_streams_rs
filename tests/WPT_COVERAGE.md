@@ -184,6 +184,24 @@ patched-global introspection — all JS object-model concerns. The reentrant-str
 and lipfuzz files exercise JS re-entrancy and a specific string transform that add no
 distinct Rust behaviour.
 
+### `transform-streams/backpressure.any.js`, `cancel.any.js`, `flush.any.js`, `terminate.any.js`, `strategies.any.js`, `reentrant-strategies.any.js`
+
+Backpressure, cancel/abort propagation, terminate, and flush behaviour are covered by
+the existing transform suite. (Note: backpressure's "writer.closed should resolve after
+readable is canceled" tests assert a *rejection* in their bodies — the title is a WPT
+naming quirk — matching the covered reject-on-cancel behaviour.)
+
+`strategies.any.js` adds one finding: the default readable strategy diverges (HWM 1
+here, spec 0), pinned by `default_strategy_hwms` and tracked for later debate; the
+default writable strategy (1) is correct.
+
+Skipped as untranslatable: all of `reentrant-strategies.any.js` (every test calls a
+stream method *inside* `size()`, but `QueuingStrategy::size(&self, &T) -> usize` is a
+pure function with no stream access); `cancel.any.js` tests where the transformer's
+`cancel()` calls `controller.error()` (Rust's `Transformer::cancel` takes no
+controller); and the `strategies.any.js` size-function-throws / RangeError-for-bad-HWM
+cases (size is an infallible trait method; HWM is `usize`).
+
 ### `piping/pipe-through.any.js`
 
 `pipe_through` data flow, close propagation, and chaining are covered. The

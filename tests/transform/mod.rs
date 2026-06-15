@@ -1415,3 +1415,52 @@ async fn enqueue_after_terminate_errors() {
 // - "Subclassing TransformStream should work": JS prototype subclassing.
 // - properties.any.js / patched-global.any.js: property descriptors and global
 //   patching — JS object-model introspection with no Rust analogue.
+
+// ── WPT: transform-streams/strategies.any.js ─────────────────────────────────
+
+// "default writable strategy should be equivalent to { highWaterMark: 1 }" +
+// "default readable strategy should be equivalent to { highWaterMark: 0 }"
+//
+// SPEC DIVERGENCE (documented, debate later): the builder defaults the *readable*
+// strategy to HWM 1, where the spec defaults it to 0. A readable HWM of 0 applies
+// backpressure immediately — transform() does not run until a read is pending — so
+// the spec default makes `writer.write(x).await` block until the chunk is read.
+// Many tests here rely on the current HWM-1 buffer to await a write before reading;
+// flipping the default to 0 would require those to read concurrently. The writable
+// default (1) is spec-correct. The behaviour is pinned so a future change is noticed.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn default_strategy_hwms() {
+    use std::sync::{Arc, Mutex};
+    let readable_ds: Arc<Mutex<Option<Option<isize>>>> = Arc::new(Mutex::new(None));
+    struct CaptureStartT {
+        readable_ds: Arc<Mutex<Option<Option<isize>>>>,
+    }
+    impl Transformer<u32, u32> for CaptureStartT {
+        async fn start(&mut self, c: &mut TransformStreamDefaultController<u32>) -> StreamResult<()> {
+            *self.readable_ds.lock().unwrap() = Some(c.desired_size());
+            Ok(())
+        }
+        async fn transform(&mut self, chunk: u32, c: &mut TransformStreamDefaultController<u32>) -> StreamResult<()> {
+            c.enqueue(chunk)
+        }
+    }
+    let ts = TransformStream::builder(CaptureStartT { readable_ds: readable_ds.clone() })
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, _reader) = readable.get_reader().unwrap();
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+
+    // Spec-correct: default writable strategy is HWM 1.
+    assert_eq!(writer.desired_size(), Some(1), "default writable strategy is HWM 1");
+
+    // DIVERGENCE pinned: default readable strategy is HWM 1 here; the spec says 0.
+    assert_eq!(
+        *readable_ds.lock().unwrap(),
+        Some(Some(1)),
+        "default readable HWM is 1 (DIVERGENCE: spec default is 0)"
+    );
+}
