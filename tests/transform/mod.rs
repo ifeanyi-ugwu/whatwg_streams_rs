@@ -1198,3 +1198,220 @@ async fn read_before_write_delivers_chunk() {
         "pending read must receive the transformed chunk delivered before the queue"
     );
 }
+
+// ── WPT: transform-streams/errors.any.js ─────────────────────────────────────
+
+// "TransformStream errors thrown in flush put the writable and readable in an
+//  errored state"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn flush_error_errors_both_sides() {
+    struct FlushErrorT;
+    impl Transformer<u32, u32> for FlushErrorT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+        async fn flush(
+            &mut self,
+            _controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Err("flush failed".into())
+        }
+    }
+
+    let ts = TransformStream::builder(FlushErrorT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    writer.write(1u32).await.unwrap();
+    // close triggers flush(), which errors → both sides errored, close rejects.
+    assert!(writer.close().await.is_err(), "close must reject when flush() errors");
+
+    // The readable side must end in an error, not a clean close.
+    let mut errored = false;
+    for _ in 0..3 {
+        match reader.read().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("readable closed cleanly; a flush() error must error it"),
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    assert!(errored, "readable side must be errored after flush() throws");
+}
+
+// "TransformStream transformer.start() rejected promise should error the stream"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn start_rejection_errors_stream() {
+    struct FailStartT;
+    impl Transformer<u32, u32> for FailStartT {
+        async fn start(
+            &mut self,
+            _controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Err("start failed".into())
+        }
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+    }
+
+    let ts = TransformStream::builder(FailStartT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    assert!(writer.write(1u32).await.is_err(), "write must fail when start() rejected");
+    assert!(reader.read().await.is_err(), "readable must be errored when start() rejected");
+}
+
+// "the readable should be errored with the reason passed to the writable abort()"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn abort_reason_propagates_to_readable() {
+    let ts = TransformStream::builder(DoubleT).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    writer.abort(Some("custom abort reason".into())).await.unwrap();
+
+    let read = reader.read().await;
+    assert!(read.is_err(), "readable must be errored after writable.abort()");
+    let msg = format!("{read:?}");
+    assert!(
+        msg.contains("custom abort reason"),
+        "readable error must carry the abort reason, got {read:?}"
+    );
+}
+
+// ── WPT: transform-streams/general.any.js ────────────────────────────────────
+
+// "TransformStream: by default, closing the writable waits for transforms to
+//  finish before closing both"
+// A transform is held in-flight while close() is requested; close must wait for
+// that transform to enqueue its chunk before the readable closes.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn close_waits_for_in_flight_transform() {
+    use std::sync::Arc;
+
+    struct SlowT {
+        started: Arc<tokio::sync::Notify>,
+        unblock: Arc<tokio::sync::Notify>,
+    }
+    impl Transformer<u32, u32> for SlowT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.started.notify_one();
+            self.unblock.notified().await; // hold the transform in-flight
+            controller.enqueue(chunk + 100)
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    let ts = TransformStream::builder(SlowT {
+        started: started.clone(),
+        unblock: unblock.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    // Queue chunk 1: transform(1) starts and blocks.
+    writer.enqueue(1u32).unwrap();
+    started.notified().await;
+
+    // Request close while the transform is still in-flight.
+    let close_task = tokio::spawn(async move { writer.close().await });
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+
+    // Release the transform; close must complete only after it enqueues.
+    unblock.notify_one();
+    close_task.await.unwrap().unwrap();
+
+    assert_eq!(
+        reader.read().await.unwrap(),
+        Some(101),
+        "the in-flight transform's chunk must arrive before the readable closes"
+    );
+    assert_eq!(reader.read().await.unwrap(), None, "readable closes after the final transform");
+}
+
+// "enqueue() should throw after controller.terminate()"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn enqueue_after_terminate_errors() {
+    use std::sync::{Arc, Mutex};
+
+    struct TerminateT {
+        enqueue_was_err: Arc<Mutex<Option<bool>>>,
+    }
+    impl Transformer<u32, u32> for TerminateT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.terminate()?;
+            // enqueue() after terminate() must be rejected.
+            let result = controller.enqueue(chunk);
+            *self.enqueue_was_err.lock().unwrap() = Some(result.is_err());
+            Ok(())
+        }
+    }
+
+    let enqueue_was_err = Arc::new(Mutex::new(None));
+    let ts = TransformStream::builder(TerminateT {
+        enqueue_was_err: enqueue_was_err.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    let _ = writer.write(1u32).await;
+    // terminate() closes the readable side.
+    assert_eq!(reader.read().await.unwrap(), None, "terminate() closes the readable");
+    assert_eq!(
+        *enqueue_was_err.lock().unwrap(),
+        Some(true),
+        "enqueue() after terminate() must return an error"
+    );
+}
+
+// Skipped from transform-streams general.any.js / errors.any.js / properties.any.js
+// / patched-global.any.js — untranslatable to the Rust API, not coverage gaps:
+//
+// - "construct with no transform function" (identity default): the Transformer trait
+//   requires a transform() method; an identity transform is a one-line impl, not a
+//   constructor default to test.
+// - "call transformer methods as methods" / "no .apply()/.call()": JS this-binding on
+//   callbacks. Transformers are trait impls with an explicit &mut self receiver.
+// - "specifying a defined readableType/writableType should throw": guards against the
+//   string type options on the JS constructor; the Rust builder has no such field.
+// - "constructor should throw when start does" / "strategy.size throws in start()":
+//   surface synchronous constructor throwing. Construction here is infallible; a
+//   start() rejection errors the stream instead (covered by start_rejection_errors_stream).
+// - "Subclassing TransformStream should work": JS prototype subclassing.
+// - properties.any.js / patched-global.any.js: property descriptors and global
+//   patching — JS object-model introspection with no Rust analogue.

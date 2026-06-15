@@ -167,6 +167,23 @@ destination. Each combination resolves to the single-direction propagation behav
 already covered (forward abort/close, backward cancel) composed together; the matrix
 adds no behaviour not exercised by those.
 
+### `transform-streams/general.any.js` + `errors.any.js`
+
+The transform suite already covers passthrough/type-change/filter, terminate, cancel,
+backpressure, and desiredSize. Added: a flush() error errors both sides; a start()
+rejection errors the stream; the writable abort() reason reaches the readable error;
+close() waits for an in-flight transform before closing the readable; and enqueue()
+after terminate() is rejected. All passed — the transform error and ordering paths
+hold.
+
+Skipped: identity-default construction (the trait requires a transform method);
+method-as-method / `.apply`-`.call` `this`-binding; the `readableType`/`writableType`
+constructor guards; synchronous constructor throwing (construction is infallible — a
+start() rejection errors the stream instead); subclassing; and properties /
+patched-global introspection — all JS object-model concerns. The reentrant-strategies
+and lipfuzz files exercise JS re-entrancy and a specific string transform that add no
+distinct Rust behaviour.
+
 ### `piping/pipe-through.any.js`
 
 `pipe_through` data flow, close propagation, and chaining are covered. The
