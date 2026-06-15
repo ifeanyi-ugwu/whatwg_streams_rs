@@ -149,6 +149,24 @@ the signal-abort path had been discarding both action results.
 Skipped: the teed-byte-stream priority case (byte sources are a separate area), and
 the JS getter/duck-typing checks shared with pipe-through.
 
+### `piping/close-propagation-backward.any.js` + `error-propagation-backward.any.js`
+
+Backward error propagation — a destination that errors (during or after piping)
+cancels the source, with the reason passed through and rejected-cancel propagated —
+is covered by the existing piping suite. Backward *close* propagation is a documented
+divergence: `pipe_to` into an already-closed destination completes `Ok` without
+cancelling the source, where the spec cancels it. The behaviour is pinned by
+`pipe_to_already_closed_dest_returns_ok_without_cancel` and tracked for later debate;
+distinguishing a pipe-initiated close from an external one in the loop's close-arm is
+the blocker.
+
+### `piping/multiple-propagation.any.js`
+
+Combinations of an errored/closed source with an erroring/errored/closed/closing
+destination. Each combination resolves to the single-direction propagation behaviours
+already covered (forward abort/close, backward cancel) composed together; the matrix
+adds no behaviour not exercised by those.
+
 ### `piping/pipe-through.any.js`
 
 `pipe_through` data flow, close propagation, and chaining are covered. The
