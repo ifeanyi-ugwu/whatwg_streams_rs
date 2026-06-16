@@ -197,10 +197,21 @@ default writable strategy (1) is correct.
 
 Skipped as untranslatable: all of `reentrant-strategies.any.js` (every test calls a
 stream method *inside* `size()`, but `QueuingStrategy::size(&self, &T) -> usize` is a
-pure function with no stream access); `cancel.any.js` tests where the transformer's
-`cancel()` calls `controller.error()` (Rust's `Transformer::cancel` takes no
-controller); and the `strategies.any.js` size-function-throws / RangeError-for-bad-HWM
-cases (size is an infallible trait method; HWM is `usize`).
+pure function with no stream access); and the `strategies.any.js` size-function-throws /
+RangeError-for-bad-HWM cases (size is an infallible trait method; HWM is `usize`).
+
+`cancel.any.js` tests 6/7 — where the transformer's `cancel()` calls
+`controller.error()` — are not expressible as written, but the distinction is worth
+stating precisely. JS `cancel(reason)` is not passed the controller either; those
+tests reach it by capturing the controller from `start()` in a closure. The Rust
+`start()` receives `&mut TransformStreamDefaultController`, a borrow that cannot be
+stored, and the controller is not `Clone`, so it cannot be captured into `cancel()`.
+The *observable outcome* those tests assert — a `cancel()`/`abort()` that signals
+failure makes the cancel/abort/close reject — is reached idiomatically by returning
+`Err` from `cancel()`, covered by `cancel_that_throws_rejects_readable_cancel` and
+`abort_that_throws_rejects_writable_abort`. (Making the controller `Clone` — its
+fields are all `SharedPtr` — would make the error()-from-cancel mechanism expressible
+too, if that exact path is ever wanted.)
 
 ### `piping/pipe-through.any.js`
 

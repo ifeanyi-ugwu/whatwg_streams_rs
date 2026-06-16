@@ -992,9 +992,10 @@ async fn transform_discard_keeps_all_writes_completing() {
     }
 }
 
-// "writer.closed should resolve after readable is canceled"
-// WPT: backpressure.any.js — tests 8 and 10
-// Cancelling the readable errors the writable, which should cause writer.closed() to reject.
+// WPT: backpressure.any.js — tests 8 and 10, titled "writer.closed should resolve
+// after readable is canceled". The WPT title is a naming quirk: the bodies assert
+// promise_rejects_exactly(..., closed, 'closed should reject'). Cancelling the
+// readable errors the writable, so writer.closed() rejects — which is what is tested.
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn writer_closed_rejects_after_readable_cancel() {
@@ -1141,9 +1142,9 @@ async fn no_transforms_without_reader_at_hwm0() {
     let _ = write_fut.await;
 }
 
-// "writer.closed should resolve after readable is canceled with HWM=0 backpressure"
-// WPT: transform-streams/backpressure.any.js test 9
-// Same invariant as tests 8/10 (already covered) but specifically for HWM=0.
+// WPT: transform-streams/backpressure.any.js test 9, titled "writer.closed should
+// resolve after readable is canceled with backpressure". As with tests 8/10 the
+// title is a quirk — the body asserts a rejection. Same invariant, for HWM=0.
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn writer_closed_rejects_after_readable_cancel_hwm0() {
