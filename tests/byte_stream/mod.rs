@@ -263,3 +263,68 @@ async fn async_read_trait_reads_to_end() {
     stream.read_to_end(&mut out).await.unwrap();
     assert_eq!(out, b"async read");
 }
+
+// ── WPT: readable-byte-streams/general.any.js (translatable behaviours) ───────
+
+// "enqueue(), getReader(), then read(view) with smaller views"
+// A BYOB read with a buffer smaller than the queued data takes only what fits;
+// the remainder is served by the next read.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byob_partial_read_serves_remainder() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"hello".to_vec()], // 5 bytes enqueued in one pull
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    let mut buf = [0u8; 3];
+    let n1 = byob.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n1], b"hel", "first read fills the 3-byte view");
+
+    let mut buf2 = [0u8; 3];
+    let n2 = byob.read(&mut buf2).await.unwrap();
+    assert_eq!(&buf2[..n2], b"lo", "the remainder is served on the next read");
+}
+
+// "Throw on enqueue() after close()" + "Throw if close()-ed more than once"
+// The byte controller's close()/enqueue() return Result; both must reject once the
+// stream is closed.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_controller_guards_after_close() {
+    use std::sync::{Arc, Mutex};
+
+    let enqueue_err = Arc::new(Mutex::new(None));
+    let close_again_err = Arc::new(Mutex::new(None));
+
+    struct GuardSource {
+        enqueue_err: Arc<Mutex<Option<bool>>>,
+        close_again_err: Arc<Mutex<Option<bool>>>,
+    }
+    impl ReadableByteSource for GuardSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+            _buffer: &mut [u8],
+        ) -> StreamResult<usize> {
+            controller.close()?;
+            *self.enqueue_err.lock().unwrap() = Some(controller.enqueue(b"x".to_vec()).is_err());
+            *self.close_again_err.lock().unwrap() = Some(controller.close().is_err());
+            Ok(0)
+        }
+    }
+
+    let stream = ReadableStream::builder_bytes(GuardSource {
+        enqueue_err: enqueue_err.clone(),
+        close_again_err: close_again_err.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    assert_eq!(reader.read().await.unwrap(), None, "stream closes");
+    assert_eq!(*enqueue_err.lock().unwrap(), Some(true), "enqueue() after close() must error");
+    assert_eq!(*close_again_err.lock().unwrap(), Some(true), "close() twice must error");
+}
