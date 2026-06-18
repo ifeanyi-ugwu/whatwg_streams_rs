@@ -328,3 +328,84 @@ async fn byte_controller_guards_after_close() {
     assert_eq!(*enqueue_err.lock().unwrap(), Some(true), "enqueue() after close() must error");
     assert_eq!(*close_again_err.lock().unwrap(), Some(true), "close() twice must error");
 }
+
+// ── Teeing ───────────────────────────────────────────────────────────────────
+//
+// tee() on a byte stream rides the generic tee path: the branches are default
+// streams, not byte streams with BYOB readers. The branch-side behaviours
+// (cancel-one, close/error propagation) are the generic tee's, covered in
+// readable/tee.rs. What is byte-distinct, and pinned here, is that the source is
+// consumed through the byte task's read/cancel handlers — a different code path
+// from a default source feeding the same coordinator.
+
+// "ReadableStream teeing with byte source: both branches read the source to the end"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_tee_both_branches_receive_all_bytes() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"hello".to_vec(), b" world".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_l1, r1) = branch1.get_reader().unwrap();
+    let (_l2, r2) = branch2.get_reader().unwrap();
+
+    let mut b1 = Vec::new();
+    while let Some(c) = r1.read().await.unwrap() {
+        b1.extend_from_slice(&c);
+    }
+    let mut b2 = Vec::new();
+    while let Some(c) = r2.read().await.unwrap() {
+        b2.extend_from_slice(&c);
+    }
+    assert_eq!(b1, b"hello world");
+    assert_eq!(b2, b"hello world");
+}
+
+// "ReadableStream teeing with byte source: canceling both branches cancels the source"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_tee_cancelling_both_branches_cancels_source() {
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
+
+    struct CancelCountingByteSource {
+        cancels: Arc<AtomicU32>,
+    }
+    impl ReadableByteSource for CancelCountingByteSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+            _buffer: &mut [u8],
+        ) -> StreamResult<usize> {
+            controller.enqueue(b"data".to_vec())?;
+            Ok(0)
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let cancels = Arc::new(AtomicU32::new(0));
+    let stream = ReadableStream::builder_bytes(CancelCountingByteSource {
+        cancels: cancels.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+    let (_l1, r1) = branch1.get_reader().unwrap();
+    let (_l2, r2) = branch2.get_reader().unwrap();
+
+    r1.cancel(None).await.unwrap();
+    r2.cancel(None).await.unwrap();
+
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        1,
+        "byte source cancel() must fire exactly once when both tee branches cancel"
+    );
+}
