@@ -240,6 +240,12 @@ impl ReadableByteStreamController {
     }
 
     pub fn close(&mut self) -> StreamResult<()> {
+        if self.byte_state.is_closed() {
+            return Err("Stream is already closed".into());
+        }
+        if self.byte_state.is_errored() {
+            return Err("Stream is errored".into());
+        }
         self.byte_state.close();
         Ok(())
     }
