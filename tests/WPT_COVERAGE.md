@@ -236,8 +236,38 @@ BYOB read with a view smaller than the queued data serving the remainder on the 
 read, and the controller's post-close guards. The last surfaced a fix: `close()` now
 rejects on an already-closed stream (it had returned Ok), matching `enqueue()`.
 
-`read-min.any.js` (`read(view, {min})`) and `tee.any.js` for byte streams are the
-remaining translatable behaviours not yet swept.
+`read-min.any.js` (`read(view, {min})`) is skipped as untranslatable. The `{min}`
+option resolves a BYOB read only once at least N bytes are filled; both endpoints it
+spans are already reachable — `byob.read(&mut buf)` resolves on the first partial fill
+(spec `min: 1`), and `read_exact` over the `AsyncRead` impl fills the whole buffer
+(spec `min: view.length`). Arbitrary `1 < min < len` is a read loop. Rust's async-I/O
+surface (tokio/futures `AsyncRead`) offers exactly `read` (partial) and `read_exact`
+(fill) — "read at least N" is not an idiom there, so a `read_min` knob would import a
+JS-ism with no precedent. The option is part of the same `read(view, options)` surface
+already skipped (byobRequest/respond/autoAllocate), and its validation assertions
+(`min: 0` throws, `min > length` throws) only bind to a parameter that would exist
+solely to satisfy them.
+
+`tee.any.js` for byte streams: `tee()` is the generic method (`T: Clone`), so a byte
+stream tees through the same coordinator with `T = Vec<u8>` and the branches are
+**default** streams. The branch-side behaviours (both branches drain fully, cancel-one,
+close/error propagation, aggregate cancel) are the generic tee's, covered in
+`readable/tee.rs`. What is byte-distinct is the source side — the coordinator consumes
+the original through the byte task's read/cancel handlers — pinned by two tests: both
+branches read a byte source to the end, and canceling both branches fires the byte
+source's `cancel()` exactly once (the byte reader's `cancel()` runs both `cancel_source`
+and a `Cancel` command, but the source is taken once, so it is not double-invoked).
+
+Default branches are a **divergence**, not untranslatable. The spec dispatches a byte
+stream's tee through `ReadableByteStreamTee`, producing two *byte* streams whose
+branches support BYOB readers (`getReader({mode:"byob"})`, branch 2 fed via
+`CloneAsUint8Array`). The data flow is identical here, but the branches are not
+byte-typed, so a consumer cannot BYOB-read a branch into its own buffer. That is
+implementable — the source is already a byte stream — and is deferred for debate, not
+skipped: it would need a byte-specific tee path with `TeeSource: ReadableByteSource` and
+`ByteStream`-typed branches. Only the buffer-clone-via-transfer assertions are genuinely
+untranslatable: each branch reads an owned `Vec<u8>`, so there is no aliasing to
+exercise.
 
 ### `piping/pipe-through.any.js`
 
