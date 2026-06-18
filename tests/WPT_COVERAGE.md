@@ -213,6 +213,32 @@ failure makes the cancel/abort/close reject — is reached idiomatically by retu
 fields are all `SharedPtr` — would make the error()-from-cancel mechanism expressible
 too, if that exact path is ever wanted.)
 
+## Byte streams (`readable-byte-streams/`)
+
+The Rust byte API is deliberately abstracted: a source implements
+`pull(&mut self, controller, buffer: &mut [u8]) -> usize` — fill the provided buffer,
+return bytes written — plus `controller.enqueue(Vec<u8>)` / `close()` / `error()` /
+`desired_size()`. The reader side is `reader.read() -> Option<Vec<u8>>` (default) and
+`byob.read(&mut [u8]) -> usize` (BYOB).
+
+This collapses the spec's BYOBRequest machinery. There is no `byobRequest`,
+`respond()`, `respondWithNewView()`, or `autoAllocateChunkSize`, and no
+`ArrayBuffer`/`TypedArray` object model. So the large majority of
+`general.any.js` (85), and all of `bad-buffers-and-views`,
+`enqueue-with-detached-buffer`, `non-transferable-buffers`, and
+`construct-byob-request`, have no Rust API surface — they test buffer detaching,
+transferable buffers, view element types (`Uint16Array`/`Uint32Array`),
+`respond`/`respondWithNewView` ordering, and direct BYOBReader construction.
+
+Covered behaviours (existing suite plus additions): default and BYOB reads, EOF,
+cancel with reason, start/pull rejection erroring reads, reader-lock exclusivity, a
+BYOB read with a view smaller than the queued data serving the remainder on the next
+read, and the controller's post-close guards. The last surfaced a fix: `close()` now
+rejects on an already-closed stream (it had returned Ok), matching `enqueue()`.
+
+`read-min.any.js` (`read(view, {min})`) and `tee.any.js` for byte streams are the
+remaining translatable behaviours not yet swept.
+
 ### `piping/pipe-through.any.js`
 
 `pipe_through` data flow, close propagation, and chaining are covered. The
