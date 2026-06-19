@@ -1,7 +1,7 @@
 // WPT: streams/transform-streams/
 
 use whatwg_streams::{
-    StreamResult, TransformStream, TransformStreamDefaultController, Transformer,
+    CountQueuingStrategy, StreamResult, TransformStream, TransformStreamDefaultController, Transformer,
 };
 
 struct DoubleT;
@@ -173,7 +173,12 @@ async fn transform_error_errors_both_sides() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn abort_writable_errors_readable() {
-    let ts = TransformStream::builder(DoubleT).spawn(tokio::spawn);
+    // Explicit readable HWM 1: this test awaits a write before reading, which the
+    // spec-default readable HWM of 0 would deadlock. The buffer is incidental here —
+    // the subject is abort propagation, not backpressure.
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
@@ -223,6 +228,7 @@ async fn flush_called_on_writable_close() {
     let ts = TransformStream::builder(FlushTracker {
         flushed: flushed.clone(),
     })
+    .readable_strategy(CountQueuingStrategy::new(1)) // incidental buffer; subject is flush
     .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
@@ -258,7 +264,9 @@ async fn terminate_closes_readable_side() {
         }
     }
 
-    let ts = TransformStream::builder(TerminatingT).spawn(tokio::spawn);
+    let ts = TransformStream::builder(TerminatingT)
+        .readable_strategy(CountQueuingStrategy::new(1)) // incidental buffer; subject is terminate
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
@@ -289,7 +297,9 @@ async fn terminate_errors_writable_side() {
         }
     }
 
-    let ts = TransformStream::builder(TerminatingT).spawn(tokio::spawn);
+    let ts = TransformStream::builder(TerminatingT)
+        .readable_strategy(CountQueuingStrategy::new(1)) // incidental buffer; subject is terminate
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, reader) = readable.get_reader().unwrap();
@@ -1224,7 +1234,9 @@ async fn flush_error_errors_both_sides() {
         }
     }
 
-    let ts = TransformStream::builder(FlushErrorT).spawn(tokio::spawn);
+    let ts = TransformStream::builder(FlushErrorT)
+        .readable_strategy(CountQueuingStrategy::new(1)) // incidental buffer; subject is flush error
+        .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_lw, writer) = writable.get_writer().unwrap();
     let (_lr, reader) = readable.get_reader().unwrap();
@@ -1331,6 +1343,7 @@ async fn close_waits_for_in_flight_transform() {
         started: started.clone(),
         unblock: unblock.clone(),
     })
+    .readable_strategy(CountQueuingStrategy::new(1)) // incidental buffer; subject is close ordering
     .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_lw, writer) = writable.get_writer().unwrap();
@@ -1385,6 +1398,7 @@ async fn enqueue_after_terminate_errors() {
     let ts = TransformStream::builder(TerminateT {
         enqueue_was_err: enqueue_was_err.clone(),
     })
+    .readable_strategy(CountQueuingStrategy::new(1)) // incidental buffer; subject is terminate guard
     .spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_lw, writer) = writable.get_writer().unwrap();
@@ -1422,13 +1436,10 @@ async fn enqueue_after_terminate_errors() {
 // "default writable strategy should be equivalent to { highWaterMark: 1 }" +
 // "default readable strategy should be equivalent to { highWaterMark: 0 }"
 //
-// SPEC DIVERGENCE (documented, debate later): the builder defaults the *readable*
-// strategy to HWM 1, where the spec defaults it to 0. A readable HWM of 0 applies
-// backpressure immediately — transform() does not run until a read is pending — so
-// the spec default makes `writer.write(x).await` block until the chunk is read.
-// Many tests here rely on the current HWM-1 buffer to await a write before reading;
-// flipping the default to 0 would require those to read concurrently. The writable
-// default (1) is spec-correct. The behaviour is pinned so a future change is noticed.
+// A readable HWM of 0 applies backpressure immediately: transform() does not run
+// until a read is pending, so `writer.write(x).await` blocks until the chunk is read.
+// Tests whose subject is not backpressure set an explicit readable HWM 1 to keep
+// awaiting a write before reading.
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn default_strategy_hwms() {
@@ -1455,13 +1466,11 @@ async fn default_strategy_hwms() {
         tokio::task::yield_now().await;
     }
 
-    // Spec-correct: default writable strategy is HWM 1.
+    // Spec defaults: writable HWM 1, readable HWM 0.
     assert_eq!(writer.desired_size(), Some(1), "default writable strategy is HWM 1");
-
-    // DIVERGENCE pinned: default readable strategy is HWM 1 here; the spec says 0.
     assert_eq!(
         *readable_ds.lock().unwrap(),
-        Some(Some(1)),
-        "default readable HWM is 1 (DIVERGENCE: spec default is 0)"
+        Some(Some(0)),
+        "default readable strategy is HWM 0"
     );
 }

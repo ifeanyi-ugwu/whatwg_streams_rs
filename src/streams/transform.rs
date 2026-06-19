@@ -574,8 +574,9 @@ impl<I: MaybeSend + 'static, O: MaybeSend + 'static, T: Transformer<I, O> + 'sta
     fn new(transformer: T) -> Self {
         Self {
             transformer,
+            // Spec defaults: writable HWM 1, readable HWM 0.
             writable_strategy: Box::new(CountQueuingStrategy::new(1)),
-            readable_strategy: Box::new(CountQueuingStrategy::new(1)),
+            readable_strategy: Box::new(CountQueuingStrategy::new(0)),
         }
     }
 
@@ -897,8 +898,9 @@ mod tests {
     #[tokio_localset_test::localset_test]
     async fn test_abort_stream() {
         let transformer = UppercaseTransformer;
-        let transform_stream =
-            TransformStream::builder(transformer).spawn(tokio::task::spawn_local);
+        let transform_stream = TransformStream::builder(transformer)
+            .readable_strategy(CountQueuingStrategy::new(1)) // buffer to await write before read
+            .spawn(tokio::task::spawn_local);
         let (readable, writable) = transform_stream.split();
         let (_, writer) = writable.get_writer().unwrap();
         let (_, reader) = readable.get_reader().unwrap();
@@ -998,7 +1000,9 @@ mod builder_tests {
 
     #[tokio_localset_test::localset_test]
     async fn test_builder_prepare() {
-        let (stream, rfut, wfut, tfut) = TransformStream::builder(DoubleTransformer).prepare();
+        let (stream, rfut, wfut, tfut) = TransformStream::builder(DoubleTransformer)
+            .readable_strategy(CountQueuingStrategy::new(1)) // buffer to await write before read
+            .prepare();
 
         // spawn the tasks manually for the test
         tokio::task::spawn_local(rfut);
@@ -1022,7 +1026,9 @@ mod builder_tests {
 
     #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_ref() {
-        let stream = TransformStream::builder(DoubleTransformer).spawn_ref(&spawn_local_fn);
+        let stream = TransformStream::builder(DoubleTransformer)
+            .readable_strategy(CountQueuingStrategy::new(1)) // buffer to await write before read
+            .spawn_ref(&spawn_local_fn);
 
         let (readable, writable) = stream.split();
         let (_, writer) = writable.get_writer().unwrap();
@@ -1037,11 +1043,9 @@ mod builder_tests {
 
     #[tokio_localset_test::localset_test]
     async fn test_builder_spawn_parts_ref() {
-        let stream = TransformStream::builder(DoubleTransformer).spawn_parts_ref(
-            &spawn_local_fn,
-            &spawn_local_fn,
-            &spawn_local_fn,
-        );
+        let stream = TransformStream::builder(DoubleTransformer)
+            .readable_strategy(CountQueuingStrategy::new(1)) // buffer to await write before read
+            .spawn_parts_ref(&spawn_local_fn, &spawn_local_fn, &spawn_local_fn);
 
         let (readable, writable) = stream.split();
         let (_, writer) = writable.get_writer().unwrap();

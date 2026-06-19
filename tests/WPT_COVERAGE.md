@@ -191,9 +191,10 @@ the existing transform suite. (Note: backpressure's "writer.closed should resolv
 readable is canceled" tests assert a *rejection* in their bodies — the title is a WPT
 naming quirk — matching the covered reject-on-cancel behaviour.)
 
-`strategies.any.js` adds one finding: the default readable strategy diverges (HWM 1
-here, spec 0), pinned by `default_strategy_hwms` and tracked for later debate; the
-default writable strategy (1) is correct.
+`strategies.any.js`: the default strategies are spec-correct — writable HWM 1, readable
+HWM 0 — verified by `default_strategy_hwms`. (The readable default was previously HWM 1;
+correcting it to 0 means a transform with no explicit readable strategy backpressures
+immediately, so tests that await a write before reading set an explicit readable HWM 1.)
 
 Skipped as untranslatable: all of `reentrant-strategies.any.js` (every test calls a
 stream method *inside* `size()`, but `QueuingStrategy::size(&self, &T) -> usize` is a
