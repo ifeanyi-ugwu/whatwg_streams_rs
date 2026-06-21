@@ -632,45 +632,25 @@ pub struct TeeSource<T: MaybeSend + 'static> {
     backpressure_signal: Option<AsyncSignal>,
 }
 
-impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableStreamDefaultController<T>,
-    ) -> StreamResult<()> {
-        if self.branch_canceled.load(Ordering::Acquire) {
-            controller.close()?;
-            return Ok(());
-        }
-
-        match self.chunk_rx.next().await {
-            Some(TeeChunk::Data(chunk)) => {
-                // If we have pending_count (i.e., not fast-path), decrement and signal.
-                if let Some(pending) = &self.pending_count {
-                    let old = pending.fetch_sub(1, Ordering::AcqRel);
-                    if old > 0 {
-                        if let Some(sig) = &self.backpressure_signal {
-                            sig.signal();
-                        }
-                    }
+impl<T: MaybeSend + 'static> TeeSource<T> {
+    /// Backpressure bookkeeping shared by the default and byte pull paths: when a
+    /// chunk leaves this branch's queue, decrement the pending count and wake the
+    /// coordinator so it can read the next chunk from the source.
+    fn note_chunk_dequeued(&self) {
+        if let Some(pending) = &self.pending_count {
+            let old = pending.fetch_sub(1, Ordering::AcqRel);
+            if old > 0 {
+                if let Some(sig) = &self.backpressure_signal {
+                    sig.signal();
                 }
-
-                controller.enqueue(chunk)?;
-            }
-            Some(TeeChunk::End) => {
-                controller.close()?;
-            }
-            Some(TeeChunk::Error(err)) => {
-                return Err(err);
-            }
-            None => {
-                controller.close()?;
             }
         }
-
-        Ok(())
     }
 
-    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+    /// Cancel coordination shared by the default and byte sources. The first branch
+    /// to cancel resolves immediately; the second waits for the coordinator to run
+    /// the source's cancel and propagates its result.
+    async fn cancel_coordinated(&mut self) -> StreamResult<()> {
         self.branch_canceled.store(true, Ordering::Release);
 
         // Wake coordinator if we have a signal (non-fast path).
@@ -702,6 +682,73 @@ impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
         .await;
 
         self.cancel_result.result.lock().clone().unwrap_or(Ok(()))
+    }
+}
+
+impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableStreamDefaultController<T>,
+    ) -> StreamResult<()> {
+        if self.branch_canceled.load(Ordering::Acquire) {
+            controller.close()?;
+            return Ok(());
+        }
+
+        match self.chunk_rx.next().await {
+            Some(TeeChunk::Data(chunk)) => {
+                self.note_chunk_dequeued();
+                controller.enqueue(chunk)?;
+            }
+            Some(TeeChunk::End) | None => {
+                controller.close()?;
+            }
+            Some(TeeChunk::Error(err)) => {
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+        self.cancel_coordinated().await
+    }
+}
+
+// A byte stream's tee yields byte (BYOB-capable) branches: this source feeds a byte
+// branch by enqueueing each cloned chunk, mirroring the spec's CloneAsUint8Array —
+// each branch owns its bytes (byte buffers detach on BYOB read, so branches cannot
+// share one buffer).
+impl ReadableByteSource for TeeSource<Vec<u8>> {
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableByteStreamController,
+        _buffer: &mut [u8],
+    ) -> StreamResult<usize> {
+        if self.branch_canceled.load(Ordering::Acquire) {
+            controller.close()?;
+            return Ok(0);
+        }
+
+        match self.chunk_rx.next().await {
+            Some(TeeChunk::Data(chunk)) => {
+                self.note_chunk_dequeued();
+                controller.enqueue(chunk)?;
+            }
+            Some(TeeChunk::End) | None => {
+                controller.close()?;
+            }
+            Some(TeeChunk::Error(err)) => {
+                return Err(err);
+            }
+        }
+
+        Ok(0)
+    }
+
+    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+        self.cancel_coordinated().await
     }
 }
 
@@ -955,7 +1002,14 @@ where
         self.branch2_strategy = Box::new(strategy);
         self
     }
+}
 
+// Terminal methods for a default-stream tee: the branches are default streams.
+impl<T: MaybeSend + 'static, Source> TeeBuilder<T, Source, DefaultStream>
+where
+    T: Clone,
+    Source: MaybeSend + 'static,
+{
     /// Prepare without spawning: returns streams + futures for coordinator and branches
     pub fn prepare(
         self,
@@ -1068,6 +1122,125 @@ where
     }
 }
 
+// Terminal methods for a byte-stream tee: the branches are byte streams, so a consumer
+// can `get_byob_reader()` on either branch. Config (backpressure_mode/strategies) is
+// shared with the default tee via the universal TeeBuilder impl above.
+impl<Source> TeeBuilder<Vec<u8>, Source, ByteStream>
+where
+    Source: ReadableByteSource,
+{
+    /// Prepare without spawning: returns byte branches + futures for coordinator and branches
+    pub fn prepare(
+        self,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            impl Future<Output = ()>, // coordinator future
+            impl Future<Output = ()>, // branch1 future
+            impl Future<Output = ()>, // branch2 future
+        ),
+        StreamError,
+    > {
+        self.stream
+            .tee_inner_bytes(self.mode, self.branch1_strategy, self.branch2_strategy)
+    }
+
+    /// Spawn the coordinator and both branches in a single task using owned closures
+    pub fn spawn<F, R>(
+        self,
+        spawn_fn: F,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+        ),
+        StreamError,
+    >
+    where
+        F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
+    {
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
+        let fut = async move {
+            futures::join!(coord_fut, rfut1, rfut2);
+        };
+        spawn_fn(Box::pin(fut));
+        Ok((stream1, stream2))
+    }
+
+    /// Spawn the coordinator and both branches in a single task using a 'static function reference.
+    pub fn spawn_ref<F, R>(
+        self,
+        spawn_fn: &'static F,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+        ),
+        StreamError,
+    >
+    where
+        F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
+    {
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
+        let fut = async move {
+            futures::join!(coord_fut, rfut1, rfut2);
+        };
+        spawn_fn(Box::pin(fut));
+        Ok((stream1, stream2))
+    }
+
+    /// Spawn each part separately using owned closures
+    pub fn spawn_parts<R1, R2, R3, F1, F2, F3>(
+        self,
+        coordinator_spawn: F1,
+        branch1_spawn: F2,
+        branch2_spawn: F3,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+        ),
+        StreamError,
+    >
+    where
+        F1: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R1,
+        F2: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R2,
+        F3: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R3,
+    {
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
+        coordinator_spawn(Box::pin(coord_fut));
+        branch1_spawn(Box::pin(rfut1));
+        branch2_spawn(Box::pin(rfut2));
+        Ok((stream1, stream2))
+    }
+
+    /// Spawn each part separately using static function references
+    pub fn spawn_parts_ref<R1, R2, R3, F1, F2, F3>(
+        self,
+        coordinator_spawn: &'static F1,
+        branch1_spawn: &'static F2,
+        branch2_spawn: &'static F3,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+        ),
+        StreamError,
+    >
+    where
+        F1: Fn(crate::platform::PlatformFuture<'static, ()>) -> R1,
+        F2: Fn(crate::platform::PlatformFuture<'static, ()>) -> R2,
+        F3: Fn(crate::platform::PlatformFuture<'static, ()>) -> R3,
+    {
+        let (stream1, stream2, coord_fut, rfut1, rfut2) = self.prepare()?;
+        coordinator_spawn(Box::pin(coord_fut));
+        branch1_spawn(Box::pin(rfut1));
+        branch2_spawn(Box::pin(rfut2));
+        Ok((stream1, stream2))
+    }
+}
+
 impl<T: MaybeSend + 'static, Source, S> ReadableStream<T, Source, S, Unlocked>
 where
     T: Clone,
@@ -1157,6 +1330,95 @@ where
 
     pub fn tee(self) -> TeeBuilder<T, Source, S> {
         TeeBuilder::new(self)
+    }
+}
+
+// Byte tee path: the coordinator and channels are identical to the default tee — it
+// reads Vec<u8> chunks from the source and fans them out — but the branches are built
+// as byte streams (BYOB-capable), so a consumer can `get_byob_reader()` on a branch.
+impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+where
+    Source: ReadableByteSource,
+{
+    fn tee_inner_bytes(
+        self,
+        mode: BackpressureMode,
+        branch1_strategy: crate::platform::BoxedStrategyStatic<Vec<u8>>,
+        branch2_strategy: crate::platform::BoxedStrategyStatic<Vec<u8>>,
+    ) -> Result<
+        (
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            impl Future<Output = ()>, // coordinator future
+            impl Future<Output = ()>, // branch1 future
+            impl Future<Output = ()>, // branch2 future
+        ),
+        StreamError,
+    > {
+        let (_, reader) = self.get_reader()?;
+
+        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<Vec<u8>>>();
+        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<Vec<u8>>>();
+
+        let branch1_canceled = SharedPtr::new(AtomicBool::new(false));
+        let branch2_canceled = SharedPtr::new(AtomicBool::new(false));
+
+        let (branch1_pending, branch2_pending, backpressure_signal) =
+            if matches!(mode, BackpressureMode::Unbounded) {
+                (None, None, None)
+            } else {
+                (
+                    Some(SharedPtr::new(AtomicUsize::new(0))),
+                    Some(SharedPtr::new(AtomicUsize::new(0))),
+                    Some(AsyncSignal::new()),
+                )
+            };
+
+        let branch1_hwm = branch1_strategy.high_water_mark();
+        let branch2_hwm = branch2_strategy.high_water_mark();
+
+        let first_cancel_done = SharedPtr::new(AtomicBool::new(false));
+        let cancel_result = SharedPtr::new(TeeCancelResult::new());
+
+        let coordinator = TeeCoordinator {
+            reader,
+            branch1_tx: branch1_tx.clone(),
+            branch2_tx: branch2_tx.clone(),
+            branch1_canceled: branch1_canceled.clone(),
+            branch2_canceled: branch2_canceled.clone(),
+            cancel_result: cancel_result.clone(),
+            backpressure_mode: mode,
+            branch1_pending_count: branch1_pending.clone(),
+            branch2_pending_count: branch2_pending.clone(),
+            backpressure_signal: backpressure_signal.clone(),
+            branch1_high_water_mark: branch1_hwm,
+            branch2_high_water_mark: branch2_hwm,
+        };
+
+        let source1 = TeeSource {
+            chunk_rx: branch1_rx,
+            branch_canceled: branch1_canceled,
+            first_cancel_done: first_cancel_done.clone(),
+            cancel_result: cancel_result.clone(),
+            pending_count: branch1_pending,
+            backpressure_signal: backpressure_signal.clone(),
+        };
+
+        let source2 = TeeSource {
+            chunk_rx: branch2_rx,
+            branch_canceled: branch2_canceled,
+            first_cancel_done,
+            cancel_result,
+            pending_count: branch2_pending,
+            backpressure_signal,
+        };
+
+        let (stream1, rfut1) = ReadableStream::new_bytes_inner(source1, branch1_strategy);
+        let (stream2, rfut2) = ReadableStream::new_bytes_inner(source2, branch2_strategy);
+
+        let coordinator_fut = coordinator.run();
+
+        Ok((stream1, stream2, coordinator_fut, rfut1, rfut2))
     }
 }
 
