@@ -409,3 +409,34 @@ async fn byte_tee_cancelling_both_branches_cancels_source() {
         "byte source cancel() must fire exactly once when both tee branches cancel"
     );
 }
+
+// "ReadableStream teeing with byte source: branches are byte (BYOB-capable) streams"
+// The point of byte tee: each branch is itself a byte stream, so a consumer can take a
+// BYOB reader on a branch and read into their own buffer. Each branch owns its bytes
+// (the spec's CloneAsUint8Array), so both drain the full content independently.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_tee_branch_supports_byob_reader() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"hello".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (branch1, branch2) = stream.tee().spawn(tokio::spawn).unwrap();
+
+    // Branch 1: BYOB read into a caller-owned buffer (only possible if the branch is
+    // a byte stream — this would not compile on a default-stream branch).
+    let (_l1, byob) = branch1.get_byob_reader().unwrap();
+    let mut buf = [0u8; 16];
+    let n = byob.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello");
+
+    // Branch 2 independently drains the same content via a default reader.
+    let (_l2, r2) = branch2.get_reader().unwrap();
+    let mut b2 = Vec::new();
+    while let Some(c) = r2.read().await.unwrap() {
+        b2.extend_from_slice(&c);
+    }
+    assert_eq!(b2, b"hello");
+}

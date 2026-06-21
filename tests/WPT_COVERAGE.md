@@ -249,26 +249,21 @@ already skipped (byobRequest/respond/autoAllocate), and its validation assertion
 (`min: 0` throws, `min > length` throws) only bind to a parameter that would exist
 solely to satisfy them.
 
-`tee.any.js` for byte streams: `tee()` is the generic method (`T: Clone`), so a byte
-stream tees through the same coordinator with `T = Vec<u8>` and the branches are
-**default** streams. The branch-side behaviours (both branches drain fully, cancel-one,
-close/error propagation, aggregate cancel) are the generic tee's, covered in
-`readable/tee.rs`. What is byte-distinct is the source side — the coordinator consumes
-the original through the byte task's read/cancel handlers — pinned by two tests: both
-branches read a byte source to the end, and canceling both branches fires the byte
-source's `cancel()` exactly once (the byte reader's `cancel()` runs both `cancel_source`
-and a `Cancel` command, but the source is taken once, so it is not double-invoked).
+`tee.any.js` for byte streams: `tee()` on a byte stream yields two **byte** branches
+(`ReadableStream<Vec<u8>, _, ByteStream>`), so a consumer can take a BYOB reader on a
+branch and read into their own buffer — pinned by `byte_tee_branch_supports_byob_reader`.
+Both branches drain the full content independently (each owns its `Vec<u8>`), cancel-one
+keeps the other live, and canceling both fires the source's `cancel()` exactly once —
+covered by the byte-tee tests plus the generic tee suite in `readable/tee.rs` (the
+coordinator and channels are shared between default and byte tee).
 
-Default branches are a **divergence**, not untranslatable. The spec dispatches a byte
-stream's tee through `ReadableByteStreamTee`, producing two *byte* streams whose
-branches support BYOB readers (`getReader({mode:"byob"})`, branch 2 fed via
-`CloneAsUint8Array`). The data flow is identical here, but the branches are not
-byte-typed, so a consumer cannot BYOB-read a branch into its own buffer. That is
-implementable — the source is already a byte stream — and is deferred for debate, not
-skipped: it would need a byte-specific tee path with `TeeSource: ReadableByteSource` and
-`ByteStream`-typed branches. Only the buffer-clone-via-transfer assertions are genuinely
-untranslatable: each branch reads an owned `Vec<u8>`, so there is no aliasing to
-exercise.
+This was previously a divergence (byte tee yielded *default* branches). It is now
+implemented: `tee()` stays universal, and the `TeeBuilder` terminal methods are split by
+pinning `S` to a concrete type (`DefaultStream` vs `ByteStream`), so no specialization is
+needed. The handing of an owned `Vec<u8>` to each branch is exactly the spec's
+`CloneAsUint8Array` — the spec copies for branch 2 precisely because BYOB reads detach the
+buffer, so branches cannot share one. The only genuinely untranslatable part is the
+JS-level buffer-aliasing assertions, which do not exist when each branch owns its bytes.
 
 ### `piping/pipe-through.any.js`
 
