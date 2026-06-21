@@ -5,7 +5,7 @@ A high-performance, WHATWG Streams API-compliant implementation for Rust, provid
 [![Crates.io](https://img.shields.io/crates/v/whatwg_streams.svg)](https://crates.io/crates/whatwg_streams)
 [![Documentation](https://docs.rs/whatwg_streams/badge.svg)](https://docs.rs/whatwg_streams)
 
-This crate mirrors the browser Streams API while adapting to Rust's ownership model and async ecosystem. It provides built-in flow control to prevent memory exhaustion, zero-copy operations for efficiency, and type-safe locking to prevent reader/writer conflicts at compile time.
+This crate mirrors the browser Streams API while adapting to Rust's ownership model and async ecosystem. It provides built-in flow control to prevent memory exhaustion, BYOB byte readers that read directly into a caller-owned buffer (no intermediate allocation), and type-safe locking to prevent reader/writer conflicts at compile time.
 
 ## Quick Start
 
@@ -14,6 +14,18 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 whatwg_streams = "0.1.0"
+```
+
+## Runnable examples
+
+The [`examples/`](examples/) directory has small, self-contained programs for each
+core surface:
+
+```sh
+cargo run --example readable_source   # implement a ReadableStream source
+cargo run --example writable_sink     # implement a WritableStream sink
+cargo run --example transform         # a stateful TransformStream with a flush trailer
+cargo run --example piping            # pipe_through + pipe_to a source → transform → sink
 ```
 
 ## Runtime Agnostic
@@ -220,6 +232,13 @@ assert_eq!(reader.read().await.unwrap(), Some("HELLO".to_string()));
 assert_eq!(reader.read().await.unwrap(), Some("WORLD".to_string()));
 ```
 
+> **Note:** the readable side of a `TransformStream` defaults to a high-water mark of
+> `0` (matching the spec), so a `write` resolves only once the readable side is read.
+> Drive the two sides concurrently — via `pipe_through`/`pipe_to` as above, or by
+> producing and consuming on separate tasks. Writing and then reading *sequentially* on
+> the same task will deadlock. Set an explicit `readable_strategy` if you want the
+> readable side to buffer ahead.
+
 ## Core Concepts
 
 ### ReadableStream
@@ -288,7 +307,9 @@ writer.enqueue_when_ready(data4).await?; // Waits for ready, then enqueues
 
 ### Byte Streams
 
-Optimized for binary data with zero-copy operations:
+Optimized for binary data: a BYOB ("bring your own buffer") reader fills a
+caller-owned buffer directly, so a single reader avoids an intermediate allocation
+per chunk:
 
 ```rust
 use whatwg_streams::ReadableByteSource;
@@ -314,7 +335,7 @@ impl ReadableByteSource for FileByteSource {
 let stream = ReadableStream::builder_bytes(source)
     .spawn(tokio::task::spawn);
 
-// BYOB reader for zero-copy reads
+// BYOB reader: reads bytes straight into your buffer
 let (_, reader) = stream.get_byob_reader().unwrap();
 let mut buffer = [0u8; 1024];
 let bytes_read = reader.read(&mut buffer).await?;
@@ -345,9 +366,9 @@ Connect readable and writable streams:
 source_stream.pipe_to(&destination_stream, None).await?;
 
 // With options
-use futures::future::AbortRegistration;
+use futures::future::AbortHandle;
 
-let (abort_handle, registration) = AbortRegistration::new();
+let (abort_handle, registration) = AbortHandle::new_pair();
 let options = StreamPipeOptions {
     prevent_close: false,
     prevent_abort: false,
