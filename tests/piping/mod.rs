@@ -1285,23 +1285,12 @@ async fn pipe_to_signal_abort_returns_sink_abort_rejection() {
 
 // ── WPT: piping/close-propagation-backward.any.js ────────────────────────────
 
-// SPEC DIVERGENCE (documented, debate later): piping into an already-closed
-// destination.
-//
-// WPT close-propagation-backward expects a closed destination to propagate
-// backward — the source is cancelled (so it can release its resources). This
-// pipe_to instead completes Ok and leaves the source untouched: the loop's
-// writer.closed() arm treats an externally-closed writable as a clean finish and
-// returns Ok without cancelling. Distinguishing "the pipe closed the destination"
-// (normal, no cancel) from "someone else closed it" (cancel) means reworking the
-// close-arm, so the current behaviour is pinned here rather than changed at the
-// tail of this work. The errored-destination path does cancel the source (covered
-// by pipe_to_dest_error_cancels_source).
-//
-// This test asserts the *current* behaviour so a future change is noticed.
+// "Closing must be propagated backward": piping into an already-closed (or
+// externally-closed) destination cancels the source — so it can release its
+// resources — and rejects, since a chunk cannot be written into a closed stream.
 #[cfg(feature = "send")]
 #[tokio::test]
-async fn pipe_to_already_closed_dest_returns_ok_without_cancel() {
+async fn pipe_to_closed_dest_cancels_source_and_rejects() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -1338,10 +1327,10 @@ async fn pipe_to_already_closed_dest_returns_ok_without_cancel() {
 
     let result = source.pipe_to(&dest, None).await;
 
-    // Current behaviour: completes Ok, source not cancelled. Spec would cancel it.
-    assert!(result.is_ok(), "pipe into a closed dest currently completes Ok, got {result:?}");
+    // The pipe awaits the source cancel before returning, so `cancelled` is set by now.
+    assert!(result.is_err(), "piping into a closed destination must reject, got {result:?}");
     assert!(
-        !cancelled.load(Ordering::Acquire),
-        "DIVERGENCE pinned: source is not cancelled (spec would cancel it backward)"
+        cancelled.load(Ordering::Acquire),
+        "the source must be cancelled when the destination is already closed"
     );
 }

@@ -153,12 +153,11 @@ the JS getter/duck-typing checks shared with pipe-through.
 
 Backward error propagation — a destination that errors (during or after piping)
 cancels the source, with the reason passed through and rejected-cancel propagated —
-is covered by the existing piping suite. Backward *close* propagation is a documented
-divergence: `pipe_to` into an already-closed destination completes `Ok` without
-cancelling the source, where the spec cancels it. The behaviour is pinned by
-`pipe_to_already_closed_dest_returns_ok_without_cancel` and tracked for later debate;
-distinguishing a pipe-initiated close from an external one in the loop's close-arm is
-the blocker.
+is covered by the existing piping suite. Backward *close* propagation is covered too:
+`pipe_to` into an already-closed (or externally-closed) destination cancels the source
+and rejects — pinned by `pipe_to_closed_dest_cancels_source_and_rejects`. The pipe's own
+close (source exhausted → `writer.close()`) is a separate arm that returns directly, so
+this only affects a destination closed out from under the pipe.
 
 ### `piping/multiple-propagation.any.js`
 
