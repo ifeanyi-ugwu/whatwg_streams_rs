@@ -414,7 +414,26 @@ where
                                     }
                                     return Err(write_err);
                                 }
-                                Ok(()) => return Ok(()), // writer closed externally
+                                Ok(()) => {
+                                    // The destination closed while the pipe was still
+                                    // live (it started closed, or was closed by someone
+                                    // else). Closing propagates backward: cancel the
+                                    // source so it can release resources, and reject —
+                                    // a chunk cannot be piped into a closed stream. If
+                                    // the cancel itself fails, that failure is what
+                                    // pipeTo rejects with.
+                                    let reason =
+                                        "cannot pipe to a closed writable stream".to_string();
+                                    let mut result_err = StreamError::from(reason.clone());
+                                    if !options.prevent_cancel {
+                                        if let Err(cancel_err) =
+                                            reader.cancel(Some(reason)).await
+                                        {
+                                            result_err = cancel_err;
+                                        }
+                                    }
+                                    return Err(result_err);
+                                }
                             }
                         }
                     }
