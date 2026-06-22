@@ -708,8 +708,26 @@ where
     }
 }
 
+/// The underlying destination for a [`WritableStream`]: the sink receives each
+/// chunk and is told when the stream finishes or is torn down.
+///
+/// # Teardown and the close/abort relationship
+///
+/// `close` takes `self` by value — closing consumes the sink, which is convenient
+/// when finishing means turning accumulated state into a final result. A consequence
+/// of owned-close is that **`abort` is not called once `close` is in flight**: by the
+/// time an abort arrives during a pending close, the sink has already been moved into
+/// the close operation. (The stream's promises still behave per spec — the close
+/// rejects with the abort reason and the abort resolves — only the sink-side `abort`
+/// callback is skipped in that interleaving.)
+///
+/// For cleanup that must run no matter how the stream ends — normal close, abort, or
+/// an interrupted close — implement [`Drop`] on the sink rather than relying on
+/// `abort`. The sink is always dropped when the stream finishes, so `Drop` is the
+/// reliable teardown hook; `abort` is best used for the *reason*-carrying side effects
+/// of an explicit abort.
 pub trait WritableSink<T: MaybeSend + 'static>: MaybeSend + Sized + 'static {
-    /// Start the sink
+    /// Called once before the first write, to set up the sink.
     fn start(
         &mut self,
         #[allow(unused)] controller: &mut WritableStreamDefaultController,
@@ -717,19 +735,25 @@ pub trait WritableSink<T: MaybeSend + 'static>: MaybeSend + Sized + 'static {
         future::ready(Ok(())) // default no-op
     }
 
-    /// Write a chunk to the sink
+    /// Called for each chunk written to the stream. Returning the future unresolved
+    /// applies backpressure: the writer's `write` does not resolve until this does.
     fn write(
         &mut self,
         chunk: T,
         controller: &mut WritableStreamDefaultController,
     ) -> impl std::future::Future<Output = StreamResult<()>> + MaybeSend;
 
-    /// Close the sink
+    /// Called once after all writes complete, when the writer closes the stream.
+    ///
+    /// Takes `self` by value so the sink can consume its accumulated state to produce
+    /// a final result. Not called if the stream is aborted instead of closed. See the
+    /// trait docs for why teardown that must always run belongs in [`Drop`].
     fn close(self) -> impl Future<Output = StreamResult<()>> + MaybeSend {
         future::ready(Ok(())) // default no-op
     }
 
-    /// Abort the sink
+    /// Called when the stream is aborted with the abort reason, for reason-carrying
+    /// cleanup. Not called once `close` is already in flight — see the trait docs.
     fn abort(
         &mut self,
         reason: Option<String>,
