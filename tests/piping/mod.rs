@@ -283,7 +283,7 @@ async fn pipe_through_chain() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_aborts_pipe() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
     use whatwg_streams::StreamError;
 
     struct BlockingSource;
@@ -297,7 +297,8 @@ async fn pipe_to_signal_aborts_pipe() {
         }
     }
 
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let controller = AbortController::new();
+    let signal = controller.signal();
     let source = ReadableStream::builder(BlockingSource).spawn(tokio::spawn);
     let sink = CollectSink::<u32> {
         collected: Default::default(),
@@ -311,7 +312,7 @@ async fn pipe_to_signal_aborts_pipe() {
             .pipe_to(
                 &dest,
                 Some(StreamPipeOptions {
-                    signal: Some(abort_registration),
+                    signal: Some(signal),
                     ..Default::default()
                 }),
             )
@@ -324,7 +325,7 @@ async fn pipe_to_signal_aborts_pipe() {
 
     // Fire abort while source is stuck — previously this deadlocked because
     // reader.cancel() could not resolve while pull_future was in flight.
-    abort_handle.abort();
+    controller.abort(None);
 
     let result = pipe.await.unwrap();
     assert!(
@@ -338,12 +339,13 @@ async fn pipe_to_signal_aborts_pipe() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_pre_aborted_signal_errors_immediately() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
     use whatwg_streams::StreamError;
 
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let controller = AbortController::new();
+    let signal = controller.signal();
     // Fire the signal before piping even starts
-    abort_handle.abort();
+    controller.abort(None);
 
     let source = ReadableStream::from_vec(vec![1u32, 2, 3]).spawn(tokio::spawn);
     let sink = CollectSink::<u32> {
@@ -357,7 +359,7 @@ async fn pipe_to_pre_aborted_signal_errors_immediately() {
         .pipe_to(
             &dest,
             Some(StreamPipeOptions {
-                signal: Some(abort_registration),
+                signal: Some(signal),
                 ..Default::default()
             }),
         )
@@ -374,7 +376,7 @@ async fn pipe_to_pre_aborted_signal_errors_immediately() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
 
     struct BlockingSource;
     impl ReadableSource<u32> for BlockingSource {
@@ -387,7 +389,8 @@ async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
         }
     }
 
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let controller = AbortController::new();
+    let signal = controller.signal();
     let aborted = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let sink = CollectSink::<u32> {
         collected: Default::default(),
@@ -403,7 +406,7 @@ async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
             .pipe_to(
                 &dest,
                 Some(StreamPipeOptions {
-                    signal: Some(abort_registration),
+                    signal: Some(signal),
                     prevent_abort: true,
                     ..Default::default()
                 }),
@@ -413,7 +416,7 @@ async fn pipe_to_signal_with_prevent_abort_skips_sink_abort() {
 
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
-    abort_handle.abort();
+    controller.abort(None);
 
     assert!(
         pipe.await.unwrap().is_err(),
@@ -838,7 +841,7 @@ async fn pipe_to_cancel_rejection_on_dest_error_propagates_backward() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_cancel_rejection_returned() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
 
     struct BlockThenErrorCancel;
     impl ReadableSource<u32> for BlockThenErrorCancel {
@@ -851,20 +854,21 @@ async fn pipe_to_signal_cancel_rejection_returned() {
         }
     }
 
-    let (abort_handle, abort_reg) = AbortHandle::new_pair();
+    let controller = AbortController::new();
+    let signal = controller.signal();
     let source = ReadableStream::builder(BlockThenErrorCancel).spawn(tokio::spawn);
     let dest = WritableStream::builder(crate::helpers::LifecycleSink::default()).spawn(tokio::spawn);
 
     let pipe = tokio::spawn(async move {
         source.pipe_to(&dest, Some(StreamPipeOptions {
-            signal: Some(abort_reg),
+            signal: Some(signal),
             prevent_abort: true, // skip sink abort so we get the cancel error
             ..Default::default()
         })).await
     });
 
     tokio::task::yield_now().await;
-    abort_handle.abort();
+    controller.abort(None);
     let result = pipe.await.unwrap();
     // With prevent_abort=true, source cancel runs and throws — the cancel rejection
     // itself must be returned, not a generic Aborted error.
@@ -880,11 +884,12 @@ async fn pipe_to_signal_cancel_rejection_returned() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_priority_over_closed_writable() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
 
     // Pre-abort the signal
-    let (abort_handle, abort_reg) = AbortHandle::new_pair();
-    abort_handle.abort();
+    let controller = AbortController::new();
+    let signal = controller.signal();
+    controller.abort(None);
 
     let source = ReadableStream::from_vec(vec![1u32]).spawn(tokio::spawn);
     let dest = WritableStream::builder(crate::helpers::LifecycleSink::default()).spawn(tokio::spawn);
@@ -895,7 +900,7 @@ async fn pipe_to_signal_priority_over_closed_writable() {
     }
 
     let result = source.pipe_to(&dest, Some(StreamPipeOptions {
-        signal: Some(abort_reg),
+        signal: Some(signal),
         ..Default::default()
     })).await;
     // Abort signal should win — pipe_to errors
@@ -907,9 +912,10 @@ async fn pipe_to_signal_priority_over_closed_writable() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_late_abort_no_effect_after_readable_errored() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
 
-    let (abort_handle, abort_reg) = AbortHandle::new_pair();
+    let controller = AbortController::new();
+    let signal = controller.signal();
     let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
     let sink = CollectSink {
         collected: collected.clone(),
@@ -927,7 +933,7 @@ async fn pipe_to_late_abort_no_effect_after_readable_errored() {
     // Pipe starts, source errors, pipe rejects
     let pipe = tokio::spawn(async move {
         source.pipe_to(&dest, Some(StreamPipeOptions {
-            signal: Some(abort_reg),
+            signal: Some(signal),
             ..Default::default()
         })).await
     });
@@ -935,11 +941,77 @@ async fn pipe_to_late_abort_no_effect_after_readable_errored() {
     // Fire abort AFTER pipe has already errored
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
-    abort_handle.abort();
+    controller.abort(None);
 
     let result = pipe.await.unwrap();
     // Pipe already rejected due to source error — abort is a no-op
     assert!(result.is_err(), "pipe must reject due to source error");
+}
+
+// "the signal's reason propagates into cancel(), abort(), and the rejection"
+// WPT abort.any.js — the reason given to AbortController.abort() must reach the
+// source cancel(), the destination abort(), and the final pipeTo() rejection.
+// Unwritable before AbortSignal carried a reason: AbortRegistration had none, so
+// the pipe substituted a hardcoded "Aborted" string for all three.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_signal_reason_propagates_to_cancel_abort_and_rejection() {
+    use whatwg_streams::AbortController;
+
+    let controller = AbortController::new();
+    let signal = controller.signal();
+
+    // Source has no data, so it hangs in pull() until cancelled, keeping the
+    // pipe live when the signal fires.
+    let cancel_reason = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let source = ReadableStream::builder(CancelTrackingSource {
+        data: vec![],
+        index: 0,
+        cancel_reason: cancel_reason.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let abort_reason = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let sink = CollectSink::<u32> {
+        collected: Default::default(),
+        closed: Default::default(),
+        aborted: abort_reason.clone(),
+    };
+    let dest = WritableStream::builder(sink).spawn(tokio::spawn);
+
+    let pipe = tokio::spawn(async move {
+        source
+            .pipe_to(
+                &dest,
+                Some(StreamPipeOptions {
+                    signal: Some(signal),
+                    ..Default::default()
+                }),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    controller.abort(Some("custom abort reason".to_string()));
+
+    let result = pipe.await.unwrap();
+
+    assert_eq!(
+        result,
+        Err(StreamError::Aborted(Some("custom abort reason".to_string()))),
+        "pipeTo must reject with the signal's reason, got {result:?}"
+    );
+    assert_eq!(
+        cancel_reason.lock().unwrap().as_deref(),
+        Some("custom abort reason"),
+        "the signal's reason must reach source.cancel()"
+    );
+    assert_eq!(
+        abort_reason.lock().unwrap().as_deref(),
+        Some("custom abort reason"),
+        "the signal's reason must reach sink.abort()"
+    );
 }
 
 // ── WPT: piping/general.any.js ───────────────────────────────────────────────
@@ -1227,7 +1299,7 @@ async fn pipe_to_abort_waits_for_in_flight_write() {
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn pipe_to_signal_abort_returns_sink_abort_rejection() {
-    use futures::future::AbortHandle;
+    use whatwg_streams::AbortController;
 
     struct BlockingSource;
     impl ReadableSource<u32> for BlockingSource {
@@ -1254,7 +1326,8 @@ async fn pipe_to_signal_abort_returns_sink_abort_rejection() {
         }
     }
 
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let controller = AbortController::new();
+    let signal = controller.signal();
     let source = ReadableStream::builder(BlockingSource).spawn(tokio::spawn);
     let dest = WritableStream::builder(FailingAbortSink).spawn(tokio::spawn);
 
@@ -1263,7 +1336,7 @@ async fn pipe_to_signal_abort_returns_sink_abort_rejection() {
             .pipe_to(
                 &dest,
                 Some(StreamPipeOptions {
-                    signal: Some(abort_registration),
+                    signal: Some(signal),
                     ..Default::default()
                 }),
             )
@@ -1272,7 +1345,7 @@ async fn pipe_to_signal_abort_returns_sink_abort_rejection() {
 
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
-    abort_handle.abort();
+    controller.abort(None);
 
     let result = pipe.await.unwrap();
     assert!(result.is_err(), "pipe must reject");
