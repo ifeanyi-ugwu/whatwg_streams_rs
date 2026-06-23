@@ -8,14 +8,14 @@ chrono = { version = "0.4.41", features = ["serde"] }
 flate2 = "1.1.2"
 futures = "0.3.31"
 futures-util = "0.3.31"
-serde = "1.0.219"
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 tar = "0.4.44"
 tokio = { version = "1.47.1", features = ['full'] }
 tokio-tungstenite = "0.27.0"
 url = "2.5.7"
 uuid = { version = "1.18.0", features = ["v4"] }
-whatwg_streams = { version = "*", path = "/Users/ifeanyi/Projects/Personal/open-source/whatwg_streams/whatwg_streams_rs" }
+whatwg_streams = { path = "../whatwg_streams_rs" }
 
 [[example]]
 name = "log_filter"
@@ -36,10 +36,6 @@ path = "examples/file_processing/csv_processor.rs"
 [[example]]
 name = "websocket_proxy"
 path = "examples/network/websocket_proxy.rs"
-
-[[example]]
-name = "websocket"
-path = "examples/network/websocket.rs"
 
 [[example]]
 name = "tcp_relay"

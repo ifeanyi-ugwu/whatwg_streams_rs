@@ -1,200 +1,66 @@
-# WHATWG Streams Examples
+# whatwg_streams examples
 
-This directory contains comprehensive examples demonstrating real-world usage of the WHATWG Streams implementation in Rust.
-
-## 📁 Directory Structure
-
-### [`basic/`](basic/)
-
-Fundamental stream operations - start here!
-
-- **[`simple_readable.rs`](basic/simple_readable.rs)** - Basic readable stream creation and consumption
-- **`simple_writable.rs`** - Basic writable stream operations
-- **`simple_transform.rs`** - Simple 1:1 transforms
-
-### [`file_processing/`](file_processing/)
-
-Real-world file processing pipelines
-
-- **[`log_filter.rs`](file_processing/log_filter.rs)** - Filter log files for ERROR entries
-- **`csv_processor.rs`** - Stream CSV parsing and filtering
-- **`json_stream.rs`** - Streaming JSON processing
-
-### [`compression/`](compression/)
-
-Data compression and decompression streams
-
-- **[`gzip_transform.rs`](compression/gzip_transform.rs)** - Stream gzip compression
-- **`decompress_stream.rs`** - Stream decompression
-- **`archive_creator.rs`** - Multi-file archive creation
-
-### [`bytes/`](bytes/)
-
-Binary data and BYOB (Bring Your Own Buffer) examples
-
-- **[`file_reader_byob.rs`](bytes/file_reader_byob.rs)** - Efficient large file reading with buffer reuse
-- **`buffer_pool.rs`** - Buffer pooling patterns
-- **`binary_protocol.rs`** - Binary protocol parsing
-
-### [`network/`](network/)
-
-Network streaming examples
-
-- **`http_response.rs`** - Stream HTTP responses
-- **`websocket_proxy.rs`** - WebSocket message transformation
-- **`tcp_relay.rs`** - TCP data relay with transforms
-
-### [`advanced/`](advanced/)
-
-Complex scenarios and advanced patterns
-
-- **[`multi_stage_pipeline.rs`](advanced/multi_stage_pipeline.rs)** - Complex pipeline with multiple transforms
-- **`backpressure_demo.rs`** - Demonstrating backpressure handling
-- **`error_recovery.rs`** - Error handling and recovery patterns
-
-## 🚀 Quick Start
-
-### Running Examples
-
-Each example is self-contained and can be run with:
+A gallery of standalone programs exercising the [`whatwg_streams`](../../whatwg_streams_rs)
+crate, a Rust port of the WHATWG Streams API. Each file is self-contained; run one with:
 
 ```bash
-# Basic examples
-cargo run --bin simple_readable
-
-# File processing
-cargo run --bin log_filter
-cargo run --bin gzip_transform
-
-# BYOB demonstrations
-cargo run --bin file_reader_byob
-
-# Complex pipelines
-cargo run --bin multi_stage_pipeline
+cargo run --example <name>
 ```
 
-### Key Learning Path
+## Examples
 
-1. **Start with basics**: `simple_readable.rs` → understand stream fundamentals
-2. **Try file processing**: `log_filter.rs` → see real-world transforms
-3. **Explore compression**: `gzip_transform.rs` → understand stateful transforms
-4. **Learn BYOB**: `file_reader_byob.rs` → when and how to use byte streams
-5. **Complex pipelines**: `multi_stage_pipeline.rs` → chain multiple transforms
+### basic/
 
-## 🎯 Key Concepts Demonstrated
+- `simple_readable` — implement a `ReadableSource` and read from the stream
+- `simple_writable` — implement a `WritableSink` and write to it
+- `simple_transform` — pipe a source through a transform into a sink
 
-### Stream Types
+### bytes/
 
-- **ReadableStream<T>** - For structured data (strings, objects, etc.)
-- **ReadableByteStream** - For binary data with BYOB support
-- **WritableStream<T>** - For outputting data
-- **TransformStream<I, O>** - For transforming data from type I to type O
+- `binary_protocol` — parse length-prefixed frames split across chunk boundaries
+- `file_reader_byob` — read a file with a BYOB reader and caller-chosen buffer sizes
+- `buffer_pool` — reuse buffers across BYOB reads with a small pool
 
-### When to Use What
+### compression/
 
-- **Default Streams** - Most use cases (data processing, transforms, piping)
-- **BYOB Streams** - Large file reading, network streams, performance-critical scenarios
-- **Transform Streams** - Any data transformation (filtering, parsing, compression)
+- `gzip_transform` — streaming gzip compression, confirmed by a round-trip
+- `decompress_stream` — streaming gzip decompression (pairs with `gzip_transform`)
+- `archive_creator` — stream files into a `.tar.gz`, one tar block at a time
 
-### Pipeline Patterns
+### file_processing/
+
+- `log_filter` — filter log lines to ERROR and write them to a file
+- `csv_processor` — filter CSV rows by a column value
+- `json_stream` — stream records out of an NDJSON file, parsing each line as it arrives
+
+### advanced/
+
+- `backpressure_demo` — watch a fast producer stall against a slow sink (prints `desired_size`)
+- `multi_stage_pipeline` — a five-stage pipeline that changes type at each step, output as gzipped NDJSON
+
+### network/
+
+- `http_response` — stream an HTTP response body off a `TcpStream` *(requires network)*
+- `tcp_relay` — wrap TCP sockets as a stream source and sink *(requires network)*
+- `websocket_proxy` — a self-contained bidirectional WebSocket proxy over byte streams
+
+## The pipeline pattern
+
+Build each piece with `::builder(..).spawn(spawn_fn)`, then compose:
 
 ```rust
-// Simple pipeline
-readable_stream
-    .pipe_through(transform_stream, None)
-    .pipe_to(&writable_stream, None)
-    .await?;
+let source = ReadableStream::builder(MySource).spawn(tokio::spawn);
+let transform = TransformStream::builder(MyTransform).spawn(tokio::spawn);
+let sink = WritableStream::builder(MySink).spawn(tokio::spawn);
 
-// Multi-stage pipeline
-source
-    .pipe_through(parse_transform, None)
-    .pipe_through(filter_transform, None)
-    .pipe_through(compress_transform, None)
-    .pipe_to(&output_stream, None)
-    .await?;
+// pipe_through hands back the transform's readable side; pipe_to drives it to the sink.
+let out = source.pipe_through(transform, None).spawn(tokio::spawn);
+out.pipe_to(&sink, None).await?;
 ```
 
-## 📊 Performance Considerations
+For byte streams, build with `builder_bytes(..)` and read via `get_byob_reader()`.
 
-### BYOB Benefits
-
-✅ **Use BYOB when**:
-
-- Reading large files (>1MB)
-- Network streams with high throughput
-- Need to control buffer allocation
-- Measurable allocation overhead
-
-❌ **Don't use BYOB when**:
-
-- Small data processing
-- Using pipe operations (they use default readers)
-- Transform operations (work with data, not buffers)
-
-### Transform Performance
-
-- Transforms work with data chunks, not individual bytes
-- Even binary transforms (compression) use default streams
-- Pipeline throughput is limited by slowest stage
-- Use appropriate buffer sizes in queuing strategies
-
-## 🔧 Implementation Notes
-
-### Error Handling
-
-All examples demonstrate proper error handling:
-
-- Source errors propagate through pipelines
-- Transform errors stop the pipeline
-- Resources are cleaned up properly
-
-### Resource Management
-
-- Files are properly closed
-- Async operations use appropriate spawning
-- Memory usage is controlled via queuing strategies
-
-### Testing
-
-Each example includes comprehensive tests showing:
-
-- Normal operation
-- Error conditions
-- Edge cases (empty data, large data)
-- Performance characteristics
-
-## 🎓 Learning Resources
-
-### Understanding Backpressure
-
-Backpressure automatically handles cases where:
-
-- Producer is faster than consumer
-- Consumer is faster than producer
-- Multiple stages have different processing rates
-
-### Stream Lifecycle
-
-1. **Start** - Initialize resources
-2. **Pull/Write** - Process data chunks
-3. **Close/Flush** - Clean up and finalize
-4. **Error** - Handle failures gracefully
-
-### Best Practices
-
-- Use appropriate chunk sizes (not too small, not too large)
-- Handle errors at appropriate levels
-- Choose correct stream types for your use case
-- Test with realistic data sizes
-
-## 🐛 Common Pitfalls
-
-1. **Using BYOB for transforms** - Transforms should use default streams
-2. **Not handling errors** - Always handle stream errors appropriately
-3. **Wrong buffer sizes** - Too small = overhead, too large = memory waste
-4. **Forgetting to close** - Always close streams to free resources
-5. **Blocking operations** - Use async operations to avoid blocking the runtime
-
----
-
-These examples demonstrate the power and flexibility of WHATWG Streams in Rust. Start with the basics and work your way up to complex pipelines!
+## Notes
+- `http_response` and `tcp_relay` reach the public internet; the rest run offline.
+- `gzip_transform` writes `compressed_data.gz`, which `decompress_stream` reads back —
+  run them in that order.
