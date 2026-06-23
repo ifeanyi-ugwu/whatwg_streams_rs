@@ -1,103 +1,35 @@
-self.addEventListener("install", (event) => {
+self.addEventListener("install", () => {
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
-  self.clients.claim();
+  event.waitUntil(self.clients.claim());
 });
 
+// Respond to /streaming-element with a stream that emits one chunk every 500ms.
 self.addEventListener("fetch", (event) => {
+  // Scope-relative match so it works whether the demo is served from the site root
+  // or from demos/service-worker-stream/.
   const url = new URL(event.request.url);
+  if (!url.pathname.endsWith("/streaming-element")) return;
 
-  if (url.pathname === "/streaming-element") {
-    event.respondWith(
-      new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            let count = 0;
-            let intervalId;
-
-            intervalId = setInterval(() => {
-              count++;
-              const chunk = encoder.encode(`Chunk ${count}\n`);
-              controller.enqueue(chunk);
-
-              if (count >= 10) {
-                clearInterval(intervalId);
-                controller.close();
-              }
-            }, 500); // Increased to 500ms so you can see individual chunks
-          },
-
-          cancel() {
-            // This will be called if the fetch is aborted
-            console.log("Stream cancelled");
-          },
-        }),
-        {
-          headers: {
-            "Content-Type": "text/plain",
-            "Cache-Control": "no-cache",
-          },
-        }
-      )
-    );
-  }
-});
-
-/*self.addEventListener("install", (event) => {
-  console.log("Service Worker installing...");
-  self.skipWaiting(); // Activate immediately
-});
-
-self.addEventListener("activate", (event) => {
-  console.log("Service Worker activating...");
-  event.waitUntil(
-    self.clients.claim().then(() => {
-      console.log("Service Worker now controls all pages");
-    })
+  event.respondWith(
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          let count = 0;
+          const id = setInterval(() => {
+            count++;
+            controller.enqueue(encoder.encode(`Chunk ${count}\n`));
+            if (count >= 10) {
+              clearInterval(id);
+              controller.close();
+            }
+          }, 500);
+        },
+      }),
+      { headers: { "Content-Type": "text/plain", "Cache-Control": "no-cache" } }
+    )
   );
 });
-
-self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
-
-  if (url.pathname === "/streaming-element") {
-    console.log("Service Worker intercepting streaming request");
-
-    event.respondWith(
-      new Response(
-        new ReadableStream({
-          start(controller) {
-            const encoder = new TextEncoder();
-            let count = 0;
-            let intervalId;
-
-            intervalId = setInterval(() => {
-              count++;
-              const chunk = encoder.encode(`Chunk ${count}\n`);
-              controller.enqueue(chunk);
-
-              if (count >= 10) {
-                clearInterval(intervalId);
-                controller.close();
-              }
-            }, 500);
-          },
-
-          cancel() {
-            console.log("Stream cancelled");
-          },
-        }),
-        {
-          headers: {
-            "Content-Type": "text/plain",
-            "Cache-Control": "no-cache",
-          },
-        }
-      )
-    );
-  }
-});
-*/

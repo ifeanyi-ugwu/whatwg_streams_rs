@@ -1,47 +1,53 @@
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{Document, HtmlElement};
-use whatwg_streams::local::{WritableSink, WritableStream, WritableStreamDefaultController};
+use web_sys::HtmlElement;
+use whatwg_streams::{
+    StreamResult, WritableSink, WritableStream, WritableStreamDefaultController,
+    WritableStreamDefaultWriter,
+};
 
-// Sink for appending <div> chunks
+/// Sink that appends each streamed chunk into a parent element as a `<div>`.
 struct StreamingElementSink {
     parent: HtmlElement,
 }
 
 impl WritableSink<String> for StreamingElementSink {
-    fn write(
+    async fn write(
         &mut self,
         chunk: String,
         _controller: &mut WritableStreamDefaultController,
-    ) -> impl std::future::Future<Output = whatwg_streams::local::StreamResult<()>> {
-        async move {
-            let document: Document = web_sys::window().unwrap().document().unwrap();
-            let div = document.create_element("div").unwrap();
-            div.set_inner_html(&chunk);
-            self.parent.append_child(&div).unwrap();
-            Ok(())
-        }
+    ) -> StreamResult<()> {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let div = document.create_element("div").unwrap();
+        div.set_text_content(Some(&chunk));
+        self.parent.append_child(&div).unwrap();
+        Ok(())
     }
 }
 
+/// JS-facing handle: construct it against an element, feed it chunks read from the
+/// service-worker response, then close it.
 #[wasm_bindgen]
 pub struct StreamingElementHandle {
-    writer: whatwg_streams::local::WritableStreamDefaultWriter<String, StreamingElementSink>,
+    writer: WritableStreamDefaultWriter<String, StreamingElementSink>,
 }
 
 #[wasm_bindgen]
 impl StreamingElementHandle {
     #[wasm_bindgen(constructor)]
     pub fn new(element_id: &str) -> StreamingElementHandle {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let el: HtmlElement = document
+        let el: HtmlElement = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
             .get_element_by_id(element_id)
             .unwrap()
             .dyn_into()
             .unwrap();
-        let sink = StreamingElementSink { parent: el };
-        let writable = WritableStream::builder(sink).spawn(spawn_local);
-        let (_, writer) = writable.get_writer().unwrap();
+        let writable =
+            WritableStream::builder(StreamingElementSink { parent: el }).spawn(spawn_local);
+        let (_lock, writer) = writable.get_writer().unwrap();
         StreamingElementHandle { writer }
     }
 

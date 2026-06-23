@@ -25,8 +25,12 @@
         await init();
 
         document.getElementById("start-btn").addEventListener("click", () => {
-          const url = "https://nbg1-speed.hetzner.com/100MB.bin"; // example large file
-          run_fetch_progress_demo(url, "progress");
+          // Cloudflare's speed-test endpoint sends CORS headers and a Content-Length,
+          // so the cross-origin fetch is allowed and a real percentage can be shown.
+          const totalBytes = 10000000; // ~10 MB
+          const url = `https://speed.cloudflare.com/__down?bytes=${totalBytes}`;
+          // Pass the known size: cross-origin responses hide Content-Length from JS.
+          run_fetch_progress_demo(url, totalBytes, "progress");
         });
       }
 

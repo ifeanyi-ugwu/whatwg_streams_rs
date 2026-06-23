@@ -12,49 +12,63 @@
       style="border: 1px solid #ccc; padding: 10px; min-height: 50px"
     ></div>
     <br />
-    <button id="start-btn">Start Streaming via Service Worker</button>
+    <button id="start-btn" disabled>Waiting for Service Worker…</button>
+    <div id="sw-status" style="margin-top: 10px; font-size: 12px; color: #666"></div>
 
     <script type="module">
-      import init, {
-        StreamingElementHandle,
-      } from "./pkg/service_worker_stream.js";
+      import init, { StreamingElementHandle } from "./pkg/service_worker_stream.js";
+
+      // The service worker must be controlling this page before the intercepted
+      // route is fetched, so wait for it to take control.
+      function waitForServiceWorkerReady() {
+        return new Promise((resolve) => {
+          if (navigator.serviceWorker.controller) return resolve();
+          navigator.serviceWorker.addEventListener("controllerchange", () => resolve());
+        });
+      }
 
       async function main() {
         await init();
 
-        // Create a handle for the streaming element
-        //const streamHandle = new StreamingElementHandle("output");
+        const startBtn = document.getElementById("start-btn");
+        const statusDiv = document.getElementById("sw-status");
 
-        // Register Service Worker
-        if ("serviceWorker" in navigator) {
-          navigator.serviceWorker
-            .register("./service-worker.js")
-            .then(() => console.log("Service Worker registered"))
-            .catch((err) => console.error("Service Worker failed:", err));
+        if (!("serviceWorker" in navigator)) {
+          statusDiv.textContent = "Service Workers not supported";
+          statusDiv.style.color = "#dc3545";
+          return;
         }
 
-        document
-          .getElementById("start-btn")
-          .addEventListener("click", async () => {
-            const outputEl = document.getElementById("output");
-            outputEl.innerHTML = ""; // clear previous chunks
-            const streamHandle = new StreamingElementHandle("output"); // new each time
-            try {
-              const response = await fetch("/streaming-element");
-              const reader = response.body.getReader();
+        try {
+          await navigator.serviceWorker.register("./service-worker.js");
+          statusDiv.textContent = "Service Worker registered, waiting for activation…";
+          await waitForServiceWorkerReady();
+          startBtn.disabled = false;
+          startBtn.textContent = "Start Streaming via Service Worker";
+          statusDiv.textContent = "Service Worker ready.";
+          statusDiv.style.color = "#28a745";
+        } catch (err) {
+          statusDiv.textContent = "Service Worker failed to register";
+          statusDiv.style.color = "#dc3545";
+          return;
+        }
 
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                const chunk = new TextDecoder().decode(value);
-                streamHandle.write_chunk(chunk); // Rust handles DOM write
-              }
+        startBtn.addEventListener("click", async () => {
+          const outputEl = document.getElementById("output");
+          outputEl.replaceChildren();
+          const streamHandle = new StreamingElementHandle("output");
 
-              streamHandle.close();
-            } catch (err) {
-              console.error("Streaming failed:", err);
-            }
-          });
+          const response = await fetch("streaming-element");
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            streamHandle.write_chunk(decoder.decode(value));
+          }
+          streamHandle.close();
+        });
       }
 
       main();

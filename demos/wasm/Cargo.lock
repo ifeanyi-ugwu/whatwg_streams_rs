@@ -196,6 +196,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "invert_canvas_demo"
+version = "0.1.0"
+dependencies = [
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "whatwg_streams",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -315,6 +325,17 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide",
+]
+
+[[package]]
+name = "png_chunks_demo"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "whatwg_streams",
 ]
 
 [[package]]
@@ -508,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "whatwg_streams"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.9"
 dependencies = [
  "futures",
  "parking_lot",

@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = [
     "append-child",
     "streaming-element",
@@ -6,7 +7,8 @@ members = [
     "streaming-fetch-progress",
     "service-worker-stream",
     "grayscale-png",
-    #"png-chunks",
+    "invert-canvas",
+    "png-chunks",
 ]
 
 # Optional: apply settings to all crates
@@ -32,3 +34,7 @@ web-sys = { version = "0.3.80", features = [
 
 # Local crate for streams implementation
 whatwg_streams = { path = "../../whatwg_streams_rs" }
+
+# Profiles only take effect at the workspace root; applies to every demo.
+[profile.release]
+opt-level = "z" # smaller wasm output
