@@ -52,9 +52,12 @@ runtime `locked` flag does, checked in `get_writer()`. What is gone is only the
 ### 3. AbortSignal / DOM types
 
 `WritableStreamDefaultController.signal` exposes a DOM `AbortSignal` (`.aborted`,
-`.reason`, `instanceof AbortSignal`). These are Web Platform types with no Rust
-equivalent; cancellation is modelled with a future being dropped / a cancellation
-token instead. Tests asserting against the `AbortSignal` surface have no binding.
+`.reason`, `instanceof AbortSignal`, event-target semantics). The behavioural core
+is modelled in Rust: `controller.abort_future()` / `with_abort()` cover `.aborted`
+(react to an in-flight abort) and `controller.abort_reason()` covers `.reason` (the
+reason carried end to end). What stays untranslatable is the DOM object *surface* —
+`instanceof AbortSignal`, `addEventListener`, `throwIfAborted()` — which is a host
+type, not a stream behaviour. Tests asserting against that surface have no binding.
 
 ### 4. Thenable duck-typing
 
@@ -144,7 +147,10 @@ aborts the pipe, a pre-fired signal rejects immediately, the prevent-options gat
 cancel/abort, and abort is a no-op after the readable has already terminated. Added:
 when the signal fires and `sink.abort()` rejects, `pipeTo` returns that rejection
 (preferred over a `source.cancel()` rejection) rather than a generic Aborted error —
-the signal-abort path had been discarding both action results.
+the signal-abort path had been discarding both action results. Also added: the
+signal's reason propagates into `source.cancel()`, `sink.abort()`, and the `pipeTo`
+rejection — `StreamPipeOptions::signal` is a reason-carrying `AbortSignal`, so the
+pipe forwards the real reason instead of a hardcoded placeholder.
 
 Skipped: the teed-byte-stream priority case (byte sources are a separate area), and
 the JS getter/duck-typing checks shared with pipe-through.
