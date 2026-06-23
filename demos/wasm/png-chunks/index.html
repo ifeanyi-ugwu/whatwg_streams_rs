@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Unpack PNG Chunks</title>
+  </head>
+  <body>
+    <h1>Unpack PNG Chunks (fetch → TransformStream)</h1>
+    <p>Streams a PNG over fetch and lists each PNG chunk as it is parsed off the wire.</p>
+    <div
+      id="chunks"
+      style="font-family: monospace; border: 1px solid #ccc; padding: 10px; min-height: 50px"
+    ></div>
+
+    <script type="module">
+      import init, { run_png_chunks_demo } from "./pkg/png_chunks_demo.js";
+
+      async function main() {
+        await init();
+        run_png_chunks_demo(
+          "https://mdn.github.io/dom-examples/streams/grayscale-png/tortoise.png",
+          "chunks"
+        );
+      }
+
+      main();
+    </script>
+  </body>
+</html>
