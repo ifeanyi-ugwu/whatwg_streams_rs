@@ -29,19 +29,24 @@
     <p>
       This site collects demos inspired by the
       <a href="https://streams.spec.whatwg.org/">WHATWG Streams demos</a>
-      and
+      and MDN's
+      <a href="https://github.com/mdn/dom-examples/tree/main/streams"
+        >dom-examples/streams</a
+      >
+      gallery (<a href="https://mdn.github.io/dom-examples/streams/">runnable live here</a>),
+      reimplemented in Rust → WebAssembly using the
+      <code>whatwg_streams</code> crate. For background, see the
       <a href="https://developer.mozilla.org/en-US/docs/Web/API/Streams_API"
-        >MDN Streams docs</a
-      >, reimplemented in Rust → WebAssembly using the
-      <code>whatwg_streams</code> crate.
+        >MDN Streams API docs</a
+      >.
     </p>
 
     <h2>Available Demos</h2>
     <ul>
-      <!-- <li>
-        <a href="invert-canvas/index.html">Invert Canvas</a> — Load an image
-        into a canvas and invert its colors via a Rust TransformStream.
-      </li> -->
+      <li>
+        <a href="invert-canvas/index.html">Invert Canvas</a> — Draw to a canvas
+        and invert its colors through a Rust TransformStream (WHATWG demo).
+      </li>
       <li>
         <a href="append-child/index.html">Append Child Writable</a> — Custom
         WritableStream that appends DOM nodes (WHATWG demo).
@@ -73,8 +78,8 @@
         convert it to grayscale via a Rust TransformStream.
       </li>
       <li>
-        <a href="png-chunks/index.html">Unpack PNG Chunks</a> — Fetch a PNG and
-        pipe chunks of bytes through a custom transform.
+        <a href="png-chunks/index.html">Unpack PNG Chunks</a> — Stream a PNG over
+        fetch and parse its chunk structure through a Rust TransformStream.
       </li>
     </ul>
 
