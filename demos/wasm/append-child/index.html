@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Append Child Writable Demo</title>
+  </head>
+  <body>
+    <h1>Append Child Writable Demo</h1>
+    <p>Click the button to stream chunks into the DOM:</p>
+
+    <div
+      id="output"
+      style="border: 1px solid #ccc; padding: 10px; min-height: 50px"
+    ></div>
+    <br />
+    <button id="start-btn">Start Stream</button>
+
+    <script type="module">
+      import init, { run_append_demo } from "./pkg/append_child_demo.js";
+
+      async function main() {
+        await init();
+
+        document.getElementById("start-btn").addEventListener("click", () => {
+          run_append_demo("output");
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>

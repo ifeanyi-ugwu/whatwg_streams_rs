@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Invert Colors Demo</title>
+  </head>
+  <body>
+    <h2>Invert Colors (Canvas + TransformStream)</h2>
+    <canvas id="invert-canvas" width="300" height="300"></canvas>
+    <br />
+    <button id="invert-btn">Invert Colors</button>
+
+    <script type="module">
+      import init, { run_invert_demo } from "./pkg/invert_canvas_demo.js";
+
+      async function main() {
+        await init();
+
+        const canvas = document.getElementById("invert-canvas");
+        const ctx = canvas.getContext("2d");
+
+        // Draw something first
+        ctx.fillStyle = "red";
+        ctx.fillRect(50, 50, 200, 200);
+
+        document.getElementById("invert-btn").addEventListener("click", () => {
+          run_invert_demo("invert-canvas");
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>

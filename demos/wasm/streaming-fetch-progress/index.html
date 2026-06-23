@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Streaming Fetch + Progress Bar</title>
+  </head>
+  <body>
+    <h1>Streaming Fetch + Progress Bar</h1>
+
+    <div
+      id="progress"
+      style="border: 1px solid #ccc; padding: 10px; width: 300px"
+    >
+      Progress: 0%
+    </div>
+    <br />
+    <button id="start-btn">Start Download</button>
+
+    <script type="module">
+      import init, {
+        run_fetch_progress_demo,
+      } from "./pkg/fetch_progress_demo.js";
+
+      async function main() {
+        await init();
+
+        document.getElementById("start-btn").addEventListener("click", () => {
+          // Cloudflare's speed-test endpoint sends CORS headers and a Content-Length,
+          // so the cross-origin fetch is allowed and a real percentage can be shown.
+          const totalBytes = 10000000; // ~10 MB
+          const url = `https://speed.cloudflare.com/__down?bytes=${totalBytes}`;
+          // Pass the known size: cross-origin responses hide Content-Length from JS.
+          run_fetch_progress_demo(url, totalBytes, "progress");
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Streaming Element Demo</title>
+  </head>
+  <body>
+    <h1>Streaming Element Demo</h1>
+
+    <div
+      id="output"
+      style="border: 1px solid #ccc; padding: 10px; min-height: 50px"
+    ></div>
+    <br />
+    <button id="start-btn">Start Streaming</button>
+
+    <script type="module">
+      import init, {
+        run_streaming_element_demo,
+      } from "./pkg/streaming_element_demo.js";
+
+      async function main() {
+        await init();
+
+        document.getElementById("start-btn").addEventListener("click", () => {
+          run_streaming_element_demo("output");
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
