@@ -986,7 +986,7 @@ async fn stream_task<T, Sink>(
 
         // cancel inflight writes/closes if abort requested but not yet started
         if inner.abort_requested {
-            controller.request_abort(); // Signal to any running writes
+            controller.request_abort(inner.abort_reason.clone()); // Signal to any running writes
             // Cancel inflight write or close operations immediately
             if let Some(inflight_op) = &mut inflight {
                 match inflight_op {
@@ -1736,6 +1736,7 @@ fn process_controller_msgs<T, Sink>(
 pub struct WritableStreamDefaultController {
     tx: UnboundedSender<ControllerMsg>,
     abort_requested: SharedPtr<AtomicBool>,
+    abort_reason: SharedPtr<RwLock<Option<String>>>,
     abort_waker: SharedPtr<AtomicWaker>,
 }
 
@@ -1744,6 +1745,7 @@ impl WritableStreamDefaultController {
         Self {
             tx: sender,
             abort_requested: SharedPtr::new(AtomicBool::new(false)),
+            abort_reason: SharedPtr::new(RwLock::new(None)),
             abort_waker: SharedPtr::new(AtomicWaker::new()),
         }
     }
@@ -1761,10 +1763,25 @@ impl WritableStreamDefaultController {
         self.abort_requested.load(Ordering::Acquire)
     }
 
-    /// Internal: request that the stream be aborted.
+    /// The reason the stream was aborted, if any.
     ///
-    /// Sets the abort flag and wakes any futures created by [`abort_future()`].
-    fn request_abort(&self) {
+    /// `None` until the stream is aborted, and `None` when it was aborted
+    /// without a reason. A sink reacting to [`abort_future()`] or
+    /// [`with_abort()`] can read this to learn *why* it was aborted.
+    ///
+    /// [`abort_future()`]: Self::abort_future
+    /// [`with_abort()`]: Self::with_abort
+    pub fn abort_reason(&self) -> Option<String> {
+        self.abort_reason.read().clone()
+    }
+
+    /// Internal: request that the stream be aborted with an optional reason.
+    ///
+    /// Records the reason, sets the abort flag, and wakes any futures created
+    /// by [`abort_future()`]. The reason is stored before the flag so a waiter
+    /// that observes the flag also sees the reason.
+    fn request_abort(&self, reason: Option<String>) {
+        *self.abort_reason.write() = reason;
         self.abort_requested.store(true, Ordering::Release);
         self.abort_waker.wake();
     }
