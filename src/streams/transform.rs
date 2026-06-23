@@ -144,6 +144,7 @@ impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
         self.readable_controller.error(error.clone())?;
         self.writable_controller.error(error);
+        self.space_signal.wake_pull();
         Ok(())
     }
 
@@ -151,6 +152,7 @@ impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
     pub fn terminate(&self) -> StreamResult<()> {
         self.readable_controller.close()?;
         self.writable_controller.error("Terminated".into());
+        self.space_signal.wake_pull();
         Ok(())
     }
 
@@ -239,6 +241,10 @@ type CancelRx = UnboundedReceiver<(Option<String>, oneshot::Sender<StreamResult<
 struct SpaceSignal {
     has_space: AtomicBool,
     waker: futures::task::AtomicWaker,
+    // Separate waker for a pull parked in `wait_for_backpressure`. The transform
+    // task and a parked pull wait on opposite edges of `has_space`, so they need
+    // distinct wakers — a single AtomicWaker holds only one at a time.
+    pull_waker: futures::task::AtomicWaker,
     pending: std::sync::atomic::AtomicUsize,
     hwm: usize,
 }
@@ -250,6 +256,7 @@ impl SpaceSignal {
             // HWM>0 → initially open (empty queue, full headroom).
             has_space: AtomicBool::new(hwm > 0),
             waker: futures::task::AtomicWaker::new(),
+            pull_waker: futures::task::AtomicWaker::new(),
             pending: std::sync::atomic::AtomicUsize::new(0),
             hwm,
         }
@@ -260,6 +267,32 @@ impl SpaceSignal {
         let prev = self.pending.fetch_add(1, AtomicOrdering::AcqRel);
         if self.hwm == 0 || prev + 1 >= self.hwm {
             self.has_space.store(false, AtomicOrdering::Release);
+            // Backpressure re-applied: resolve a pull parked on `wait_for_backpressure`.
+            self.pull_waker.wake();
+        }
+    }
+
+    /// Resolve a parked pull when the readable side terminates (close/error),
+    /// so the source task can settle instead of leaving pull pending forever.
+    fn wake_pull(&self) {
+        self.pull_waker.wake();
+    }
+
+    /// Park a pull until backpressure is re-applied (the transform enqueued
+    /// enough to close the gate) or the readable side terminates. Mirrors the
+    /// spec's `[[backpressureChangePromise]]`: pull stays pending rather than
+    /// resolving immediately, which is what keeps the readable drive loop from
+    /// re-firing pull in a tight synchronous loop while the async upstream is
+    /// still delivering.
+    fn poll_backpressure(&self, cx: &mut std::task::Context<'_>, closed: bool) -> std::task::Poll<()> {
+        if closed || !self.has_space.load(AtomicOrdering::Acquire) {
+            return std::task::Poll::Ready(());
+        }
+        self.pull_waker.register(cx.waker());
+        if closed || !self.has_space.load(AtomicOrdering::Acquire) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
         }
     }
 
@@ -335,9 +368,20 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
         // pull() fires whenever desired_size > 0 (spec-correct, not just on empty queue).
         // Sync pending from the actual desired_size so the SpaceSignal stays accurate
         // when pull fires mid-queue (HWM > 1) or when a pending read creates a free slot.
+        // This opens the gate (backpressure → false) so the transform may produce.
         if let Some(ds) = controller.desired_size() {
             self.space_signal.sync_from_desired_size(ds);
         }
+
+        // Then stay pending until the transform re-applies backpressure by
+        // enqueueing, or the readable side terminates. Returning Ok immediately
+        // here would let the readable drive loop re-fire pull in a tight loop
+        // while the async upstream is still delivering — busy-spinning the
+        // executor (and freezing the browser main thread on wasm).
+        let space_signal = self.space_signal.clone();
+        poll_fn(move |cx| space_signal.poll_backpressure(cx, controller.is_closed_or_errored()))
+            .await;
+
         Ok(())
     }
 
