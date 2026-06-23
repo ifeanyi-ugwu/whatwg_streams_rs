@@ -4,6 +4,8 @@ version = "0.1.0-alpha.9"
 edition = "2024"
 description = "whatwg_streams for rust"
 license = "MIT"
+repository = "https://github.com/ifeanyi-ugwu/whatwg_streams_rs"
+exclude = ["tests/", "examples/"]
 
 [features]
 default = ["send"]
