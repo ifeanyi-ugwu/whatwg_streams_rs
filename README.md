@@ -13,7 +13,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-whatwg_streams = "0.1.0"
+whatwg_streams = "0.1.0-alpha.9"
 ```
 
 ## Runnable examples
@@ -121,7 +121,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-whatwg_streams = { version = "0.1.0", default-features = false, features = ["local"] }
+whatwg_streams = { version = "0.1.0-alpha.9", default-features = false, features = ["local"] }
 ```
 
 Then use with single-threaded executors like `tokio::task::spawn_local` or `futures::executor::LocalPool`:
@@ -365,18 +365,19 @@ Connect readable and writable streams:
 ```rust
 source_stream.pipe_to(&destination_stream, None).await?;
 
-// With options
-use futures::future::AbortHandle;
+// With options: an AbortController's signal can abort the pipe in flight.
+use whatwg_streams::AbortController;
 
-let (abort_handle, registration) = AbortHandle::new_pair();
+let controller = AbortController::new();
 let options = StreamPipeOptions {
     prevent_close: false,
     prevent_abort: false,
     prevent_cancel: false,
-    signal: Some(registration),
+    signal: Some(controller.signal()),
 };
 
 source_stream.pipe_to(&destination_stream, Some(options)).await?;
+// controller.abort(Some("reason".into())); // from elsewhere, to tear the pipe down
 ```
 
 ### Custom Queuing Strategies
