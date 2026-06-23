@@ -1,4 +1,5 @@
 use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked};
+use super::shared::AbortSignal;
 use super::shared::StreamResult;
 use super::shared::WakerSet;
 pub use super::{
@@ -15,7 +16,7 @@ use futures::{
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
         oneshot,
     },
-    future::{AbortRegistration, Abortable, Aborted, poll_fn},
+    future::{Either, poll_fn, select},
     io::AsyncRead,
     stream::{Stream, StreamExt},
 };
@@ -463,27 +464,32 @@ where
         };
 
         // Run with abort support if provided
-        if let Some(reg) = options.signal {
-            match Abortable::new(pipe_loop, reg).await {
-                Ok(result) => result,
-                Err(Aborted) => {
+        if let Some(signal) = options.signal {
+            let abort_fut = signal.aborted_future();
+            futures::pin_mut!(pipe_loop, abort_fut);
+            // `select` polls the abort future first, so an already-fired signal
+            // wins before the pipe does any work.
+            match select(abort_fut, pipe_loop).await {
+                Either::Right((result, _)) => result,
+                Either::Left(((), _pipe_loop)) => {
                     // Spec shutdown-with-action: cancel the source and abort the
-                    // destination, then reject with the action's failure if one
-                    // occurred — a sink.abort() rejection preferred over a
-                    // source.cancel() one — otherwise with the abort reason.
+                    // destination with the signal's reason, then reject with the
+                    // action's failure if one occurred — a sink.abort() rejection
+                    // preferred over a source.cancel() one — otherwise with the
+                    // abort reason itself.
+                    let reason = signal.reason();
                     let mut action_error = None;
                     if !options.prevent_cancel {
-                        if let Err(e) = reader.cancel(Some("Aborted".to_string())).await {
+                        if let Err(e) = reader.cancel(reason.clone()).await {
                             action_error = Some(e);
                         }
                     }
                     if !options.prevent_abort {
-                        if let Err(e) = writer.abort(Some("Aborted".to_string())).await {
+                        if let Err(e) = writer.abort(reason.clone()).await {
                             action_error = Some(e);
                         }
                     }
-                    Err(action_error
-                        .unwrap_or_else(|| StreamError::Aborted(Some("Pipe operation aborted".into()))))
+                    Err(action_error.unwrap_or(StreamError::Aborted(reason)))
                 }
             }
         } else {
@@ -1538,7 +1544,7 @@ pub struct StreamPipeOptions {
     pub prevent_close: bool,
     pub prevent_abort: bool,
     pub prevent_cancel: bool,
-    pub signal: Option<AbortRegistration>,
+    pub signal: Option<AbortSignal>,
 }
 
 // ----------- Constructor Implementation  -----------

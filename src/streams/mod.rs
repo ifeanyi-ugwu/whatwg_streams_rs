@@ -14,7 +14,7 @@ pub use readable::{
     ReadableStreamBuilder, ReadableStreamDefaultController, ReadableStreamDefaultReader,
     StreamPipeOptions, StreamTypeMarker, TeeBuilder, TeeConfig,
 };
-pub use shared::StreamResult;
+pub use shared::{AbortController, AbortSignal, StreamResult};
 pub use transform::{
     TransformStream, TransformStreamBuilder, TransformStreamDefaultController, Transformer,
 };
