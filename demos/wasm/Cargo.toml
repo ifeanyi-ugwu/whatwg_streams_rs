@@ -11,30 +11,12 @@ members = [
     "png-chunks",
 ]
 
-# Optional: apply settings to all crates
 [workspace.dependencies]
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3.80"
-web-sys = { version = "0.3.80", features = [
-    "console",
-    "Window",
-    "Document",
-    "HtmlElement",
-    "CustomElementRegistry",
-    "Element",
-    "Node",
-    "CanvasRenderingContext2d",
-    "ImageData",
-    "Response",
-    "Request",
-    "ReadableStream",
-    "WritableStream",
-] }
+# Single-threaded (Rc-based) build; the wasm demos run on one thread. Kept apart
+# from the root workspace so this never unifies with the native demo's `send`.
+whatwg_streams = { path = "../../crates/whatwg_streams", default-features = false }
 
-# Local crate for streams implementation
-whatwg_streams = { path = "../../whatwg_streams_rs" }
-
-# Profiles only take effect at the workspace root; applies to every demo.
+# opt-level = "z" keeps the wasm output small. Lives here, not at the repo root,
+# so native release builds keep the default opt-level = 3.
 [profile.release]
-opt-level = "z" # smaller wasm output
+opt-level = "z"

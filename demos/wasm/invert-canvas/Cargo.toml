@@ -16,4 +16,4 @@ web-sys = { version = "0.3.80", features = [
     "CanvasRenderingContext2d",
     "ImageData",
 ] }
-whatwg_streams = { path = "../../../whatwg_streams_rs", default-features = false, features = ["local"] }
+whatwg_streams = { workspace = true, features = ["local"] }

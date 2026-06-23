@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/whatwg_streams",
+    "demos/native",
+]
+# The wasm gallery is its own workspace (demos/wasm/Cargo.toml). It must stay
+# out of this one: its demos pull whatwg_streams with `local`, the native demo
+# pulls it with `send`, and those features are mutually exclusive. A single
+# workspace would unify them on the host (rust-analyzer, `cargo check
+# --workspace`) and the lib's exclusivity guard would fire.
+exclude = ["demos/wasm"]
+
+[workspace.dependencies]
+# default-features = false so the native demo opts into `send` explicitly,
+# mirroring how the wasm workspace opts into `local`.
+whatwg_streams = { path = "crates/whatwg_streams", default-features = false }

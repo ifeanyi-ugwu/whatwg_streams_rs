@@ -1,0 +1,5 @@
+# Every cargo command run inside the wasm gallery (build, check, and the cargo
+# invocations rust-analyzer makes) defaults to wasm32. Without this the demos
+# would try to compile for the host, where web-sys/wasm-bindgen don't build.
+[build]
+target = "wasm32-unknown-unknown"

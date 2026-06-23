@@ -15,7 +15,7 @@ tokio = { version = "1.47.1", features = ['full'] }
 tokio-tungstenite = "0.27.0"
 url = "2.5.7"
 uuid = { version = "1.18.0", features = ["v4"] }
-whatwg_streams = { path = "../whatwg_streams_rs" }
+whatwg_streams = { workspace = true, features = ["send"] }
 
 [[example]]
 name = "log_filter"
