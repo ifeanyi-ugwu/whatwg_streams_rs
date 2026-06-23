@@ -134,6 +134,53 @@ async fn abort_rejects_outstanding_writes_with_reason() {
     assert!(write_result.is_err(), "in-flight write must reject when stream is aborted");
 }
 
+// "a sink interrupted mid-write can read the abort reason from the controller"
+// abort_future()/with_abort() tell a sink *that* it was aborted; abort_reason()
+// tells it *why*. A sink parked on abort_future() during an in-flight write must
+// see the reason passed to writer.abort().
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn sink_reads_abort_reason_during_in_flight_write() {
+    use std::sync::{Arc, Mutex};
+
+    struct ReasonObservingSink {
+        observed: Arc<Mutex<Option<String>>>,
+    }
+    impl WritableSink<u32> for ReasonObservingSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            controller.abort_future().await;
+            let reason = controller.abort_reason();
+            *self.observed.lock().unwrap() = reason.clone();
+            Err(StreamError::Aborted(reason))
+        }
+    }
+
+    let observed = Arc::new(Mutex::new(None));
+    let stream = WritableStream::builder(ReasonObservingSink {
+        observed: observed.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    // Enqueue a write; it parks in the sink on abort_future(). Hold the future so
+    // its completion channel stays open until abort resolves it.
+    let _writing = writer.write(1u32);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    writer.abort(Some("mid-write reason".into())).await.unwrap();
+
+    assert_eq!(
+        observed.lock().unwrap().as_deref(),
+        Some("mid-write reason"),
+        "sink must observe the abort reason via controller.abort_reason()"
+    );
+}
+
 // "abort() should succeed even if sink.abort() is not supplied (no-op)"
 // WPT abort.any.js test 17
 #[cfg(feature = "send")]
