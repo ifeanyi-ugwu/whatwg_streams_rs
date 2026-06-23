@@ -1,151 +1,131 @@
-//! Buffer Pool Example
+//! Reusing buffers across BYOB reads with a simple pool.
 //!
-//! Demonstrates a simple thread-safe buffer pool for reusing `Vec<u8>` buffers.
-//! Useful with BYOB readers or any hot path where repeated allocations would
-//! be noticeable. The API returns a `PooledBuf` that returns the buffer to the
-//! pool when dropped (unless you consume it with `into_inner()`).
+//! A BYOB reader fills a caller-provided buffer on each read, which makes it a natural
+//! fit for buffer reuse: rather than allocating a fresh `Vec` per read, each read borrows
+//! a buffer from a pool and returns it on drop. This streams a file through a byte
+//! `ReadableStream`, reading into pooled buffers; the "buffers in pool" line shows a
+//! returned buffer being handed back out instead of a new allocation.
+//!
+//! Run with: `cargo run --example buffer_pool`
 
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
+use whatwg_streams::{ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult};
 
-/// A simple fixed-size buffer pool.
+/// A fixed-size buffer pool that hands out reusable `Vec<u8>` buffers.
 pub struct BufferPool {
     buffer_size: usize,
     capacity: usize,
-    inner: Mutex<Vec<Vec<u8>>>,
+    free: Mutex<Vec<Vec<u8>>>,
 }
 
 impl BufferPool {
-    /// Create a new pool which keeps up to `capacity` buffers of `buffer_size`.
+    /// Keeps up to `capacity` buffers of `buffer_size` bytes.
     pub fn new(buffer_size: usize, capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             buffer_size,
             capacity,
-            inner: Mutex::new(Vec::with_capacity(capacity)),
+            free: Mutex::new(Vec::with_capacity(capacity)),
         })
     }
 
-    /// Acquire a pooled buffer. When the returned `PooledBuf` is dropped
-    /// the buffer is returned to the pool (if the pool isn't full).
+    /// Borrow a buffer, reusing a returned one when available.
     pub fn acquire(self: &Arc<Self>) -> PooledBuf {
-        let mut guard = self.inner.lock().unwrap();
-        if let Some(mut buf) = guard.pop() {
-            // ensure length is the buffer_size so callers get the full capacity as slice
-            buf.resize(self.buffer_size, 0);
-            PooledBuf {
-                pool: Some(Arc::clone(self)),
-                buf: Some(buf),
-                capacity: self.buffer_size,
-            }
-        } else {
-            // allocate fresh if pool empty
-            PooledBuf {
-                pool: Some(Arc::clone(self)),
-                buf: Some(vec![0u8; self.buffer_size]),
-                capacity: self.buffer_size,
-            }
+        let buf = self
+            .free
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| vec![0u8; self.buffer_size]);
+        PooledBuf {
+            pool: Arc::clone(self),
+            buf: Some(buf),
         }
     }
 
-    /// Current number of available buffers in pool (for diagnostics).
+    /// Number of buffers currently available for reuse.
     pub fn available(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
-        guard.len()
+        self.free.lock().unwrap().len()
     }
 }
 
-/// A buffer handed out from the pool. When dropped it returns the buffer
-/// to the pool automatically (unless `into_inner()` was used).
+/// A buffer borrowed from the pool; returns itself on drop unless the pool is full.
 pub struct PooledBuf {
-    pool: Option<Arc<BufferPool>>,
+    pool: Arc<BufferPool>,
     buf: Option<Vec<u8>>,
-    capacity: usize,
-}
-
-impl PooledBuf {
-    /// Take ownership of the Vec<u8> and prevent it returning to the pool.
-    pub fn into_inner(mut self) -> Vec<u8> {
-        // prevent returning to pool in Drop
-        self.pool = None;
-        self.buf.take().unwrap()
-    }
-
-    /// Get the buffer length (capacity).
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
 }
 
 impl Deref for PooledBuf {
     type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.buf.as_ref().unwrap().as_slice()
+    fn deref(&self) -> &[u8] {
+        self.buf.as_ref().unwrap()
     }
 }
 
 impl DerefMut for PooledBuf {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buf.as_mut().unwrap().as_mut_slice()
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.buf.as_mut().unwrap()
     }
 }
 
 impl Drop for PooledBuf {
     fn drop(&mut self) {
-        // Try to return buffer to pool; if pool is full, drop buffer.
-        if let (Some(pool), Some(mut buf)) = (self.pool.take(), self.buf.take()) {
-            // restore length to capacity to keep a uniform pool state
-            buf.resize(pool.buffer_size, 0);
-            let mut guard = pool.inner.lock().unwrap();
-            if guard.len() < pool.capacity {
-                guard.push(buf);
-            } // else drop
+        if let Some(mut buf) = self.buf.take() {
+            buf.resize(self.pool.buffer_size, 0);
+            let mut free = self.pool.free.lock().unwrap();
+            if free.len() < self.pool.capacity {
+                free.push(buf);
+            }
         }
     }
 }
 
-/// Demo: read a file using pooled buffers repeatedly to show reuse.
-pub async fn run_buffer_pool_example() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Buffer Pool Example ===");
+/// Byte source that fills each BYOB buffer from a file.
+pub struct FileByteSource {
+    file: File,
+}
 
-    // create a small sample file for demo
-    let demo_path = "buffer_pool_demo.txt";
-    let content = "Hello buffer pool!\n".repeat(512); // ~9KB
-    tokio::fs::write(demo_path, &content).await?;
-
-    // create the pool: 16 KB buffers, keep up to 4
-    let pool = BufferPool::new(16 * 1024, 4);
-
-    println!("pool available (start): {}", pool.available());
-
-    // open file and repeatedly read into the pooled buffer
-    let mut file = File::open(demo_path).await?;
-    loop {
-        let mut buf = pool.acquire(); // get a PooledBuf
-        let n = file.read(&mut *buf).await?;
+impl ReadableByteSource for FileByteSource {
+    async fn pull(
+        &mut self,
+        controller: &mut ReadableByteStreamController,
+        buffer: &mut [u8],
+    ) -> StreamResult<usize> {
+        let n = self.file.read(buffer).await?;
         if n == 0 {
-            break;
+            controller.close()?;
         }
-
-        // Process the read bytes (here: print summary)
-        println!("read {} bytes (pool available: {})", n, pool.available());
-
-        // optionally shrink/truncate view; we don't change underlying Vec here
-        // dropping `buf` returns it to the pool automatically
+        Ok(n)
     }
-
-    println!("pool available (end): {}", pool.available());
-
-    // cleanup
-    let _ = tokio::fs::remove_file(demo_path).await;
-
-    println!("✅ Buffer pool demo complete");
-    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_buffer_pool_example().await
+async fn main() {
+    let demo_path = "buffer_pool_demo.txt";
+    tokio::fs::write(demo_path, "Hello buffer pool!\n".repeat(512))
+        .await
+        .expect("write demo file");
+
+    // 4 KB buffers so the ~9.5 KB file takes several reads and buffer reuse is visible.
+    let pool = BufferPool::new(4 * 1024, 4);
+    let file = File::open(demo_path).await.expect("open demo file");
+    let stream = ReadableStream::builder_bytes(FileByteSource { file }).spawn(tokio::spawn);
+    let (_lock, reader) = stream.get_byob_reader().expect("a fresh stream is unlocked");
+
+    let mut total = 0;
+    loop {
+        println!("buffers in pool: {}", pool.available()); // 0 first time, 1+ once reused
+        let mut buf = pool.acquire();
+        let n = reader.read(&mut buf).await.expect("read should not error");
+        if n == 0 {
+            break;
+        }
+        total += n;
+        // `buf` returns to the pool here, on drop.
+    }
+    println!("read {total} bytes total");
+
+    let _ = tokio::fs::remove_file(demo_path).await;
 }

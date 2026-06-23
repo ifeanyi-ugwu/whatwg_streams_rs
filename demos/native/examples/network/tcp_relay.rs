@@ -1,18 +1,22 @@
-//! TCP Relay Example
+//! Wrapping TCP sockets as a stream source and a stream sink.
 //!
-//! Demonstrates how to use WHATWG-like streams to relay data between
-//! two TCP sockets with optional transformations. This is the basic
-//! "proxy pattern": client <-> relay <-> server.
+//! One socket is exposed as a byte `ReadableStream`, read through a BYOB reader that
+//! fills a caller buffer; a second socket is exposed as a `WritableStream` sink. A
+//! message written to the sink is echoed by the server and read back through the source
+//! — the two halves a socket-to-socket relay is built from.
+//!
+//! Requires network access (connects to tcpbin.com:4242, a public echo server).
+//!
+//! Run with: `cargo run --example tcp_relay`
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableByteSource, ReadableByteStreamController, ReadableStream},
-    writable_new::{WritableSink, WritableStream, WritableStreamDefaultController},
+use whatwg_streams::{
+    ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult, WritableSink,
+    WritableStream, WritableStreamDefaultController,
 };
 
-/// Readable source wrapping a TCP socket
+/// Byte source that connects to `addr` on start and reads from the socket.
 pub struct TcpSource {
     socket: Option<TcpStream>,
     addr: String,
@@ -29,9 +33,7 @@ impl TcpSource {
 
 impl ReadableByteSource for TcpSource {
     async fn start(&mut self, _controller: &mut ReadableByteStreamController) -> StreamResult<()> {
-        println!("🔌 Connecting to {}", self.addr);
-        let stream = TcpStream::connect(&self.addr).await?;
-        self.socket = Some(stream);
+        self.socket = Some(TcpStream::connect(&self.addr).await?);
         Ok(())
     }
 
@@ -40,32 +42,21 @@ impl ReadableByteSource for TcpSource {
         controller: &mut ReadableByteStreamController,
         buffer: &mut [u8],
     ) -> StreamResult<usize> {
-        if let Some(socket) = self.socket.as_mut() {
-            match socket.read(buffer).await {
-                Ok(0) => {
-                    println!("⛔ TCP closed by remote");
-                    controller.close()?;
-                    Ok(0)
-                }
-                Ok(n) => {
-                    println!("📥 Read {} byte(s) from {}", n, self.addr);
-                    Ok(n)
-                }
-                Err(e) => Err(e.into()),
-            }
-        } else {
-            Ok(0)
+        let socket = self.socket.as_mut().expect("connected in start");
+        let n = socket.read(buffer).await?;
+        if n == 0 {
+            controller.close()?;
         }
+        Ok(n)
     }
 
-    async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
-        println!("🚫 TCP source cancelled: {:?}", reason);
+    async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
         self.socket = None;
         Ok(())
     }
 }
 
-/// Writable sink wrapping a TCP socket
+/// Sink that writes each chunk to a TCP socket.
 pub struct TcpSink {
     socket: TcpStream,
 }
@@ -76,60 +67,37 @@ impl WritableSink<Vec<u8>> for TcpSink {
         chunk: Vec<u8>,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
-        println!("📤 Forwarding {} byte(s)", chunk.len());
         self.socket.write_all(&chunk).await?;
         Ok(())
     }
 
     async fn close(mut self) -> StreamResult<()> {
-        println!("✅ Closing sink socket");
         self.socket.shutdown().await?;
         Ok(())
     }
 }
 
-/// Example: relay data from one TCP connection to another with a transform.
-pub async fn run_tcp_relay_example() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== TCP Relay Example ===");
-
-    // connect to server (echo)
-    let server_addr = "tcpbin.com:4242"; // public test echo server
-    let client_source = ReadableStream::builder(TcpSource::new(server_addr))
-        .with_spawn(|fut| {
-            tokio::spawn(fut);
-        })
-        .build();
-    let reader = client_source.get_byob_reader().1;
-
-    // second connection acts as sink (another echo)
-    let sink_stream = TcpStream::connect(server_addr).await?;
-    let sink = TcpSink {
-        socket: sink_stream,
-    };
-    let writable =
-        WritableStream::new_with_spawn(sink, Box::new(CountQueuingStrategy::new(1)), |fut| {
-            tokio::spawn(fut);
-        });
-    let (_, writer) = writable.get_writer()?;
-
-    // Send a message through the relay
-    let msg = b"hello relay!".to_vec();
-    println!("➡️ sending: {:?}", String::from_utf8_lossy(&msg));
-    writer.write(msg).await?;
-
-    // Read back the echo
-    let mut buf = vec![0u8; 64];
-    let n = reader.read(&mut buf).await?;
-    if n > 0 {
-        let received = &buf[..n];
-        println!("✅ received: {:?}", String::from_utf8_lossy(received));
-    }
-
-    writer.close().await?;
-    Ok(())
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_tcp_relay_example().await
+async fn main() {
+    let addr = "tcpbin.com:4242"; // public echo server
+
+    let source = ReadableStream::builder_bytes(TcpSource::new(addr)).spawn(tokio::spawn);
+    let (_rlock, reader) = source.get_byob_reader().expect("a fresh stream is unlocked");
+
+    let sink_socket = TcpStream::connect(addr).await.expect("connect sink socket");
+    let sink = WritableStream::builder(TcpSink {
+        socket: sink_socket,
+    })
+    .spawn(tokio::spawn);
+    let (_wlock, writer) = sink.get_writer().expect("a fresh stream is unlocked");
+
+    let message = b"hello relay!".to_vec();
+    println!("sending: {}", String::from_utf8_lossy(&message));
+    writer.write(message).await.expect("write to sink");
+
+    let mut buf = vec![0u8; 64];
+    let n = reader.read(&mut buf).await.expect("read from source");
+    println!("received: {}", String::from_utf8_lossy(&buf[..n]));
+
+    writer.close().await.expect("close sink");
 }

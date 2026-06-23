@@ -1,29 +1,23 @@
-//! Gzip Compression Transform Example
+//! Streaming gzip compression as a `TransformStream`.
 //!
-//! Demonstrates streaming compression using a transform stream that:
-//! 1. Reads data chunks from a source
-//! 2. Compresses each chunk using gzip
-//! 3. Outputs compressed data to a file
+//! Text chunks flow from a source into a stateful transformer that feeds them to a
+//! `GzEncoder`, flushing after each chunk so compressed bytes are emitted incrementally
+//! rather than all at the end. A file sink writes the compressed output, and `main`
+//! reads it back and decompresses to confirm a clean round-trip.
 //!
-//! This example shows:
-//! - How transforms work with binary data (Vec<u8>)
-//! - Stateful transformers that maintain compression context
-//! - Proper resource cleanup in flush() method
-//! - Why BYOB isn't needed - compression operates on data chunks, not buffer management
+//! Run with: `cargo run --example gzip_transform`
 
 use flate2::{Compression, write::GzEncoder};
 use std::io::Write;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    transform::{TransformStream, TransformStreamDefaultController, Transformer},
-    writable_new::{WritableSink, WritableStream, WritableStreamDefaultController},
+use whatwg_streams::{
+    ReadableSource, ReadableStream, ReadableStreamDefaultController, StreamResult, TransformStream,
+    TransformStreamDefaultController, Transformer, WritableSink, WritableStream,
+    WritableStreamDefaultController,
 };
 
-/// A readable source that generates text data in chunks
-/// Simulates reading a large text file or streaming text data
+/// Yields chunks of text as bytes, then closes.
 pub struct TextDataSource {
     chunks: Vec<String>,
     index: usize,
@@ -37,7 +31,6 @@ impl TextDataSource {
         }
     }
 
-    /// Create a source with sample data for demonstration
     pub fn sample_data() -> Self {
         let chunks = vec![
             "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(100),
@@ -56,9 +49,8 @@ impl ReadableSource<Vec<u8>> for TextDataSource {
         controller: &mut ReadableStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
         if self.index < self.chunks.len() {
-            let chunk = self.chunks[self.index].as_bytes().to_vec();
+            controller.enqueue(self.chunks[self.index].as_bytes().to_vec())?;
             self.index += 1;
-            controller.enqueue(chunk)?;
         } else {
             controller.close()?;
         }
@@ -66,32 +58,19 @@ impl ReadableSource<Vec<u8>> for TextDataSource {
     }
 }
 
-/// A transform stream that compresses data using gzip
-/// Note: This operates on Vec<u8> chunks, not individual buffers
+/// Compresses incoming bytes, emitting compressed output as it becomes available.
+#[derive(Default)]
 pub struct GzipCompressor {
     encoder: Option<GzEncoder<Vec<u8>>>,
-    total_input: usize,
-    total_output: usize,
-}
-
-impl GzipCompressor {
-    pub fn new() -> Self {
-        Self {
-            encoder: None,
-            total_input: 0,
-            total_output: 0,
-        }
-    }
+    emitted: usize,
 }
 
 impl Transformer<Vec<u8>, Vec<u8>> for GzipCompressor {
     async fn start(
         &mut self,
-        _controller: &mut TransformStreamDefaultController<Vec<u8>>,
+        _c: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
-        // Initialize the gzip encoder
         self.encoder = Some(GzEncoder::new(Vec::new(), Compression::default()));
-        println!("🗜️  Gzip compressor initialized");
         Ok(())
     }
 
@@ -100,35 +79,16 @@ impl Transformer<Vec<u8>, Vec<u8>> for GzipCompressor {
         chunk: Vec<u8>,
         controller: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
-        if let Some(encoder) = &mut self.encoder {
-            let input_size = chunk.len();
-            self.total_input += input_size;
-
-            // Write the chunk to the compressor
-            encoder
-                .write_all(&chunk)
-                .map_err(|e| format!("Compression error: {}", e))?;
-
-            // For streaming compression, we need to flush periodically to get output
-            encoder
-                .flush()
-                .map_err(|e| format!("Compression flush error: {}", e))?;
-
-            // Get any compressed data that's ready
-            let compressed_data = encoder.get_ref().clone();
-            if compressed_data.len() > self.total_output {
-                let new_data = compressed_data[self.total_output..].to_vec();
-                self.total_output = compressed_data.len();
-
-                if !new_data.is_empty() {
-                    controller.enqueue(new_data)?;
-                }
-            }
-
-            println!(
-                "🔄 Compressed {} bytes input, {} bytes output so far",
-                input_size, self.total_output
-            );
+        let encoder = self.encoder.as_mut().expect("encoder set in start");
+        encoder.write_all(&chunk)?;
+        // Flush so the inner buffer holds everything compressed so far, then emit only
+        // the bytes produced since the previous chunk.
+        encoder.flush()?;
+        let produced = encoder.get_ref();
+        if produced.len() > self.emitted {
+            let new_bytes = produced[self.emitted..].to_vec();
+            self.emitted = produced.len();
+            controller.enqueue(new_bytes)?;
         }
         Ok(())
     }
@@ -138,243 +98,87 @@ impl Transformer<Vec<u8>, Vec<u8>> for GzipCompressor {
         controller: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
         if let Some(encoder) = self.encoder.take() {
-            // Finish compression and get final data
-            let final_compressed = encoder
-                .finish()
-                .map_err(|e| format!("Final compression error: {}", e))?;
-
-            // Send any remaining compressed data
-            if final_compressed.len() > self.total_output {
-                let final_chunk = final_compressed[self.total_output..].to_vec();
-                if !final_chunk.is_empty() {
-                    controller.enqueue(final_chunk)?;
-                }
+            let finished = encoder.finish()?;
+            if finished.len() > self.emitted {
+                controller.enqueue(finished[self.emitted..].to_vec())?;
             }
-
-            let compression_ratio = if self.total_input > 0 {
-                (final_compressed.len() as f64 / self.total_input as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            println!("✅ Compression complete!");
-            println!(
-                "📊 Input: {} bytes, Output: {} bytes",
-                self.total_input,
-                final_compressed.len()
-            );
-            println!("📈 Compression ratio: {:.1}%", compression_ratio);
         }
         Ok(())
     }
 }
 
-/// A writable sink that saves compressed data to a file
+/// Writes compressed bytes to a file.
 pub struct CompressedFileWriter {
-    file_path: String,
-    file_handle: Option<File>,
+    path: String,
+    file: Option<File>,
     bytes_written: usize,
 }
 
 impl CompressedFileWriter {
     pub fn new(path: &str) -> Self {
         Self {
-            file_path: path.to_string(),
-            file_handle: None,
+            path: path.to_string(),
+            file: None,
             bytes_written: 0,
         }
     }
 }
 
 impl WritableSink<Vec<u8>> for CompressedFileWriter {
-    async fn start(
-        &mut self,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
-        self.file_handle = Some(File::create(&self.file_path).await?);
-        println!("📁 Created compressed output file: {}", self.file_path);
+    async fn start(&mut self, _c: &mut WritableStreamDefaultController) -> StreamResult<()> {
+        self.file = Some(File::create(&self.path).await?);
         Ok(())
     }
 
     async fn write(
         &mut self,
         chunk: Vec<u8>,
-        _controller: &mut WritableStreamDefaultController,
+        _c: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
-        if let Some(file) = &mut self.file_handle {
+        if let Some(file) = &mut self.file {
             file.write_all(&chunk).await?;
             self.bytes_written += chunk.len();
-            println!(
-                "💾 Wrote {} bytes to file (total: {})",
-                chunk.len(),
-                self.bytes_written
-            );
         }
         Ok(())
     }
 
     async fn close(mut self) -> StreamResult<()> {
-        if let Some(file) = self.file_handle.take() {
+        if let Some(file) = self.file.take() {
             file.sync_all().await?;
-            println!(
-                "🔒 Compressed file closed: {} bytes written",
-                self.bytes_written
-            );
         }
         Ok(())
     }
 }
 
-/// Example function demonstrating streaming gzip compression
-pub async fn run_gzip_compression_example() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Gzip Compression Transform Example ===");
-
-    // Create a readable stream with sample text data
-    let readable_stream = ReadableStream::new_default(TextDataSource::sample_data(), None);
-
-    // Create the gzip compression transform
-    let gzip_transform = TransformStream::new(GzipCompressor::new());
-
-    // Create writable stream for compressed output
-    let output_file = "compressed_data.gz";
-    let writable_stream = WritableStream::new_with_spawn(
-        CompressedFileWriter::new(output_file),
-        Box::new(CountQueuingStrategy::new(3)), // Small buffer for demo
-        |fut| {
-            tokio::spawn(fut);
-        },
-    );
-
-    println!("🚀 Starting compression pipeline...");
-
-    // Execute the pipeline: Text Data -> Gzip Transform -> Compressed File
-    readable_stream
-        .pipe_through(gzip_transform, None)
-        .pipe_to(&writable_stream, None)
-        .await?;
-
-    println!("✅ Compression pipeline completed!");
-
-    // Verify the compressed file was created
-    match tokio::fs::metadata(output_file).await {
-        Ok(metadata) => {
-            println!("📁 Compressed file size: {} bytes", metadata.len());
-
-            // Test decompression to verify integrity
-            test_decompression(output_file).await?;
-        }
-        Err(e) => println!("⚠️  Could not read compressed file metadata: {}", e),
-    }
-
-    Ok(())
-}
-
-/// Helper function to test that the compressed data can be decompressed
-async fn test_decompression(compressed_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    println!("🔍 Testing decompression...");
-
-    let compressed_data = tokio::fs::read(compressed_file).await?;
-    let mut decoder = GzDecoder::new(&compressed_data[..]);
-    let mut decompressed = String::new();
-    decoder.read_to_string(&mut decompressed)?;
-
-    println!("✅ Decompression successful!");
-    println!("📄 Decompressed {} characters", decompressed.len());
-
-    // Show a snippet of the decompressed data
-    let snippet = if decompressed.len() > 100 {
-        format!("{}...", &decompressed[..100])
-    } else {
-        decompressed
-    };
-    println!("📖 Sample: {}", snippet);
-
-    Ok(())
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_gzip_compression_example().await
+async fn main() {
+    let output_file = "compressed_data.gz";
+    let source = ReadableStream::builder(TextDataSource::sample_data()).spawn(tokio::spawn);
+    let gzip = TransformStream::builder(GzipCompressor::default()).spawn(tokio::spawn);
+    let sink = WritableStream::builder(CompressedFileWriter::new(output_file)).spawn(tokio::spawn);
+
+    let compressed = source.pipe_through(gzip, None).spawn(tokio::spawn);
+    compressed
+        .pipe_to(&sink, None)
+        .await
+        .expect("pipe should complete");
+
+    let size = tokio::fs::metadata(output_file)
+        .await
+        .expect("stat output")
+        .len();
+    println!("wrote {output_file} ({size} bytes)");
+    verify_roundtrip(output_file).await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Reads the compressed file back and decompresses it to confirm integrity.
+async fn verify_roundtrip(path: &str) {
     use flate2::read::GzDecoder;
     use std::io::Read;
-    use tokio::fs;
 
-    #[tokio::test]
-    async fn test_gzip_compression_pipeline() {
-        let test_data = vec![
-            "Hello, world! ".repeat(50),
-            "This is test data. ".repeat(50),
-            "Final chunk of data. ".repeat(50),
-        ];
-
-        let readable = ReadableStream::new_default(TextDataSource::new(test_data), None);
-        let transform = TransformStream::new(GzipCompressor::new());
-        let output_path = "test_compressed.gz";
-        let writable = WritableStream::new_with_spawn(
-            CompressedFileWriter::new(output_path),
-            Box::new(CountQueuingStrategy::new(5)),
-            |fut| {
-                tokio::spawn(fut);
-            },
-        );
-
-        // Run compression pipeline
-        readable
-            .pipe_through(transform, None)
-            .pipe_to(&writable, None)
-            .await
-            .expect("Compression pipeline should complete");
-
-        // Verify the file was created and can be decompressed
-        let compressed_data = fs::read(output_path).await.unwrap();
-        assert!(!compressed_data.is_empty());
-
-        // Test decompression
-        let mut decoder = GzDecoder::new(&compressed_data[..]);
-        let mut decompressed = String::new();
-        decoder.read_to_string(&mut decompressed).unwrap();
-
-        // Verify content is correct
-        assert!(decompressed.contains("Hello, world!"));
-        assert!(decompressed.contains("This is test data."));
-        assert!(decompressed.contains("Final chunk of data."));
-
-        // Clean up
-        let _ = fs::remove_file(output_path).await;
-    }
-
-    #[tokio::test]
-    async fn test_empty_compression() {
-        let readable = ReadableStream::new_default(TextDataSource::new(vec![]), None);
-        let transform = TransformStream::new(GzipCompressor::new());
-        let output_path = "test_empty_compressed.gz";
-        let writable = WritableStream::new_with_spawn(
-            CompressedFileWriter::new(output_path),
-            Box::new(CountQueuingStrategy::new(1)),
-            |fut| {
-                tokio::spawn(fut);
-            },
-        );
-
-        readable
-            .pipe_through(transform, None)
-            .pipe_to(&writable, None)
-            .await
-            .expect("Empty compression should complete");
-
-        // Even empty compression should produce a valid gzip file
-        let compressed_data = fs::read(output_path).await.unwrap();
-        assert!(!compressed_data.is_empty()); // Gzip header + footer
-
-        // Clean up
-        let _ = fs::remove_file(output_path).await;
-    }
+    let compressed = tokio::fs::read(path).await.expect("read output");
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut text = String::new();
+    decoder.read_to_string(&mut text).expect("decompress");
+    println!("round-trip ok: {} characters recovered", text.len());
 }

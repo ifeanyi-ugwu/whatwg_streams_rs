@@ -1,16 +1,21 @@
-//! HTTP Response Stream Example
+//! Streaming an HTTP response body through a `ReadableStream`.
 //!
-//! Demonstrates reading from an HTTP server and streaming the response body
-//! using the same pipeline pattern as other examples.
+//! A raw `TcpStream` is wrapped as a byte-producing source: each `pull` reads up to
+//! `buffer_size` bytes off the socket and enqueues them, closing when the server hangs up
+//! (the request asks for `Connection: close`). The reader consumes the response in chunks
+//! as they arrive off the wire, rather than buffering the whole body first.
+//!
+//! Requires network access (connects to example.com:80).
+//!
+//! Run with: `cargo run --example http_response`
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableSource, ReadableStream, ReadableStreamDefaultController},
+use whatwg_streams::{
+    ReadableSource, ReadableStream, ReadableStreamDefaultController, StreamResult,
 };
 
-/// A simple readable source that reads from a TCP stream (HTTP response)
+/// Reads an HTTP response body off a TCP socket, one buffer at a time.
 pub struct HttpResponseSource {
     stream: TcpStream,
     buffer_size: usize,
@@ -35,31 +40,29 @@ impl ReadableSource<Vec<u8>> for HttpResponseSource {
         if n == 0 {
             controller.close()?;
         } else {
-            controller.enqueue(buf[..n].to_vec())?;
+            buf.truncate(n);
+            controller.enqueue(buf)?;
         }
         Ok(())
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🌐 HTTP Response Stream Example");
-
-    // Connect to HTTP server
-    let mut stream = TcpStream::connect("example.com:80").await?;
+async fn main() {
+    let mut stream = TcpStream::connect("example.com:80")
+        .await
+        .expect("connect to example.com:80");
     let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-    stream.write_all(request).await?;
+    stream.write_all(request).await.expect("send request");
 
-    // Wrap TCP stream in our readable source
-    let readable = ReadableStream::new_default(HttpResponseSource::new(stream, 1024), None);
+    let response =
+        ReadableStream::builder(HttpResponseSource::new(stream, 1024)).spawn(tokio::spawn);
+    let (_lock, reader) = response.get_reader().expect("a fresh stream is unlocked");
 
-    // Read and print chunks as they arrive
-    let mut reader = readable.get_reader().1;
-    while let Some(chunk) = reader.read().await? {
-        println!("📦 Received {} bytes", chunk.len());
-        // Could process chunks here (parse headers, decompress, etc.)
+    let mut total = 0;
+    while let Some(chunk) = reader.read().await.expect("read should not error") {
+        total += chunk.len();
+        println!("received {} bytes", chunk.len());
     }
-
-    println!("✅ HTTP response fully received");
-    Ok(())
+    println!("response complete: {total} bytes total");
 }

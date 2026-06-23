@@ -1,19 +1,14 @@
-//! Multi-Stage Pipeline Example
+//! A multi-stage pipeline that changes data type at each step.
 //!
-//! Demonstrates a complex data processing pipeline that chains multiple transforms:
-//! 1. Raw log data source
-//! 2. Parse log entries into structured data
-//! 3. Filter by log level
-//! 4. Add timestamps and metadata  
-//! 5. Convert to JSON format
-//! 6. Compress the output
-//! 7. Write to file
+//! Raw log lines flow through five transforms before hitting a file sink:
+//!   source(String) -> parse(LogEntry) -> filter(LogEntry) -> enrich(String/JSON)
+//!   -> gzip(Vec<u8>) -> file
 //!
-//! This example shows:
-//! - How to chain multiple transform streams
-//! - Different data types flowing through the pipeline (String -> LogEntry -> String)
-//! - Error handling and backpressure across multiple stages
-//! - Real-world pipeline complexity
+//! Each `pipe_through` hands the next stage the previous stage's readable side, so the
+//! whole chain runs concurrently with backpressure applied end to end. The output is
+//! gzip-compressed NDJSON (one JSON object per line).
+//!
+//! Run with: `cargo run --example multi_stage_pipeline`
 
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -21,14 +16,12 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    transform::{TransformStream, TransformStreamDefaultController, Transformer},
-    writable_new::{WritableSink, WritableStream, WritableStreamDefaultController},
+use whatwg_streams::{
+    ReadableSource, ReadableStream, ReadableStreamDefaultController, StreamResult, TransformStream,
+    TransformStreamDefaultController, Transformer, WritableSink, WritableStream,
+    WritableStreamDefaultController,
 };
 
-/// Structured log entry after parsing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub timestamp: Option<DateTime<Utc>>,
@@ -38,29 +31,30 @@ pub struct LogEntry {
     pub thread_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogLevel {
-    ERROR,
-    WARN,
-    INFO,
-    DEBUG,
-    TRACE,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 impl LogLevel {
-    fn from_str(s: &str) -> Option<Self> {
+    fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
-            "ERROR" => Some(LogLevel::ERROR),
-            "WARN" | "WARNING" => Some(LogLevel::WARN),
-            "INFO" => Some(LogLevel::INFO),
-            "DEBUG" => Some(LogLevel::DEBUG),
-            "TRACE" => Some(LogLevel::TRACE),
+            "ERROR" => Some(LogLevel::Error),
+            "WARN" | "WARNING" => Some(LogLevel::Warn),
+            "INFO" => Some(LogLevel::Info),
+            "DEBUG" => Some(LogLevel::Debug),
+            "TRACE" => Some(LogLevel::Trace),
             _ => None,
         }
     }
 }
 
-/// Stage 1: Raw log data source
+/// Stage 1 — yields raw log lines, then closes.
+#[derive(Default)]
 pub struct LogDataSource {
     logs: Vec<String>,
     index: usize,
@@ -68,21 +62,18 @@ pub struct LogDataSource {
 
 impl LogDataSource {
     pub fn new() -> Self {
-        let sample_logs = vec![
-            "2024-01-15T10:30:45Z [ERROR] [auth-service] [thread-1] User authentication failed: invalid credentials",
-            "2024-01-15T10:30:46Z [INFO] [web-server] [thread-2] Request processed successfully: GET /api/users",
-            "2024-01-15T10:30:47Z [DEBUG] [database] [thread-3] Connection pool stats: active=5, idle=15, max=20",
-            "2024-01-15T10:30:48Z [ERROR] [payment-service] [thread-4] Payment processing failed: timeout after 30s",
-            "2024-01-15T10:30:49Z [WARN] [cache] [thread-1] Cache miss rate high: 85% over last 5 minutes",
+        let sample = [
+            "2024-01-15T10:30:45Z [ERROR] [auth-service] [thread-1] Authentication failed: invalid credentials",
+            "2024-01-15T10:30:46Z [INFO] [web-server] [thread-2] Request processed: GET /api/users",
+            "2024-01-15T10:30:47Z [DEBUG] [database] [thread-3] Pool stats: active=5 idle=15 max=20",
+            "2024-01-15T10:30:48Z [ERROR] [payment-service] [thread-4] Payment failed: timeout after 30s",
+            "2024-01-15T10:30:49Z [WARN] [cache] [thread-1] Cache miss rate high: 85% over 5 minutes",
             "2024-01-15T10:30:50Z [INFO] [scheduler] [thread-5] Background job completed: data-cleanup",
-            "2024-01-15T10:30:51Z [TRACE] [network] [thread-2] TCP packet sent: 1024 bytes to 192.168.1.100",
+            "2024-01-15T10:30:51Z [TRACE] [network] [thread-2] TCP packet sent: 1024 bytes",
             "2024-01-15T10:30:52Z [ERROR] [file-system] [thread-6] File not found: /var/logs/app.log",
-            "2024-01-15T10:30:53Z [DEBUG] [memory] [thread-3] Memory usage: 2.1GB used, 1.9GB free",
-            "2024-01-15T10:30:54Z [INFO] [health-check] [thread-7] All systems operational",
         ];
-
         Self {
-            logs: sample_logs.into_iter().map(String::from).collect(),
+            logs: sample.into_iter().map(String::from).collect(),
             index: 0,
         }
     }
@@ -94,12 +85,8 @@ impl ReadableSource<String> for LogDataSource {
         controller: &mut ReadableStreamDefaultController<String>,
     ) -> StreamResult<()> {
         if self.index < self.logs.len() {
-            let log_line = self.logs[self.index].clone();
+            controller.enqueue(self.logs[self.index].clone())?;
             self.index += 1;
-            controller.enqueue(log_line)?;
-
-            // Simulate real-time log generation with small delay
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         } else {
             controller.close()?;
         }
@@ -107,7 +94,7 @@ impl ReadableSource<String> for LogDataSource {
     }
 }
 
-/// Stage 2: Parse raw log strings into structured LogEntry objects
+/// Stage 2 — parses `timestamp [level] [source] [thread] message` into a `LogEntry`.
 pub struct LogParser;
 
 impl Transformer<String, LogEntry> for LogParser {
@@ -116,65 +103,32 @@ impl Transformer<String, LogEntry> for LogParser {
         chunk: String,
         controller: &mut TransformStreamDefaultController<LogEntry>,
     ) -> StreamResult<()> {
-        // Parse log line: "timestamp [level] [source] [thread] message"
         let parts: Vec<&str> = chunk.splitn(5, ' ').collect();
-
-        if parts.len() >= 5 {
-            let timestamp = DateTime::parse_from_rfc3339(parts[0])
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc));
-
-            // Extract level from [LEVEL]
-            let level_str = parts[1].trim_start_matches('[').trim_end_matches(']');
-            let level = LogLevel::from_str(level_str).unwrap_or(LogLevel::INFO);
-
-            // Extract source from [source]
-            let source = Some(
-                parts[2]
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string(),
-            );
-
-            // Extract thread from [thread]
-            let thread_id = Some(
-                parts[3]
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string(),
-            );
-
-            let message = parts[4].to_string();
-
-            let log_entry = LogEntry {
-                timestamp,
-                level,
-                message,
-                source,
-                thread_id,
-            };
-
-            controller.enqueue(log_entry.clone())?;
-            println!("📝 Parsed: {} -> {:?}", level_str, log_entry.level);
-        } else {
-            println!("⚠️  Failed to parse log line: {}", chunk);
-            // Skip malformed lines rather than error
+        if parts.len() < 5 {
+            return Ok(()); // skip malformed lines
         }
-
-        Ok(())
+        let unbracket = |s: &str| s.trim_start_matches('[').trim_end_matches(']').to_string();
+        let entry = LogEntry {
+            timestamp: DateTime::parse_from_rfc3339(parts[0])
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc)),
+            level: LogLevel::parse(&unbracket(parts[1])).unwrap_or(LogLevel::Info),
+            source: Some(unbracket(parts[2])),
+            thread_id: Some(unbracket(parts[3])),
+            message: parts[4].to_string(),
+        };
+        controller.enqueue(entry)
     }
 }
 
-/// Stage 3: Filter logs by level (ERROR and WARN only)
+/// Stage 3 — forwards only entries whose level is in `allowed`.
 pub struct LogLevelFilter {
-    allowed_levels: Vec<LogLevel>,
+    allowed: Vec<LogLevel>,
 }
 
 impl LogLevelFilter {
-    pub fn new(levels: Vec<LogLevel>) -> Self {
-        Self {
-            allowed_levels: levels,
-        }
+    pub fn new(allowed: Vec<LogLevel>) -> Self {
+        Self { allowed }
     }
 }
 
@@ -184,45 +138,34 @@ impl Transformer<LogEntry, LogEntry> for LogLevelFilter {
         chunk: LogEntry,
         controller: &mut TransformStreamDefaultController<LogEntry>,
     ) -> StreamResult<()> {
-        if self.allowed_levels.contains(&chunk.level) {
-            println!("✅ Passed filter: {:?} - {}", chunk.level, chunk.message);
+        if self.allowed.contains(&chunk.level) {
             controller.enqueue(chunk)?;
-        } else {
-            println!("🚫 Filtered out: {:?}", chunk.level);
-            // Don't enqueue - filter out this entry
         }
         Ok(())
-    }
-}
-
-/// Stage 4: Add processing metadata and enrich entries
-pub struct MetadataEnricher {
-    processing_id: String,
-    processed_count: u64,
-}
-
-impl MetadataEnricher {
-    pub fn new() -> Self {
-        Self {
-            processing_id: format!("proc-{}", uuid::Uuid::new_v4().simple()),
-            processed_count: 0,
-        }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct EnrichedLogEntry {
     #[serde(flatten)]
-    log_entry: LogEntry,
-    processing_metadata: ProcessingMetadata,
+    entry: LogEntry,
+    processing_id: String,
+    sequence_number: u64,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ProcessingMetadata {
+/// Stage 4 — tags each entry with processing metadata and serializes it to JSON.
+pub struct MetadataEnricher {
     processing_id: String,
-    processing_timestamp: DateTime<Utc>,
-    sequence_number: u64,
-    pipeline_stage: String,
+    count: u64,
+}
+
+impl Default for MetadataEnricher {
+    fn default() -> Self {
+        Self {
+            processing_id: format!("proc-{}", uuid::Uuid::new_v4().simple()),
+            count: 0,
+        }
+    }
 }
 
 impl Transformer<LogEntry, String> for MetadataEnricher {
@@ -231,56 +174,30 @@ impl Transformer<LogEntry, String> for MetadataEnricher {
         chunk: LogEntry,
         controller: &mut TransformStreamDefaultController<String>,
     ) -> StreamResult<()> {
-        self.processed_count += 1;
-
+        self.count += 1;
         let enriched = EnrichedLogEntry {
-            log_entry: chunk,
-            processing_metadata: ProcessingMetadata {
-                processing_id: self.processing_id.clone(),
-                processing_timestamp: Utc::now(),
-                sequence_number: self.processed_count,
-                pipeline_stage: "multi-stage-pipeline".to_string(),
-            },
+            entry: chunk,
+            processing_id: self.processing_id.clone(),
+            sequence_number: self.count,
         };
-
-        // Convert to JSON string
-        match serde_json::to_string(&enriched) {
-            Ok(json_str) => {
-                println!("🔄 Enriched entry #{}", self.processed_count);
-                controller.enqueue(json_str)?;
-            }
-            Err(e) => {
-                println!("❌ JSON serialization failed: {}", e);
-                // Continue processing rather than failing the entire pipeline
-            }
-        }
-
-        Ok(())
+        let json = serde_json::to_string(&enriched).map_err(|e| e.to_string())?;
+        controller.enqueue(json)
     }
 }
 
-/// Stage 5: Compression transform (reusing from previous example)
-pub struct JsonGzipCompressor {
+/// Stage 5 — gzips each JSON line, emitting compressed bytes as they become available.
+#[derive(Default)]
+pub struct JsonlGzipCompressor {
     encoder: Option<GzEncoder<Vec<u8>>>,
-    entries_compressed: u64,
+    emitted: usize,
 }
 
-impl JsonGzipCompressor {
-    pub fn new() -> Self {
-        Self {
-            encoder: None,
-            entries_compressed: 0,
-        }
-    }
-}
-
-impl Transformer<String, Vec<u8>> for JsonGzipCompressor {
+impl Transformer<String, Vec<u8>> for JsonlGzipCompressor {
     async fn start(
         &mut self,
-        _controller: &mut TransformStreamDefaultController<Vec<u8>>,
+        _c: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
         self.encoder = Some(GzEncoder::new(Vec::new(), Compression::default()));
-        println!("🗜️  JSON Gzip compressor initialized");
         Ok(())
     }
 
@@ -289,30 +206,14 @@ impl Transformer<String, Vec<u8>> for JsonGzipCompressor {
         chunk: String,
         controller: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
-        if let Some(encoder) = &mut self.encoder {
-            self.entries_compressed += 1;
-
-            // Add newline to separate JSON entries
-            let json_line = format!("{}\n", chunk);
-
-            encoder
-                .write_all(json_line.as_bytes())
-                .map_err(|e| format!("Compression error: {}", e))?;
-
-            // Periodically flush to get compressed output
-            if self.entries_compressed % 5 == 0 {
-                encoder
-                    .flush()
-                    .map_err(|e| format!("Compression flush error: {}", e))?;
-
-                let compressed_data = encoder.get_ref().clone();
-                if !compressed_data.is_empty() {
-                    controller.enqueue(compressed_data.clone())?;
-                    // Reset encoder with new buffer
-                    *encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    println!("🗜️  Compressed batch of 5 entries");
-                }
-            }
+        let encoder = self.encoder.as_mut().expect("encoder set in start");
+        writeln!(encoder, "{chunk}")?;
+        encoder.flush()?;
+        let produced = encoder.get_ref();
+        if produced.len() > self.emitted {
+            let new_bytes = produced[self.emitted..].to_vec();
+            self.emitted = produced.len();
+            controller.enqueue(new_bytes)?;
         }
         Ok(())
     }
@@ -322,373 +223,100 @@ impl Transformer<String, Vec<u8>> for JsonGzipCompressor {
         controller: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
         if let Some(encoder) = self.encoder.take() {
-            let final_compressed = encoder
-                .finish()
-                .map_err(|e| format!("Final compression error: {}", e))?;
-
-            if !final_compressed.is_empty() {
-                controller.enqueue(final_compressed)?;
+            let finished = encoder.finish()?;
+            if finished.len() > self.emitted {
+                controller.enqueue(finished[self.emitted..].to_vec())?;
             }
-
-            println!(
-                "✅ Compression complete - {} entries processed",
-                self.entries_compressed
-            );
         }
         Ok(())
     }
 }
 
-/// Final stage: Compressed file writer
+/// Final stage — writes the compressed bytes to a file.
 pub struct CompressedJsonWriter {
-    file_path: String,
-    file_handle: Option<File>,
-    bytes_written: u64,
+    path: String,
+    file: Option<File>,
 }
 
 impl CompressedJsonWriter {
     pub fn new(path: &str) -> Self {
         Self {
-            file_path: path.to_string(),
-            file_handle: None,
-            bytes_written: 0,
+            path: path.to_string(),
+            file: None,
         }
     }
 }
 
 impl WritableSink<Vec<u8>> for CompressedJsonWriter {
-    async fn start(
-        &mut self,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
-        self.file_handle = Some(File::create(&self.file_path).await?);
-        println!("📁 Created compressed JSON output: {}", self.file_path);
+    async fn start(&mut self, _c: &mut WritableStreamDefaultController) -> StreamResult<()> {
+        self.file = Some(File::create(&self.path).await?);
         Ok(())
     }
 
     async fn write(
         &mut self,
         chunk: Vec<u8>,
-        _controller: &mut WritableStreamDefaultController,
+        _c: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
-        if let Some(file) = &mut self.file_handle {
+        if let Some(file) = &mut self.file {
             file.write_all(&chunk).await?;
-            self.bytes_written += chunk.len() as u64;
         }
         Ok(())
     }
 
     async fn close(mut self) -> StreamResult<()> {
-        if let Some(file) = self.file_handle.take() {
+        if let Some(file) = self.file.take() {
             file.sync_all().await?;
-            println!(
-                "🔒 Pipeline output complete: {} bytes written to {}",
-                self.bytes_written, self.file_path
-            );
         }
         Ok(())
     }
 }
 
-/// Run the complete multi-stage pipeline
-pub async fn run_multi_stage_pipeline() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Multi-Stage Processing Pipeline ===");
-    println!("📊 Pipeline stages:");
-    println!("   1. Raw log data source");
-    println!("   2. Parse to structured entries");
-    println!("   3. Filter by log level (ERROR, WARN only)");
-    println!("   4. Add processing metadata");
-    println!("   5. Compress as JSON");
-    println!("   6. Write to file");
-    println!();
-
-    // Stage 1: Create data source
-    //let log_source = ReadableStream::new_default(LogDataSource::new(), None);
-    let log_source = ReadableStream::builder(LogDataSource::new())
-        .with_spawn(|fut| {
-            tokio::spawn(fut);
-        })
-        .build();
-
-    // Stage 2: Parse logs into structured data
-    let parser = TransformStream::new(LogParser);
-
-    // Stage 3: Filter by level
-    let filter = TransformStream::new(LogLevelFilter::new(vec![LogLevel::ERROR, LogLevel::WARN]));
-
-    // Stage 4: Add metadata and convert to JSON
-    let enricher = TransformStream::new(MetadataEnricher::new());
-
-    // Stage 5: Compress JSON
-    let compressor = TransformStream::new(JsonGzipCompressor::new());
-
-    // Stage 6: Write compressed output
+#[tokio::main]
+async fn main() {
     let output_file = "processed_logs.jsonl.gz";
-    let writer = WritableStream::new_with_spawn(
-        CompressedJsonWriter::new(output_file),
-        Box::new(CountQueuingStrategy::new(3)),
-        |fut| {
-            tokio::spawn(fut);
-        },
-    );
 
-    println!("🚀 Starting pipeline execution...");
-    let start_time = std::time::Instant::now();
+    let source = ReadableStream::builder(LogDataSource::new()).spawn(tokio::spawn);
+    let parser = TransformStream::builder(LogParser).spawn(tokio::spawn);
+    let filter = TransformStream::builder(LogLevelFilter::new(vec![LogLevel::Error, LogLevel::Warn]))
+        .spawn(tokio::spawn);
+    let enricher = TransformStream::builder(MetadataEnricher::default()).spawn(tokio::spawn);
+    let compressor = TransformStream::builder(JsonlGzipCompressor::default()).spawn(tokio::spawn);
+    let writer = WritableStream::builder(CompressedJsonWriter::new(output_file)).spawn(tokio::spawn);
 
-    // Execute the complete pipeline
-    log_source
-        .pipe_through(parser, None) // String -> LogEntry
-        .pipe_through(filter, None) // LogEntry -> LogEntry (filtered)
-        .pipe_through(enricher, None) // LogEntry -> String (JSON)
-        .pipe_through(compressor, None) // String -> Vec<u8> (compressed)
-        .pipe_to(&writer, None) // Vec<u8> -> File
-        .await?;
+    println!("running: source -> parse -> filter(ERROR,WARN) -> enrich -> gzip -> file");
+    let parsed = source.pipe_through(parser, None).spawn(tokio::spawn);
+    let filtered = parsed.pipe_through(filter, None).spawn(tokio::spawn);
+    let enriched = filtered.pipe_through(enricher, None).spawn(tokio::spawn);
+    let compressed = enriched.pipe_through(compressor, None).spawn(tokio::spawn);
+    compressed
+        .pipe_to(&writer, None)
+        .await
+        .expect("pipeline should complete");
 
-    let duration = start_time.elapsed();
-    println!("✅ Pipeline completed in {:?}", duration);
-
-    // Verify the output
-    verify_pipeline_output(output_file).await?;
-
-    Ok(())
+    verify_output(output_file).await;
 }
 
-/// Verify the pipeline output by decompressing and checking the data
-async fn verify_pipeline_output(compressed_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Decompresses the output and reports how many entries survived the filter.
+async fn verify_output(path: &str) {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
-    println!("🔍 Verifying pipeline output...");
+    let compressed = tokio::fs::read(path).await.expect("read output");
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut text = String::new();
+    decoder.read_to_string(&mut text).expect("decompress output");
 
-    let compressed_data = tokio::fs::read(compressed_file).await?;
-    let mut decoder = GzDecoder::new(&compressed_data[..]);
-    let mut decompressed = String::new();
-    decoder.read_to_string(&mut decompressed)?;
-
-    let lines: Vec<&str> = decompressed
-        .trim()
-        .split('\n')
-        .filter(|s| !s.is_empty())
+    let entries: Vec<EnrichedLogEntry> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("parse NDJSON line"))
         .collect();
-    println!("📄 Output contains {} processed log entries", lines.len());
 
-    // Parse and validate a few entries
-    for (i, line) in lines.iter().take(3).enumerate() {
-        match serde_json::from_str::<EnrichedLogEntry>(line) {
-            Ok(parsed) => {
-                println!(
-                    "   Entry {}: {:?} - {}",
-                    i + 1,
-                    parsed.log_entry.level,
-                    parsed.processing_metadata.sequence_number
-                );
-            }
-            Err(e) => {
-                println!("   Entry {}: JSON parse error - {}", i + 1, e);
-            }
-        }
-    }
-
-    let file_size = tokio::fs::metadata(compressed_file).await?.len();
-    println!("💾 Compressed file size: {} bytes", file_size);
     println!(
-        "📈 Compression ratio: {:.1}%",
-        (file_size as f64 / decompressed.len() as f64) * 100.0
+        "wrote {path} ({} bytes): {} entries, levels {:?}",
+        compressed.len(),
+        entries.len(),
+        entries.iter().map(|e| &e.entry.level).collect::<Vec<_>>(),
     );
-
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_multi_stage_pipeline().await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::fs;
-
-    #[tokio::test]
-    async fn test_log_parser() {
-        let parser_stream = TransformStream::new(LogParser);
-        let (readable, writable) = parser_stream.split();
-        let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
-
-        let test_log =
-            "2024-01-15T10:30:45Z [ERROR] [auth-service] [thread-1] Authentication failed";
-        writer.write(test_log.to_string()).await.unwrap();
-        writer.close().await.unwrap();
-
-        let result = reader.read().await.unwrap().unwrap();
-        assert_eq!(result.level, LogLevel::ERROR);
-        assert!(result.message.contains("Authentication failed"));
-    }
-
-    #[tokio::test]
-    async fn test_level_filter() {
-        let filter = TransformStream::new(LogLevelFilter::new(vec![LogLevel::ERROR]));
-        let (readable, writable) = filter.split();
-        let (_, writer) = writable.get_writer().unwrap();
-        let (_, reader) = readable.get_reader();
-
-        // Test entries
-        let error_entry = LogEntry {
-            timestamp: None,
-            level: LogLevel::ERROR,
-            message: "Error message".to_string(),
-            source: None,
-            thread_id: None,
-        };
-
-        let info_entry = LogEntry {
-            timestamp: None,
-            level: LogLevel::INFO,
-            message: "Info message".to_string(),
-            source: None,
-            thread_id: None,
-        };
-
-        writer.write(error_entry.clone()).await.unwrap();
-        writer.write(info_entry).await.unwrap();
-        writer.close().await.unwrap();
-
-        // Should only get the ERROR entry
-        let result = reader.read().await.unwrap().unwrap();
-        assert_eq!(result.level, LogLevel::ERROR);
-
-        // No more entries should be available
-        let result2 = reader.read().await.unwrap();
-        assert!(result2.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_complete_mini_pipeline() {
-        // Test a simplified 3-stage pipeline
-        let source = ReadableStream::new_default(LogDataSource::new(), None);
-        let parser = TransformStream::new(LogParser);
-        let filter =
-            TransformStream::new(LogLevelFilter::new(vec![LogLevel::ERROR, LogLevel::WARN]));
-
-        let output_file = "test_pipeline_output.jsonl";
-        let writer = WritableStream::new_with_spawn(
-            TestJsonWriter::new(output_file),
-            Box::new(CountQueuingStrategy::new(5)),
-            |fut| {
-                tokio::spawn(fut);
-            },
-        );
-
-        // Run mini pipeline: logs -> parse -> filter -> write
-        source
-            .pipe_through(parser, None)
-            .pipe_through(filter, None)
-            .pipe_to(&TestJsonWriteAdapter::new(writer), None)
-            .await
-            .expect("Mini pipeline should complete");
-
-        // Verify output exists
-        let content = fs::read_to_string(output_file).await.unwrap();
-        assert!(!content.is_empty());
-
-        // Should contain only ERROR and WARN entries
-        assert!(content.contains("ERROR") || content.contains("WARN"));
-        assert!(!content.contains("INFO")); // INFO should be filtered out
-
-        // Clean up
-        let _ = fs::remove_file(output_file).await;
-    }
-
-    // Helper test writer for structured data
-    struct TestJsonWriter {
-        file_path: String,
-        content: String,
-    }
-
-    impl TestJsonWriter {
-        fn new(path: &str) -> Self {
-            Self {
-                file_path: path.to_string(),
-                content: String::new(),
-            }
-        }
-    }
-
-    impl WritableSink<LogEntry> for TestJsonWriter {
-        async fn write(
-            &mut self,
-            chunk: LogEntry,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
-            let json_line = serde_json::to_string(&chunk).unwrap();
-            self.content.push_str(&json_line);
-            self.content.push('\n');
-            Ok(())
-        }
-
-        async fn close(self) -> StreamResult<()> {
-            tokio::fs::write(&self.file_path, self.content).await?;
-            Ok(())
-        }
-    }
-
-    // Adapter to bridge LogEntry -> String for existing writer
-    struct TestJsonWriteAdapter {
-        inner: WritableStream<String, TestStringWriter, whatwg_streams::dlc::ideation::d::Unlocked>,
-    }
-
-    impl TestJsonWriteAdapter {
-        fn new(
-            _writer: WritableStream<
-                Vec<u8>,
-                CompressedJsonWriter,
-                whatwg_streams::dlc::ideation::d::Unlocked,
-            >,
-        ) -> Self {
-            // Create a simple string writer for testing
-            let string_writer = WritableStream::new_with_spawn(
-                TestStringWriter::new("test_adapter_output.txt"),
-                Box::new(CountQueuingStrategy::new(5)),
-                |fut| {
-                    tokio::spawn(fut);
-                },
-            );
-
-            Self {
-                inner: string_writer,
-            }
-        }
-    }
-
-    struct TestStringWriter {
-        file_path: String,
-        content: String,
-    }
-
-    impl TestStringWriter {
-        fn new(path: &str) -> Self {
-            Self {
-                file_path: path.to_string(),
-                content: String::new(),
-            }
-        }
-    }
-
-    impl WritableSink<String> for TestStringWriter {
-        async fn write(
-            &mut self,
-            chunk: String,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
-            self.content.push_str(&chunk);
-            self.content.push('\n');
-            Ok(())
-        }
-
-        async fn close(self) -> StreamResult<()> {
-            tokio::fs::write(&self.file_path, self.content).await?;
-            Ok(())
-        }
-    }
 }

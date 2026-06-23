@@ -1,211 +1,140 @@
-//! JSON Stream Example
+//! Streaming records out of an NDJSON file.
 //!
-//! Demonstrates how to process JSON data incrementally as a stream.
-//! - Reads a JSON array from a source
-//! - Parses objects one by one using serde_json
-//! - Prints each object as it is processed
+//! The data is newline-delimited JSON — one object per line — the format you reach for
+//! when records must be processed incrementally. The source reads the file in byte
+//! chunks; a transform buffers them, slices out each complete line as it arrives, and
+//! deserializes it into a `Person`; the sink prints each one. At no point is more than a
+//! single line held in memory, so this scales to files far larger than RAM.
 //!
-//! This is memory-efficient for large JSON arrays.
+//! A bracketed `[...]` JSON array cannot be streamed this way — the whole array is one
+//! value and must be parsed at once. NDJSON exists precisely to make per-record
+//! streaming possible.
+//!
+//! Run with: `cargo run --example json_stream`
 
 use serde::Deserialize;
-use serde_json::Deserializer;
 use tokio::fs::File;
-use tokio::io::{self, AsyncReadExt};
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    writable_new::{WritableSink, WritableStream, WritableStreamDefaultController},
+use tokio::io::AsyncReadExt;
+use whatwg_streams::{
+    ReadableSource, ReadableStream, ReadableStreamDefaultController, StreamResult, TransformStream,
+    TransformStreamDefaultController, Transformer, WritableSink, WritableStream,
+    WritableStreamDefaultController,
 };
 
-/// Example struct to deserialize JSON objects into
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-struct Person {
+#[derive(Deserialize)]
+pub struct Person {
     name: String,
     age: u32,
 }
 
-/// Source that streams JSON objects from a file
-pub struct JsonFileSource {
-    data: Vec<u8>,
-    cursor: usize,
-    objects: Vec<Person>,
-    idx: usize,
+/// Reads a file in fixed-size byte chunks, then closes.
+pub struct NdjsonFileSource {
+    file: File,
+    buffer_size: usize,
 }
 
-impl JsonFileSource {
-    pub async fn from_file(path: &str) -> io::Result<Self> {
-        let mut file = File::open(path).await?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).await?;
-
-        // Deserialize JSON array into Vec<Person>
-        let objects: Vec<Person> = serde_json::from_slice(&buf)?;
-
+impl NdjsonFileSource {
+    pub async fn open(path: &str, buffer_size: usize) -> std::io::Result<Self> {
         Ok(Self {
-            data: buf,
-            cursor: 0,
-            objects,
-            idx: 0,
+            file: File::open(path).await?,
+            buffer_size,
         })
     }
 }
 
-impl ReadableSource<Person> for JsonFileSource {
-    async fn start(
-        &mut self,
-        _controller: &mut ReadableStreamDefaultController<Person>,
-    ) -> StreamResult<()> {
-        println!("✅ JSON stream started");
-        Ok(())
-    }
-
+impl ReadableSource<Vec<u8>> for NdjsonFileSource {
     async fn pull(
         &mut self,
-        controller: &mut ReadableStreamDefaultController<Person>,
+        controller: &mut ReadableStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
-        if self.idx < self.objects.len() {
-            let obj = self.objects[self.idx].clone();
-            self.idx += 1;
-            controller.enqueue(obj)?;
-        } else {
+        let mut buf = vec![0u8; self.buffer_size];
+        let n = self.file.read(&mut buf).await?;
+        if n == 0 {
             controller.close()?;
+        } else {
+            buf.truncate(n);
+            controller.enqueue(buf)?;
         }
-        Ok(())
-    }
-
-    async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
-        println!("🚫 JSON stream cancelled: {:?}", reason);
         Ok(())
     }
 }
 
-/// Writable sink that prints JSON objects
+/// Buffers bytes and deserializes each complete newline-terminated line into a `Person`.
+#[derive(Default)]
+pub struct PersonParser {
+    buf: Vec<u8>,
+}
+
+impl PersonParser {
+    fn parse_line(line: &[u8], controller: &mut TransformStreamDefaultController<Person>) -> StreamResult<()> {
+        let text = std::str::from_utf8(line).map_err(|e| e.to_string())?.trim();
+        if !text.is_empty() {
+            let person: Person = serde_json::from_str(text).map_err(|e| e.to_string())?;
+            controller.enqueue(person)?;
+        }
+        Ok(())
+    }
+}
+
+impl Transformer<Vec<u8>, Person> for PersonParser {
+    async fn transform(
+        &mut self,
+        chunk: Vec<u8>,
+        controller: &mut TransformStreamDefaultController<Person>,
+    ) -> StreamResult<()> {
+        self.buf.extend_from_slice(&chunk);
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=nl).collect();
+            Self::parse_line(&line, controller)?;
+        }
+        Ok(())
+    }
+
+    async fn flush(
+        &mut self,
+        controller: &mut TransformStreamDefaultController<Person>,
+    ) -> StreamResult<()> {
+        // A final line with no trailing newline.
+        let rest = std::mem::take(&mut self.buf);
+        Self::parse_line(&rest, controller)
+    }
+}
+
+/// Prints each parsed person.
 pub struct ConsoleSink;
 
 impl WritableSink<Person> for ConsoleSink {
     async fn write(
         &mut self,
         chunk: Person,
-        _controller: &mut WritableStreamDefaultController,
+        _c: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
-        println!("👤 Person: {:?}", chunk);
+        println!("  {} (age {})", chunk.name, chunk.age);
         Ok(())
     }
-
-    async fn close(self) -> StreamResult<()> {
-        println!("✅ ConsoleSink closed");
-        Ok(())
-    }
-
-    async fn abort(&mut self, reason: Option<String>) -> StreamResult<()> {
-        println!("🚫 ConsoleSink aborted: {:?}", reason);
-        Ok(())
-    }
-}
-
-/// Example runner
-pub async fn run_json_stream_example() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== JSON Stream Example ===");
-
-    // Create a small JSON test file
-    let path = "examples/file_processing/people.json";
-    tokio::fs::write(
-        path,
-        r#"[{"name":"Alice","age":30},{"name":"Bob","age":25},{"name":"Charlie","age":35}]"#,
-    )
-    .await?;
-
-    // Build JSON stream
-    let source = JsonFileSource::from_file(path).await?;
-    let readable = ReadableStream::new_default(source, None);
-
-    // Build writable
-    let writable = WritableStream::new_with_spawn(
-        ConsoleSink,
-        Box::new(CountQueuingStrategy::new(1)),
-        |fut| {
-            tokio::spawn(fut);
-        },
-    );
-
-    // Pipe JSON stream to console
-    readable.pipe_to(&writable, None).await?;
-
-    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_json_stream_example().await
-}
+async fn main() {
+    let path = "people.ndjson";
+    tokio::fs::write(
+        path,
+        "{\"name\":\"Alice\",\"age\":30}\n{\"name\":\"Bob\",\"age\":25}\n{\"name\":\"Charlie\",\"age\":35}\n",
+    )
+    .await
+    .expect("write sample ndjson");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+    // A deliberately small read buffer so lines genuinely split across chunks, exercising
+    // the parser's cross-chunk buffering.
+    let input = NdjsonFileSource::open(path, 16).await.expect("open ndjson");
+    let source = ReadableStream::builder(input).spawn(tokio::spawn);
+    let parser = TransformStream::builder(PersonParser::default()).spawn(tokio::spawn);
+    let sink = WritableStream::builder(ConsoleSink).spawn(tokio::spawn);
 
-    struct CollectSink {
-        items: Arc<Mutex<Vec<Person>>>,
-    }
-
-    impl WritableSink<Person> for CollectSink {
-        async fn write(
-            &mut self,
-            chunk: Person,
-            _controller: &mut WritableStreamDefaultController,
-        ) -> StreamResult<()> {
-            self.items.lock().await.push(chunk);
-            Ok(())
-        }
-
-        async fn close(self) -> StreamResult<()> {
-            Ok(())
-        }
-
-        async fn abort(&mut self, _reason: Option<String>) -> StreamResult<()> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_json_stream_collects_people() {
-        let path = "examples/file_processing/test_people.json";
-        tokio::fs::write(
-            path,
-            r#"[{"name":"Dana","age":40},{"name":"Eli","age":28}]"#,
-        )
+    println!("streaming people from {path}:");
+    let people = source.pipe_through(parser, None).spawn(tokio::spawn);
+    people
+        .pipe_to(&sink, None)
         .await
-        .unwrap();
-
-        let source = JsonFileSource::from_file(path).await.unwrap();
-        let readable = ReadableStream::new_default(source, None);
-
-        let items = Arc::new(Mutex::new(Vec::new()));
-        let sink = CollectSink {
-            items: items.clone(),
-        };
-
-        let writable =
-            WritableStream::new_with_spawn(sink, Box::new(CountQueuingStrategy::new(1)), |fut| {
-                tokio::spawn(fut);
-            });
-
-        readable.pipe_to(&writable, None).await.unwrap();
-
-        let collected = items.lock().await.clone();
-        assert_eq!(
-            collected,
-            vec![
-                Person {
-                    name: "Dana".into(),
-                    age: 40
-                },
-                Person {
-                    name: "Eli".into(),
-                    age: 28
-                }
-            ]
-        );
-    }
+        .expect("pipe should complete");
 }

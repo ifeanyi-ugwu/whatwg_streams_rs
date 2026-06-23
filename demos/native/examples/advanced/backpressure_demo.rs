@@ -1,20 +1,20 @@
-//! Backpressure Demo Example
+//! Backpressure across a pipeline, made visible.
 //!
-//! Demonstrates how to handle backpressure in a streaming pipeline using
-//! whatwg_streams. This example shows:
-//! 1. A fast producer generating data
-//! 2. A slow consumer processing data
-//! 3. How a queue strategy controls memory usage and prevents overrun
+//! A fast producer feeds a slow sink through a queue with a high-water mark of 5.
+//! Each `pull` prints the controller's remaining `desired_size`: it counts down as the
+//! queue fills, reaches 0, and the producer then stalls until the sink drains a slot.
+//! The producer never races more than ~5 items ahead of the sink — that is backpressure.
+//!
+//! Run with: `cargo run --example backpressure_demo`
 
 use std::time::Duration;
 use tokio::time::sleep;
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    writable_new::{WritableSink, WritableStream, WritableStreamDefaultController},
+use whatwg_streams::{
+    CountQueuingStrategy, ReadableSource, ReadableStream, ReadableStreamDefaultController,
+    StreamResult, WritableSink, WritableStream, WritableStreamDefaultController,
 };
 
-/// Fast producer generating numbers
+/// Produces 1..=max as fast as the queue will accept.
 pub struct FastProducer {
     count: usize,
     max: usize,
@@ -34,7 +34,11 @@ impl ReadableSource<usize> for FastProducer {
         if self.count < self.max {
             self.count += 1;
             controller.enqueue(self.count)?;
-            println!("📦 Produced: {}", self.count);
+            println!(
+                "produced {:>2}  (queue room left: {:?})",
+                self.count,
+                controller.desired_size()
+            );
         } else {
             controller.close()?;
         }
@@ -42,7 +46,7 @@ impl ReadableSource<usize> for FastProducer {
     }
 }
 
-/// Slow consumer that simulates processing delay
+/// Accepts one item every 200ms.
 pub struct SlowConsumer;
 
 impl WritableSink<usize> for SlowConsumer {
@@ -51,35 +55,21 @@ impl WritableSink<usize> for SlowConsumer {
         chunk: usize,
         _controller: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
-        println!("📥 Consuming: {}", chunk);
-        sleep(Duration::from_millis(200)).await; // simulate slow processing
-        Ok(())
-    }
-
-    async fn close(self) -> StreamResult<()> {
-        println!("✅ Consumer done");
+        println!("        consumed {chunk:>2}");
+        sleep(Duration::from_millis(200)).await;
         Ok(())
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Backpressure Demo ===");
+async fn main() {
+    let source = ReadableStream::builder(FastProducer::new(20))
+        .strategy(CountQueuingStrategy::new(5))
+        .spawn(tokio::spawn);
+    let sink = WritableStream::builder(SlowConsumer).spawn(tokio::spawn);
 
-    let producer = FastProducer::new(20);
-    let readable = ReadableStream::new_default(producer, None);
-
-    let consumer = SlowConsumer;
-    let writable = WritableStream::new_with_spawn(
-        consumer,
-        Box::new(CountQueuingStrategy::new(5)), // queue allows up to 5 items before backpressure
-        |fut| {
-            tokio::spawn(fut);
-        },
-    );
-
-    readable.pipe_to(&writable, None).await?;
-
-    println!("✅ Backpressure demo completed");
-    Ok(())
+    source
+        .pipe_to(&sink, None)
+        .await
+        .expect("pipe should complete");
 }

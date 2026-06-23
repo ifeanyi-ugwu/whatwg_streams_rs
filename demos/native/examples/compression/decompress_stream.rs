@@ -1,28 +1,24 @@
-//! Decompression Transform Example
+//! Streaming gzip decompression as a `TransformStream`.
 //!
-//! Demonstrates streaming decompression using a transform stream that:
-//! 1. Reads compressed data chunks from a file
-//! 2. Decompresses each chunk using gzip
-//! 3. Outputs decompressed data to a file
+//! Compressed bytes are read from a file in fixed-size chunks and fed to a stateful
+//! `Decompress`. One input chunk can expand into more output than a single buffer holds,
+//! so `transform` loops — tracking how much the inflater consumed and produced each call
+//! — and emits every decompressed batch downstream. Pair it with `gzip_transform`, which
+//! writes `compressed_data.gz`.
 //!
-//! This example shows:
-//! - How transforms can reverse gzip compression
-//! - Chunked streaming decompression with flush
-//! - Using readable → transform → writable pipeline
+//! Run with: `cargo run --example decompress_stream`
 
-use flate2::Decompress;
-use flate2::FlushDecompress;
-use std::io;
+use flate2::write::GzDecoder;
+use std::io::{self, Write};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use whatwg_streams::dlc::ideation::d::{
-    CountQueuingStrategy, StreamResult,
-    readable_sampling_b::{ReadableSource, ReadableStream, ReadableStreamDefaultController},
-    transform::{TransformStream, TransformStreamDefaultController, Transformer},
-    writable_new::{WritableSink, WritableStream, WritableStreamDefaultController},
+use whatwg_streams::{
+    ReadableSource, ReadableStream, ReadableStreamDefaultController, StreamResult, TransformStream,
+    TransformStreamDefaultController, Transformer, WritableSink, WritableStream,
+    WritableStreamDefaultController,
 };
 
-/// A readable source that streams compressed data from a file
+/// Reads a file in fixed-size chunks, then closes.
 pub struct CompressedFileSource {
     file: File,
     buffer_size: usize,
@@ -30,8 +26,10 @@ pub struct CompressedFileSource {
 
 impl CompressedFileSource {
     pub async fn new(path: &str, buffer_size: usize) -> io::Result<Self> {
-        let file = File::open(path).await?;
-        Ok(Self { file, buffer_size })
+        Ok(Self {
+            file: File::open(path).await?,
+            buffer_size,
+        })
     }
 }
 
@@ -52,15 +50,18 @@ impl ReadableSource<Vec<u8>> for CompressedFileSource {
     }
 }
 
-/// A transform stream that decompresses gzip data
+/// Inflates gzip data incrementally, emitting each decompressed batch.
+///
+/// `write::GzDecoder` decompresses gzip (header, payload, and CRC footer) as bytes are
+/// written to it, appending plaintext to an inner `Vec` that is drained after each chunk.
 pub struct GzipDecompressor {
-    decompressor: Decompress,
+    decoder: GzDecoder<Vec<u8>>,
 }
 
-impl GzipDecompressor {
-    pub fn new() -> Self {
+impl Default for GzipDecompressor {
+    fn default() -> Self {
         Self {
-            decompressor: Decompress::new(true), // true = gzip header
+            decoder: GzDecoder::new(Vec::new()),
         }
     }
 }
@@ -71,110 +72,89 @@ impl Transformer<Vec<u8>, Vec<u8>> for GzipDecompressor {
         chunk: Vec<u8>,
         controller: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
-        let mut output = vec![0u8; chunk.len() * 5]; // oversize buffer
-        let mut total_out = 0;
-
-        let status = self
-            .decompressor
-            .decompress(&chunk, &mut output, FlushDecompress::None)
-            .map_err(|e| format!("Decompression error: {}", e))?;
-
-        total_out = self.decompressor.total_out() as usize;
-
-        if total_out > 0 {
-            output.truncate(total_out);
-            controller.enqueue(output)?;
+        self.decoder.write_all(&chunk)?;
+        let produced = std::mem::take(self.decoder.get_mut());
+        if !produced.is_empty() {
+            controller.enqueue(produced)?;
         }
-
-        println!("🔄 Decompressed chunk: {:?} ({:?})", total_out, status);
         Ok(())
     }
 
     async fn flush(
         &mut self,
-        _controller: &mut TransformStreamDefaultController<Vec<u8>>,
+        controller: &mut TransformStreamDefaultController<Vec<u8>>,
     ) -> StreamResult<()> {
-        println!("✅ Decompression complete");
+        // Finalize the gzip stream (verifies the CRC) and emit any trailing plaintext.
+        self.decoder.try_finish()?;
+        let produced = std::mem::take(self.decoder.get_mut());
+        if !produced.is_empty() {
+            controller.enqueue(produced)?;
+        }
         Ok(())
     }
 }
 
-/// A writable sink that writes decompressed text to a file
+/// Writes decompressed bytes to a file.
 pub struct DecompressedFileWriter {
     file_path: String,
-    file_handle: Option<File>,
+    file: Option<File>,
 }
 
 impl DecompressedFileWriter {
     pub fn new(path: &str) -> Self {
         Self {
             file_path: path.to_string(),
-            file_handle: None,
+            file: None,
         }
     }
 }
 
 impl WritableSink<Vec<u8>> for DecompressedFileWriter {
-    async fn start(
-        &mut self,
-        _controller: &mut WritableStreamDefaultController,
-    ) -> StreamResult<()> {
-        self.file_handle = Some(File::create(&self.file_path).await?);
-        println!("📂 Created decompressed output file: {}", self.file_path);
+    async fn start(&mut self, _c: &mut WritableStreamDefaultController) -> StreamResult<()> {
+        self.file = Some(File::create(&self.file_path).await?);
         Ok(())
     }
 
     async fn write(
         &mut self,
         chunk: Vec<u8>,
-        _controller: &mut WritableStreamDefaultController,
+        _c: &mut WritableStreamDefaultController,
     ) -> StreamResult<()> {
-        if let Some(file) = &mut self.file_handle {
+        if let Some(file) = &mut self.file {
             file.write_all(&chunk).await?;
-            println!("💾 Wrote {} bytes of decompressed data", chunk.len());
         }
         Ok(())
     }
 
     async fn close(mut self) -> StreamResult<()> {
-        if let Some(file) = self.file_handle.take() {
+        if let Some(file) = self.file.take() {
             file.sync_all().await?;
-            println!("🔒 Decompressed file closed");
         }
         Ok(())
     }
 }
 
-/// Example function demonstrating decompression
-pub async fn run_decompression_example() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Decompression Stream Example ===");
-
-    // Source compressed file (produced by gzip example)
+#[tokio::main]
+async fn main() {
     let source_path = "compressed_data.gz";
     let dest_path = "decompressed_output.txt";
 
-    let readable =
-        ReadableStream::new_default(CompressedFileSource::new(source_path, 1024).await?, None);
-    let transform = TransformStream::new(GzipDecompressor::new());
-    let writable = WritableStream::new_with_spawn(
-        DecompressedFileWriter::new(dest_path),
-        Box::new(CountQueuingStrategy::new(3)),
-        |fut| {
-            tokio::spawn(fut);
-        },
-    );
+    let input = CompressedFileSource::new(source_path, 1024)
+        .await
+        .expect("open compressed_data.gz (run the gzip_transform example first)");
+    let source = ReadableStream::builder(input).spawn(tokio::spawn);
+    let inflate = TransformStream::builder(GzipDecompressor::default()).spawn(tokio::spawn);
+    let sink = WritableStream::builder(DecompressedFileWriter::new(dest_path)).spawn(tokio::spawn);
 
-    readable
-        .pipe_through(transform, None)
-        .pipe_to(&writable, None)
-        .await?;
+    let plain = source.pipe_through(inflate, None).spawn(tokio::spawn);
+    plain
+        .pipe_to(&sink, None)
+        .await
+        .expect("pipe should complete");
 
-    println!("✅ Decompression pipeline finished");
-
-    Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_decompression_example().await
+    let size = tokio::fs::metadata(dest_path)
+        .await
+        .expect("stat output")
+        .len();
+    println!("wrote {dest_path} ({size} bytes)");
 }
