@@ -13,7 +13,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-whatwg_streams = "0.1.0-alpha.9"
+whatwg_streams = "0.1.0-alpha.10"
 ```
 
 ## Runnable examples
@@ -121,7 +121,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-whatwg_streams = { version = "0.1.0-alpha.9", default-features = false, features = ["local"] }
+whatwg_streams = { version = "0.1.0-alpha.10", default-features = false, features = ["local"] }
 ```
 
 Then use with single-threaded executors like `tokio::task::spawn_local` or `futures::executor::LocalPool`:
@@ -235,7 +235,7 @@ assert_eq!(reader.read().await.unwrap(), Some("WORLD".to_string()));
 > **Note:** the readable side of a `TransformStream` defaults to a high-water mark of
 > `0` (matching the spec), so a `write` resolves only once the readable side is read.
 > Drive the two sides concurrently — via `pipe_through`/`pipe_to` as above, or by
-> producing and consuming on separate tasks. Writing and then reading *sequentially* on
+> producing and consuming on separate tasks. Writing and then reading _sequentially_ on
 > the same task will deadlock. Set an explicit `readable_strategy` if you want the
 > readable side to buffer ahead.
 
