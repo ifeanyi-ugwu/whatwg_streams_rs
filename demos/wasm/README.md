@@ -1,15 +1,19 @@
-# local_stream_wasm
+# whatwg_streams — wasm demos
 
 Browser demos of the WHATWG Streams API, compiled from Rust to WebAssembly with
 [`wasm-bindgen`](https://rustwasm.github.io/wasm-bindgen/) and driving the
-[`whatwg_streams`](../whatwg_streams_rs) crate. The set mirrors the WHATWG spec demos and
+[`whatwg_streams`](../../crates/whatwg_streams) crate. The set mirrors the WHATWG spec demos and
 MDN's [`dom-examples/streams`](https://github.com/mdn/dom-examples/tree/main/streams)
 gallery — runnable live at
 [mdn.github.io/dom-examples/streams](https://mdn.github.io/dom-examples/streams/) —
 reimplemented in Rust.
 
-Each demo is an isolated crate under `demos/<name>/` with its own `index.html` harness.
-`demos/index.html` is a landing page linking to all of them.
+This gallery is its own Cargo workspace, separate from the root, because its demos build
+`whatwg_streams` with the `local` feature while the native demo uses `send`, and the two are
+mutually exclusive. Each demo is an isolated crate under `<name>/` with its own `index.html`
+harness; `index.html` here is a landing page linking to all of them.
+
+All commands below run from this directory (`demos/wasm/`).
 
 ## Prerequisites
 
@@ -23,7 +27,7 @@ cargo install wasm-pack      # or: brew install wasm-pack
 One demo:
 
 ```bash
-cd demos/<name>
+cd <name>
 wasm-pack build --target web     # outputs ./pkg/
 ```
 
@@ -35,11 +39,10 @@ All of them:
 
 ## Run
 
-Serve the `demos/` directory (a static server is required — ES module imports and service
+Serve this directory (a static server is required — ES module imports and service
 workers do not work over `file://`):
 
 ```bash
-cd demos
 python3 -m http.server 8080
 # open http://localhost:8080/
 ```
