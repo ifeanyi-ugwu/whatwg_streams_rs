@@ -47,3 +47,8 @@ pub mod streams;
 
 // Re-export everything from streams
 pub use streams::*;
+
+// Byte streams surface `Bytes` in their public API (reads yield `Bytes`, enqueue takes
+// `impl Into<Bytes>`). Re-exporting the crate lets downstream code name that type
+// without taking a separate, version-matched dependency on `bytes`.
+pub use bytes::{self, Bytes};

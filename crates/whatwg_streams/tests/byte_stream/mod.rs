@@ -1,7 +1,7 @@
 // WPT: streams/readable-streams/byte-source.any.js
 
 use whatwg_streams::{
-    ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult,
+    Bytes, ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult,
 };
 
 struct ChunkedByteSource {
@@ -109,7 +109,7 @@ async fn default_reader_closes_at_eof() {
     };
     let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
     let (_locked, reader) = stream.get_reader().unwrap();
-    assert_eq!(reader.read().await.unwrap(), Some(b"data".to_vec()));
+    assert_eq!(reader.read().await.unwrap(), Some(Bytes::from_static(b"data")));
     assert_eq!(reader.read().await.unwrap(), None);
 }
 
@@ -225,7 +225,7 @@ async fn byob_release_lock_allows_new_reader() {
     let (_locked, byob) = stream.get_byob_reader().unwrap();
     let stream = byob.release_lock();
     let (_locked, reader) = stream.get_reader().unwrap();
-    assert_eq!(reader.read().await.unwrap(), Some(b"abc".to_vec()));
+    assert_eq!(reader.read().await.unwrap(), Some(Bytes::from_static(b"abc")));
 }
 
 // "BYOB reader: cancel() calls source cancel() with the given reason"

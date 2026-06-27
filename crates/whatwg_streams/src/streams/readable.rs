@@ -10,6 +10,7 @@ pub use super::{
     writable::{WritableSink, WritableStream},
 };
 use crate::platform::{MaybeSend, MaybeSync, SharedPtr};
+use bytes::Bytes;
 use futures::{
     FutureExt,
     channel::{
@@ -251,7 +252,7 @@ impl ReadableByteStreamController {
         Ok(())
     }
 
-    pub fn enqueue(&mut self, chunk: Vec<u8>) -> StreamResult<()> {
+    pub fn enqueue(&mut self, chunk: impl Into<Bytes>) -> StreamResult<()> {
         if self.byte_state.is_closed() {
             return Err("Stream is closed".into());
         }
@@ -259,7 +260,9 @@ impl ReadableByteStreamController {
             return Err("Stream is errored".into());
         }
 
-        self.byte_state.enqueue_data(&chunk);
+        // A caller already holding Bytes transfers it in with no byte copy; owned
+        // buffers (Vec<u8>, &'static [u8]) convert at the boundary.
+        self.byte_state.enqueue_bytes(chunk.into());
         Ok(())
     }
 
@@ -742,10 +745,11 @@ impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
 }
 
 // A byte stream's tee yields byte (BYOB-capable) branches: this source feeds a byte
-// branch by enqueueing each cloned chunk, mirroring the spec's CloneAsUint8Array —
-// each branch owns its bytes (byte buffers detach on BYOB read, so branches cannot
-// share one buffer).
-impl ReadableByteSource for TeeSource<Vec<u8>> {
+// branch by enqueueing each chunk. The branches refcount-share one Bytes rather than
+// copying (the spec clones via CloneAsUint8Array because JS ArrayBuffers are mutable;
+// Bytes is immutable, so sharing is observably identical and safe — BYOB reads copy
+// into the caller's own buffer, never mutating the shared chunk).
+impl ReadableByteSource for TeeSource<Bytes> {
     async fn pull(
         &mut self,
         controller: &mut ReadableByteStreamController,
@@ -1150,7 +1154,7 @@ where
 // Terminal methods for a byte-stream tee: the branches are byte streams, so a consumer
 // can `get_byob_reader()` on either branch. Config (backpressure_mode/strategies) is
 // shared with the default tee via the universal TeeBuilder impl above.
-impl<Source> TeeBuilder<Vec<u8>, Source, ByteStream>
+impl<Source> TeeBuilder<Bytes, Source, ByteStream>
 where
     Source: ReadableByteSource,
 {
@@ -1159,8 +1163,8 @@ where
         self,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
             impl Future<Output = ()>, // coordinator future
             impl Future<Output = ()>, // branch1 future
             impl Future<Output = ()>, // branch2 future
@@ -1177,8 +1181,8 @@ where
         spawn_fn: F,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
         ),
         StreamError,
     >
@@ -1199,8 +1203,8 @@ where
         spawn_fn: &'static F,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
         ),
         StreamError,
     >
@@ -1223,8 +1227,8 @@ where
         branch2_spawn: F3,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
         ),
         StreamError,
     >
@@ -1248,8 +1252,8 @@ where
         branch2_spawn: &'static F3,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
         ),
         StreamError,
     >
@@ -1359,21 +1363,22 @@ where
 }
 
 // Byte tee path: the coordinator and channels are identical to the default tee — it
-// reads Vec<u8> chunks from the source and fans them out — but the branches are built
-// as byte streams (BYOB-capable), so a consumer can `get_byob_reader()` on a branch.
-impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+// reads Bytes chunks from the source and fans them out by refcount — but the branches
+// are built as byte streams (BYOB-capable), so a consumer can `get_byob_reader()` on a
+// branch.
+impl<Source> ReadableStream<Bytes, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource,
 {
     fn tee_inner_bytes(
         self,
         mode: BackpressureMode,
-        branch1_strategy: crate::platform::BoxedStrategyStatic<Vec<u8>>,
-        branch2_strategy: crate::platform::BoxedStrategyStatic<Vec<u8>>,
+        branch1_strategy: crate::platform::BoxedStrategyStatic<Bytes>,
+        branch2_strategy: crate::platform::BoxedStrategyStatic<Bytes>,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
-            ReadableStream<Vec<u8>, TeeSource<Vec<u8>>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
+            ReadableStream<Bytes, TeeSource<Bytes>, ByteStream, Unlocked>,
             impl Future<Output = ()>, // coordinator future
             impl Future<Output = ()>, // branch1 future
             impl Future<Output = ()>, // branch2 future
@@ -1382,8 +1387,8 @@ where
     > {
         let (_, reader) = self.get_reader()?;
 
-        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<Vec<u8>>>();
-        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<Vec<u8>>>();
+        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<Bytes>>();
+        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<Bytes>>();
 
         let branch1_canceled = SharedPtr::new(AtomicBool::new(false));
         let branch2_canceled = SharedPtr::new(AtomicBool::new(false));
@@ -1549,13 +1554,13 @@ pub struct StreamPipeOptions {
 
 // ----------- Constructor Implementation  -----------
 
-impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+impl<Source> ReadableStream<Bytes, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource,
 {
     pub(crate) fn new_bytes_inner(
         source: Source,
-        strategy: Box<dyn QueuingStrategy<Vec<u8>> + 'static>,
+        strategy: Box<dyn QueuingStrategy<Bytes> + 'static>,
     ) -> (Self, impl Future<Output = ()>) {
         let (command_tx, command_rx) = unbounded();
         let queue_total_size = SharedPtr::new(AtomicUsize::new(0));
@@ -1717,7 +1722,7 @@ where
 }
 
 // ----------- Reader Methods for Byte Streams -----------
-impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+impl<Source> ReadableStream<Bytes, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource,
 {
@@ -1725,7 +1730,7 @@ where
         &self,
     ) -> Result<
         (
-            ReadableStream<Vec<u8>, Source, ByteStream, Locked>,
+            ReadableStream<Bytes, Source, ByteStream, Locked>,
             ReadableStreamBYOBReader<Source, Locked>,
         ),
         StreamError,
@@ -1841,12 +1846,12 @@ where
     }
 }
 
-impl<T: MaybeSend + 'static, Source, StreamType, LockState> AsyncRead
-    for ReadableStream<T, Source, StreamType, LockState>
+// Gated to byte streams: only they carry a byte_state to read from. The chunk type T
+// is irrelevant here — AsyncRead fills the caller's buffer, it never constructs a chunk.
+impl<T: MaybeSend + 'static, Source, LockState> AsyncRead
+    for ReadableStream<T, Source, ByteStream, LockState>
 where
-    T: for<'a> From<&'a [u8]>,
     Source: ReadableByteSource,
-    StreamType: StreamTypeMarker,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -2061,14 +2066,14 @@ where
 
 // ----------- BYOB Reader (preserving original structure) -----------
 pub struct ReadableStreamBYOBReader<Source, LockState>(
-    ReadableStream<Vec<u8>, Source, ByteStream, LockState>,
+    ReadableStream<Bytes, Source, ByteStream, LockState>,
 );
 
 impl<Source, LockState> ReadableStreamBYOBReader<Source, LockState>
 where
     Source: ReadableByteSource,
 {
-    pub fn new(stream: ReadableStream<Vec<u8>, Source, ByteStream, LockState>) -> Self {
+    pub fn new(stream: ReadableStream<Bytes, Source, ByteStream, LockState>) -> Self {
         ReadableStreamBYOBReader(stream)
     }
 
@@ -2093,7 +2098,7 @@ where
         poll_fn(|cx| self.0.byte_state.as_ref().unwrap().poll_read_into(cx, buf)).await
     }
 
-    pub fn release_lock(self) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked> {
+    pub fn release_lock(self) -> ReadableStream<Bytes, Source, ByteStream, Unlocked> {
         self.0.locked.store(false, Ordering::Release);
         ReadableStream {
             command_tx: self.0.command_tx.clone(),
@@ -2449,7 +2454,7 @@ async fn readable_stream_task<T: 'static, Source>(
 // ----------- Byte Stream Task Implementation -----------
 async fn readable_byte_stream_task<Source>(
     byte_state: SharedPtr<ByteStreamState<Source>>,
-    mut command_rx: UnboundedReceiver<StreamCommand<Vec<u8>>>,
+    mut command_rx: UnboundedReceiver<StreamCommand<Bytes>>,
     mut controller: ReadableByteStreamController,
 ) where
     Source: ReadableByteSource,
@@ -2457,7 +2462,7 @@ async fn readable_byte_stream_task<Source>(
     let _ = byte_state.start_source(&controller).await;
 
     // Pending read requests queued while no data is available
-    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Vec<u8>>>>> =
+    let mut pending_reads: VecDeque<oneshot::Sender<StreamResult<Option<Bytes>>>> =
         VecDeque::new();
 
     loop {
@@ -2506,14 +2511,12 @@ async fn readable_byte_stream_task<Source>(
                         // Fulfill pending reads if any data appeared
                         if any_data_produced {
                             while let Some(completion) = pending_reads.pop_front() {
-                                let mut read_buf = vec![0u8; 8192];
-                                match poll_fn(|cx| byte_state.poll_read_into(cx, &mut read_buf)).now_or_never() {
-                                    Some(Ok(0)) => {
+                                match poll_fn(|cx| byte_state.poll_read_chunk(cx)).now_or_never() {
+                                    Some(Ok(None)) => {
                                         let _ = completion.send(Ok(None));
                                     }
-                                    Some(Ok(n)) => {
-                                        read_buf.truncate(n);
-                                        let _ = completion.send(Ok(Some(read_buf)));
+                                    Some(Ok(Some(chunk))) => {
+                                        let _ = completion.send(Ok(Some(chunk)));
                                         break; // Only fulfill one read per pull
                                     }
                                     Some(Err(err)) => {
@@ -2575,14 +2578,12 @@ async fn readable_byte_stream_task<Source>(
                         }
 
                         // Attempt immediate read
-                        let mut buf = vec![0u8; 8192];
-                        match poll_fn(|cx| byte_state.poll_read_into(cx, &mut buf)).now_or_never() {
-                            Some(Ok(0)) => {
+                        match poll_fn(|cx| byte_state.poll_read_chunk(cx)).now_or_never() {
+                            Some(Ok(None)) => {
                                 let _ = completion.send(Ok(None));
                             }
-                            Some(Ok(n)) => {
-                                buf.truncate(n);
-                                let _ = completion.send(Ok(Some(buf)));
+                            Some(Ok(Some(chunk))) => {
+                                let _ = completion.send(Ok(Some(chunk)));
                             }
                             Some(Err(err)) => {
                                 let _ = completion.send(Err(err));
@@ -2689,8 +2690,8 @@ where
     }
 }
 
-// Byte stream builder - specialized for Vec<u8>
-impl<Source> ReadableStreamBuilder<Vec<u8>, Source, ByteStream>
+// Byte stream builder - specialized for Bytes
+impl<Source> ReadableStreamBuilder<Bytes, Source, ByteStream>
 where
     Source: ReadableByteSource,
 {
@@ -2702,7 +2703,7 @@ where
         }
     }
 
-    pub fn strategy<S: QueuingStrategy<Vec<u8>> + MaybeSend + 'static>(mut self, s: S) -> Self {
+    pub fn strategy<S: QueuingStrategy<Bytes> + MaybeSend + 'static>(mut self, s: S) -> Self {
         self.strategy = Box::new(s);
         self
     }
@@ -2711,14 +2712,14 @@ where
     pub fn prepare(
         self,
     ) -> (
-        ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>,
+        ReadableStream<Bytes, Source, ByteStream, Unlocked>,
         impl Future<Output = ()>,
     ) {
         ReadableStream::new_bytes_inner(self.source, self.strategy)
     }
 
     /// Spawn with an owned spawner function
-    pub fn spawn<F, R>(self, spawn_fn: F) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+    pub fn spawn<F, R>(self, spawn_fn: F) -> ReadableStream<Bytes, Source, ByteStream, Unlocked>
     where
         F: FnOnce(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
@@ -2731,7 +2732,7 @@ where
     pub fn spawn_ref<F, R>(
         self,
         spawn_fn: &'static F,
-    ) -> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+    ) -> ReadableStream<Bytes, Source, ByteStream, Unlocked>
     where
         F: Fn(crate::platform::PlatformFuture<'static, ()>) -> R,
     {
@@ -2785,12 +2786,12 @@ where
 }
 
 // Byte streams
-impl<Source> ReadableStream<Vec<u8>, Source, ByteStream, Unlocked>
+impl<Source> ReadableStream<Bytes, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource,
 {
     /// Returns a builder for byte streams
-    pub fn builder_bytes(source: Source) -> ReadableStreamBuilder<Vec<u8>, Source, ByteStream> {
+    pub fn builder_bytes(source: Source) -> ReadableStreamBuilder<Bytes, Source, ByteStream> {
         ReadableStreamBuilder::new_bytes(source)
     }
 }

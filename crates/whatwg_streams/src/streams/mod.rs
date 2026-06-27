@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 pub mod byte_source_trait;
 pub mod byte_state;
 pub mod error;
@@ -67,6 +69,16 @@ pub struct ByteLengthQueuingStrategy {
 impl ByteLengthQueuingStrategy {
     pub const fn new(high_water_mark: usize) -> Self {
         Self { high_water_mark }
+    }
+}
+
+impl QueuingStrategy<Bytes> for ByteLengthQueuingStrategy {
+    fn size(&self, chunk: &Bytes) -> usize {
+        chunk.len()
+    }
+
+    fn high_water_mark(&self) -> usize {
+        self.high_water_mark
     }
 }
 
