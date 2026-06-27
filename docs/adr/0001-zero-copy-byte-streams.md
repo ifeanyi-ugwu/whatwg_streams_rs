@@ -137,16 +137,19 @@ Wins:
   byte readable pipes its `Bytes` handles straight into any `WritableSink<Bytes>`.
 - Native interop with the `bytes`-based async ecosystem (hyper, tonic, object
   stores) without a `.to_vec()` at the boundary.
+- BYOB reads can be zero-copy too via `read_owned` (see the BYOB-direct section):
+  a source filling the transferred buffer directly avoids the queue copy that
+  `read(&mut [u8])` pays.
 
 Costs and limits:
 
 - New dependency on `bytes`.
 - `Bytes` uses atomic refcounting even under the single-threaded `local` feature.
   A non-atomic variant is not worth the complexity.
-- BYOB reads into a caller-owned `&mut [u8]` remain copy-bound — zero-copy cannot
-  help a destination the caller owns. The contiguous `as_slices` fast path is
-  replaced by draining across front chunks (same total bytes copied, slightly
-  more bookkeeping).
+- `read(&mut [u8])` copies into the caller-owned destination; `read_owned` is the
+  zero-copy alternative via ownership transfer (see the BYOB-direct section). The
+  internal drain replaced the contiguous `as_slices` fast path with draining
+  across front chunks (same total bytes copied, slightly more bookkeeping).
 - Byte-granular reads stay zero-copy only under return-what's-at-the-front
   semantics (`Bytes::split_to`/`advance`, which are offset math). A demand for a
   single contiguous owned buffer larger than the front chunk forces coalescing —
@@ -162,32 +165,31 @@ Alternatives rejected:
   pinch with a one-line change, but delivers no zero-copy: the byte still lands
   in `VecDeque<u8>` by copy. Adequate only if zero-copy is not a goal.
 
-## Deferred: BYOB-direct fast path
+## BYOB-direct fast path
 
-A BYOB read still copies once, from the queue into the caller's `&mut [u8]`. The
-optimization that removes it — the source writing bytes directly into the
-consumer's buffer (the spec's `respond(n)` path) — is deliberately deferred.
+The `read(&mut [u8])` BYOB read copies once, from the queue into the caller's
+buffer. The zero-copy alternative — the source writing bytes directly into the
+consumer's buffer (the spec's `byobRequest` + `respond(n)` path) — is implemented
+as `read_owned`.
 
-The WHATWG `ReadableByteStreamController` is a hybrid: a queue plus an
-opportunistic BYOB-direct path, with the queue as the universal fallback. This
-library implements the queue half. BYOB-direct is a single optional layer on the
-same base, not a different architecture.
+Rust cannot lend the consumer's `&mut [u8]` to the source across the task
+boundary, so the buffer is handed over by ownership: `read_owned` transfers a
+`BytesMut` into the stream (the Rust analog of a transferred `ArrayBuffer`); the
+source fills it via `controller.byob_request()` and `respond(n)`, and ownership
+moves back. A source that `enqueue`s instead falls back to one queue copy, and
+queued bytes are served first (FIFO).
 
-Its limits are intrinsic, not implementation choices: it can serve only one BYOB
-consumer (the same bytes cannot be written into two buffers, which is why tee
-copies), and it requires an empty queue (FIFO ordering means queued bytes are
-delivered before freshly-pulled ones). So it would fire in exactly one case — one
-BYOB reader waiting, queue empty — and fall back to the queue everywhere else,
-which is precisely where this library's behavior already matches the spec.
+The WHATWG `ReadableByteStreamController` is itself a hybrid — a queue plus an
+opportunistic BYOB-direct path — and this implements both halves. The fast path's
+limits are intrinsic, not implementation choices, and hold here exactly as in the
+spec: it serves only one BYOB consumer (the same bytes cannot fill two buffers,
+which is why tee copies), and it requires an empty queue (FIFO). The single BYOB
+reader is guaranteed by the stream lock, so no extra gating is needed.
 
-The cost not taken is coupling: BYOB-direct threads the consumer's `&mut [u8]`
-into the source's `pull`, welding source to reader and complicating tee,
-default-reader, no-reader, and backpressure handling. The retained single copy is
-a `memcpy` of in-memory bytes, cheap relative to the I/O that produced them.
+Deferred follow-ups: multiple pipelined pull-intos (one in-flight is serialized),
+and `autoAllocateChunkSize`-style direct fill for default reads (BYOB-only here).
 
-Revisit when a profile shows that copy is a real bottleneck (e.g. a multi-GB/s
-proxy), and add it then as an opt-in fast path gated on "one BYOB reader, empty
-queue" — never as a replacement for the queue. The full reasoning is in
+The full reasoning is in
 [docs/explainers/byte-source-zero-copy.md](../explainers/byte-source-zero-copy.md).
 
 ## Implementation plan

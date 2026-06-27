@@ -2,8 +2,8 @@
 
 This explains the reasoning behind `ReadableByteSource`'s single, enqueue-driven
 `pull`: why the WHATWG byte stream offers a source two ways to produce bytes, why
-this library collapses them into one, and the single copy that remains on a BYOB
-read — including the optimization that would remove it and why it is deferred.
+this library collapses them into one, and how the consumer side reads — the
+queue-copy `read(&mut [u8])` and the zero-copy `read_owned`.
 
 The decision is recorded in [ADR 0001](../adr/0001-zero-copy-byte-streams.md).
 This document is the longer "why," meant for understanding rather than for
@@ -128,46 +128,46 @@ always "fill a provided buffer.")
 The "did not allocate" part is the point: the buffer has to belong to the
 consumer so the bytes land in the consumer's memory in one shot.
 
-## So why doesn't this library do BYOB-direct?
+## How this library does BYOB-direct
 
-It is a real, well-understood optimization — exactly what JavaScript's BYOB-direct
-does — and it is deliberately deferred, not unexamined. The reason is an
-architecture tradeoff.
+It is implemented — as an *opportunistic layer* on top of the queue-mediated
+base, which is exactly how the WHATWG controller is structured (see below). Two
+things make it a layer rather than a replacement.
 
-This library is **queue-mediated**: the source always pushes into one central
-byte queue, and readers pull from it. The source has no idea who is reading, how
-many readers there are, or what buffer they hold. That ignorance is a feature —
-it keeps several things simple and uniform:
+First, the base has to be the queue, because the source is decoupled from the
+reader. The source pushes into one central byte queue and has no idea who is
+reading, how many readers there are, or what buffer they hold. That ignorance is
+what keeps everything else simple:
 
-- **tee** — two readers. If the source wrote directly into "the consumer's
-  buffer," whose buffer? Two buffers cannot be filled at once without copying. A
-  queue fans out by refcount trivially.
-- **default reader** — no buffer is supplied at all. The auto-allocate fallback
-  would be needed anyway.
+- **tee** — two readers. The same bytes cannot be written directly into two
+  buffers at once; a queue fans out by refcount trivially.
+- **default reader** — no buffer is supplied at all.
 - **no reader waiting yet** — the source wants to produce, but no consumer buffer
   exists. The queue lets it run ahead.
 - **backpressure** — the queue decouples source pace from consumer pace.
 
-BYOB-direct requires threading the consumer's `&mut [u8]` all the way into the
-source's `pull`, which couples the source to the reader and undoes each of those.
-The one BYOB-read copy this library keeps is a `memcpy` of bytes already in
-memory — cheap next to the I/O that produced them — and keeping the queue model
-keeps tee, backpressure, and multi-reader handling clean.
+So BYOB-direct can only be *opportunistic*: it applies when exactly one BYOB
+reader is waiting and the queue is empty, and falls back to the queue otherwise.
+(The single reader is guaranteed by the stream lock; the empty queue is FIFO.)
 
-The trigger to revisit would be a profile showing that single queue-to-`B`
-`memcpy` is a real bottleneck — say a proxy pushing gigabytes per second. Even
-then it would be added as an *opt-in fast path*: used only when exactly one BYOB
-reader is waiting and the queue is empty, falling back to queue-mediated
-otherwise — not as a replacement.
+Second, the handoff has to transfer ownership. Rust cannot lend the consumer's
+`&mut [u8]` to the source — the source runs in a separate task, and the borrow
+checker forbids aliasing a `&mut` across that boundary (it is enforcing the exact
+safety property JS enforces by detaching the `ArrayBuffer`). So the consumer moves
+an owned `BytesMut` into the stream, the source fills it, and ownership moves back
+— the faithful Rust analog of `ArrayBuffer` transfer. That is the `read_owned`
+method: the source fills the transferred buffer via `controller.byob_request()`
+and `respond(n)` for a zero-copy delivery, or `enqueue`s and the buffer is filled
+from the queue (one copy) as a fallback. Queued bytes are always served first.
 
-Two distinct decisions hide under the same word "copy":
+So the two "copy" decisions resolve differently:
 
 - **The two-shapes fold (producer side)** — a pure win, no tradeoff. A path that
   was secretly double-copying, and never delivered the spec's benefit, was
-  removed. Nothing lost.
+  removed.
 - **BYOB-direct (consumer side)** — a real optimization with a real cost
-  (coupling), consciously not taken. The remaining single copy is the price of a
-  clean queue model.
+  (coupling), paid only on the narrow fast path and kept off the queue base, which
+  still backs every other case.
 
 ## Does JavaScript suffer those same breakages?
 
@@ -193,34 +193,33 @@ there is a pending BYOB pull-into at the front, and the source chooses to write
 into `byobRequest`'s view and call `respond(n)`. Every other time it is queue,
 copy, or controller-allocated buffer.
 
-So the opt-in fast path described above — used exactly when one BYOB reader is
-waiting and the queue is empty, else fall back to the queue — *is* the WHATWG
-architecture. The real difference between this library and the spec is not a
-different architecture: this library implements the queue half and skips the
-opportunistic fast-path half. Same base, one optional layer missing.
+So the opt-in fast path — used exactly when one BYOB reader is waiting and the
+queue is empty, else fall back to the queue — *is* the WHATWG architecture. This
+library implements both halves: the queue and the opportunistic fast-path layer
+on top.
 
-## Would this library's fast path match JavaScript's?
+## Does this library's fast path match JavaScript's?
 
 Yes — and more strongly than coincidence. Split the behavior in two.
 
-The **fallback (queue) behavior already matches** the spec. In every non-fast-path
-case (no reader, default reader, tee, backpressure), both are queue-mediated and
-both pay one copy on a BYOB read, copying from the queue into the consumer's
-buffer. That is exactly what `poll_read_into` does from `VecDeque<Bytes>` into the
-caller's `&mut [u8]`.
+The **fallback (queue) behavior matches** the spec. In every non-fast-path case
+(no reader, default reader, tee, backpressure), both are queue-mediated and both
+pay one copy on a BYOB read, copying from the queue into the consumer's buffer.
+That is what `read(&mut [u8])` / `poll_read_into` does from `VecDeque<Bytes>` into
+the caller's slice.
 
-The **fast path** is the only missing piece, and if added it would fire in the
-same narrow case and carry the same limitations — because the limitations are
-intrinsic to the problem, not to the implementation:
+The **fast path** (`read_owned`) fires in the same narrow case and carries the
+same limitations — because the limitations are intrinsic to the problem, not to
+the implementation:
 
-- It can help only one BYOB consumer. The same bytes cannot be written directly
-  into two buffers at once — which is why tee must copy, in any implementation.
+- It serves only one BYOB consumer. The same bytes cannot be written directly into
+  two buffers at once — which is why tee copies, in any implementation. (Here the
+  single reader is guaranteed by the stream lock.)
 - It requires the queue to be empty. FIFO ordering means already-queued bytes
   must be delivered before freshly-pulled ones; if anything is queued, even a
   BYOB reader drains it first (copy), and only then can a fresh pull go direct.
 
-Neither the spec nor a faithful Rust version can escape those, so a Rust fast path
-would trigger in the same scenario and fall back in the same scenarios by
-necessity. Everywhere except that one fast-path scenario, the two are already the
-same; the fast path is purely additive — the single situation where the spec
-currently saves a copy this library does not.
+Neither the spec nor this implementation can escape those, so the fast path
+triggers in the same scenario and falls back in the same scenarios by necessity.
+Everywhere except that one fast-path scenario, the two behave identically; the
+fast path is purely additive — the one situation where a copy is saved.
