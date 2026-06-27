@@ -223,3 +223,59 @@ Neither the spec nor this implementation can escape those, so the fast path
 triggers in the same scenario and falls back in the same scenarios by necessity.
 Everywhere except that one fast-path scenario, the two behave identically; the
 fast path is purely additive — the one situation where a copy is saved.
+
+## The fast path that exists, and the one that doesn't
+
+BYOB-direct removes a real copy, so it was worth building. The analogous trick
+for *default* reads — the spec's `autoAllocateChunkSize`, where the controller
+allocates a buffer and has the source fill it even for a default read — removes
+no copy, and is deliberately not implemented. The difference is what the consumer
+asks for:
+
+- A **BYOB reader** wants the bytes in *its own* buffer `B` — a fixed
+  destination. Routed through the queue, getting them into `B` is a copy
+  (queue → `B`); `read_owned` removes it by having the source write into `B`
+  directly. A real copy existed.
+- A **default reader** wants *a chunk* (`Bytes`) — no fixed destination. Whatever
+  buffer the bytes already occupy simply *becomes* the chunk, by move. No copy
+  ever existed.
+
+`autoAllocateChunkSize` optimizes a copy that, for default reads, is not there.
+Counting copies beyond the unavoidable I/O fill (the bytes must land somewhere
+when read from the FD/socket):
+
+```
+source owns the buffer (what this library does):
+  io.read --> buf  (source's BytesMut)        I/O fill
+  enqueue(buf.freeze())                        move into queue   (0 copies)
+  default read: queue.pop_front() --> Bytes    move to consumer  (0 copies)
+
+controller owns the buffer (autoAllocateChunkSize):
+  default read, queue empty: controller allocs B    allocation
+  source fills B via byob_request, respond(n)        I/O fill
+  B --> consumer                                     move to consumer (0 copies)
+```
+
+Both are zero copies beyond the I/O fill; the only difference is who allocated the
+buffer — a wash in Rust. JavaScript keeps `autoAllocateChunkSize` for a reason
+that does not translate: it lets a source be written once (always "fill the
+provided buffer, respond") and serve both reader types, with the runtime handling
+transfer/detach. In Rust the source contract is already uniform (`pull` enqueues
+or closes; the reader pulls) and a source already owns and moves its buffer, so
+the mechanism would add routing and a controller-allocated buffer to remove
+nothing.
+
+## The through-line
+
+Three JavaScript mechanisms in this area exist for one root reason — JavaScript
+has no cheap, safe ownership transfer — and Rust's `move` dissolves all three:
+
+| JS mechanism | Why JS needs it | Why Rust does not |
+| --- | --- | --- |
+| Two source shapes (`enqueue` vs `respond`) | no cheap ownership transfer | `move` is the transfer |
+| Fill-a-buffer pull | the source can't hand its buffer over cheaply | the source owns it and `enqueue`s |
+| `autoAllocateChunkSize` (default reads) | uniform source path + detach; no copy to remove | already uniform; default reads are already zero-copy |
+
+BYOB-direct (`read_owned`) is the one optimization here that is *not* in that
+bucket: it removes a genuine copy — the queue into the consumer's fixed buffer —
+which is why it was worth building and these are not.
