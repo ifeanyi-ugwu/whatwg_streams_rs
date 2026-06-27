@@ -3,14 +3,77 @@ use super::{
     readable::ReadableByteStreamController,
 };
 use crate::platform::{MaybeSend, MaybeSync, SharedPtr};
-use bytes::{Buf, Bytes};
-use futures::future::poll_fn;
+use bytes::{Buf, Bytes, BytesMut};
+use futures::{channel::oneshot, future::poll_fn};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
     sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
+
+// A BYOB read that handed its owned buffer to the stream and is waiting for the
+// source to fill it (the Rust analog of a transferred ArrayBuffer). The buffer is
+// owned here for the duration, never aliased, and moves back to the reader through
+// `completion`.
+pub struct PendingPullInto {
+    buf: BytesMut,
+    completion: oneshot::Sender<Result<(BytesMut, usize), StreamError>>,
+}
+
+impl PendingPullInto {
+    pub(crate) fn buf(&self) -> &[u8] {
+        &self.buf
+    }
+
+    pub(crate) fn buf_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+
+    pub(crate) fn buf_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    // Hand the buffer back to the reader, filled in [..n].
+    pub(crate) fn complete(self, n: usize) {
+        let _ = self.completion.send(Ok((self.buf, n)));
+    }
+
+    pub(crate) fn complete_err(self, err: StreamError) {
+        let _ = self.completion.send(Err(err));
+    }
+}
+
+// Outcome of beginning a BYOB owned-buffer read.
+pub enum PullIntoOutcome {
+    // Satisfied synchronously from the queue, or EOF (n == 0 on a closed stream).
+    Ready(BytesMut, usize),
+    Errored(StreamError),
+    // Registered as pending; the reader awaits the source filling it.
+    Registered(oneshot::Receiver<Result<(BytesMut, usize), StreamError>>),
+}
+
+// Copy up to dst.len() bytes from the front of the queue into dst, popping whole
+// chunks and advancing a partially-consumed front chunk in place (offset math, no
+// byte movement). Returns the number of bytes copied.
+fn drain_queue_into(buffer: &mut VecDeque<Bytes>, dst: &mut [u8]) -> usize {
+    let mut copied = 0;
+    while copied < dst.len() {
+        let Some(front) = buffer.front_mut() else {
+            break;
+        };
+        let front_len = front.len();
+        let n = std::cmp::min(dst.len() - copied, front_len);
+        dst[copied..copied + n].copy_from_slice(&front[..n]);
+        copied += n;
+        if n == front_len {
+            buffer.pop_front();
+        } else {
+            front.advance(n);
+        }
+    }
+    copied
+}
 
 // Enhanced byte state that handles both buffering and source pulling
 pub struct ByteStreamState<Source> {
@@ -36,6 +99,10 @@ pub struct ByteStreamState<Source> {
     desired_size: AtomicIsize,
     start_completed: AtomicBool,
     start_wakers: Mutex<Vec<Waker>>,
+
+    // A waiting BYOB owned-buffer read. At most one (a stream has one reader, and
+    // read_owned is awaited before the next), so a single slot suffices.
+    pending_pull_into: Mutex<Option<PendingPullInto>>,
 }
 
 impl<Source> ByteStreamState<Source>
@@ -58,6 +125,7 @@ where
             desired_size: AtomicIsize::new(high_water_mark as isize),
             start_completed: AtomicBool::new(false),
             start_wakers: Mutex::new(Vec::new()),
+            pending_pull_into: Mutex::new(None),
         })
     }
 
@@ -116,24 +184,7 @@ where
 
         let bytes_copied = {
             let mut buffer = self.buffer.lock();
-            let mut copied = 0;
-            while copied < buf.len() {
-                let Some(front) = buffer.front_mut() else {
-                    break;
-                };
-                let front_len = front.len();
-                let n = std::cmp::min(buf.len() - copied, front_len);
-                buf[copied..copied + n].copy_from_slice(&front[..n]);
-                copied += n;
-                if n == front_len {
-                    buffer.pop_front();
-                } else {
-                    // Offset past the consumed prefix; the remainder stays at the
-                    // front for the next read without moving any bytes.
-                    front.advance(n);
-                }
-            }
-
+            let copied = drain_queue_into(&mut buffer, buf);
             if copied > 0 {
                 let new_size = self
                     .queue_total_size
@@ -142,7 +193,6 @@ where
                 self.queue_total_size.store(new_size, Ordering::Release);
                 self.update_desired_size();
             }
-
             copied
         };
 
@@ -256,7 +306,126 @@ where
         }
 
         self.update_desired_size();
+        // A waiting BYOB pull-into gets first claim on freshly enqueued bytes.
+        self.settle_pending_pull_into();
         self.wake_readers();
+    }
+
+    // Begin a BYOB owned-buffer read. Queue-first (FIFO): if the queue holds data,
+    // fill the buffer from it synchronously; on a closed empty stream, EOF;
+    // otherwise register the buffer as a pending pull-into and force a pull so the
+    // source can fill it directly (zero-copy via byob_request/respond).
+    pub fn begin_pull_into(&self, mut buf: BytesMut) -> PullIntoOutcome {
+        if self.errored.load(Ordering::Acquire) {
+            return PullIntoOutcome::Errored(self.take_error());
+        }
+        if buf.is_empty() {
+            return PullIntoOutcome::Ready(buf, 0);
+        }
+
+        let rx = {
+            let mut buffer = self.buffer.lock();
+            if !buffer.is_empty() {
+                let n = drain_queue_into(&mut buffer, &mut buf);
+                let new_size = self
+                    .queue_total_size
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(n);
+                self.queue_total_size.store(new_size, Ordering::Release);
+                drop(buffer);
+                self.update_desired_size();
+                self.maybe_trigger_pull();
+                return PullIntoOutcome::Ready(buf, n);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return PullIntoOutcome::Ready(buf, 0);
+            }
+            // Register while holding the buffer lock so an enqueue cannot slip a
+            // chunk into the queue between the emptiness check and registration.
+            let (tx, rx) = oneshot::channel();
+            *self.pending_pull_into.lock() = Some(PendingPullInto { buf, completion: tx });
+            rx
+        };
+
+        // close()/error() may have fired between the top-of-function check and
+        // registration; settle now so the pending read cannot be stranded.
+        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
+            self.settle_pending_pull_into();
+        }
+        self.force_pull();
+        PullIntoOutcome::Registered(rx)
+    }
+
+    // Take the pending pull-into for the source to fill directly (byob_request).
+    pub fn take_pull_into(&self) -> Option<PendingPullInto> {
+        self.pending_pull_into.lock().take()
+    }
+
+    // A byob_request dropped without respond() returns its buffer here; retry it.
+    pub fn return_pull_into(&self, pending: PendingPullInto) {
+        *self.pending_pull_into.lock() = Some(pending);
+        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
+            self.settle_pending_pull_into();
+        } else {
+            self.force_pull();
+        }
+    }
+
+    // Complete a waiting pull-into from the queue (the source enqueued instead of
+    // responding), or with EOF / the error once the stream is terminal. Locks in
+    // buffer -> pending order, matching begin_pull_into.
+    fn settle_pending_pull_into(&self) {
+        let mut buffer = self.buffer.lock();
+        let mut pending = self.pending_pull_into.lock();
+        if pending.is_none() {
+            return;
+        }
+
+        if self.errored.load(Ordering::Acquire) {
+            let p = pending.take().unwrap();
+            drop(pending);
+            drop(buffer);
+            p.complete_err(self.take_error());
+            return;
+        }
+
+        if !buffer.is_empty() {
+            let mut p = pending.take().unwrap();
+            let n = drain_queue_into(&mut buffer, p.buf_mut());
+            let new_size = self
+                .queue_total_size
+                .load(Ordering::Relaxed)
+                .saturating_sub(n);
+            self.queue_total_size.store(new_size, Ordering::Release);
+            drop(pending);
+            drop(buffer);
+            self.update_desired_size();
+            p.complete(n);
+            self.maybe_trigger_pull();
+            return;
+        }
+
+        if self.closed.load(Ordering::Acquire) {
+            let p = pending.take().unwrap();
+            drop(pending);
+            drop(buffer);
+            p.complete(0); // EOF
+        }
+        // else: no data, not terminal — leave pending for the next pull.
+    }
+
+    // Like maybe_trigger_pull but ignores the high-water-mark gate: a registered
+    // pull-into is an explicit demand for data even at HWM 0.
+    fn force_pull(&self) {
+        if !self.pull_in_progress.load(Ordering::Acquire)
+            && !self.closed.load(Ordering::Acquire)
+            && !self.errored.load(Ordering::Acquire)
+        {
+            self.needs_pull.store(true, Ordering::Release);
+            if let Some(waker) = self.pull_waker.lock().take() {
+                waker.wake();
+            }
+        }
     }
 
     // Called when pull operation starts
@@ -267,13 +436,18 @@ where
     // Called when pull operation completes
     pub fn mark_pull_completed(&self) {
         self.pull_in_progress.store(false, Ordering::Release);
-        // Check if we need another pull
-        self.maybe_trigger_pull();
+        // A still-pending pull-into must keep pulling even at HWM 0.
+        if self.pending_pull_into.lock().is_some() {
+            self.force_pull();
+        } else {
+            self.maybe_trigger_pull();
+        }
     }
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.update_desired_size();
+        self.settle_pending_pull_into();
         self.wake_readers();
         if let Some(waker) = self.pull_waker.lock().take() {
             waker.wake();
@@ -284,6 +458,7 @@ where
         *self.error.lock() = Some(err);
         self.errored.store(true, Ordering::Release);
         self.update_desired_size();
+        self.settle_pending_pull_into();
         self.wake_readers();
         if let Some(waker) = self.pull_waker.lock().take() {
             waker.wake();
@@ -410,6 +585,9 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
         &self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Bytes>, StreamError>>;
+    fn begin_pull_into(&self, buf: BytesMut) -> PullIntoOutcome;
+    fn take_pull_into(&self) -> Option<PendingPullInto>;
+    fn return_pull_into(&self, pending: PendingPullInto);
     fn cancel_source<'a>(
         &'a self,
         reason: Option<String>,
@@ -469,6 +647,18 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Bytes>, StreamError>> {
         ByteStreamState::poll_read_chunk(self, cx)
+    }
+
+    fn begin_pull_into(&self, buf: BytesMut) -> PullIntoOutcome {
+        ByteStreamState::begin_pull_into(self, buf)
+    }
+
+    fn take_pull_into(&self) -> Option<PendingPullInto> {
+        ByteStreamState::take_pull_into(self)
+    }
+
+    fn return_pull_into(&self, pending: PendingPullInto) {
+        ByteStreamState::return_pull_into(self, pending)
     }
 
     fn cancel_source<'a>(

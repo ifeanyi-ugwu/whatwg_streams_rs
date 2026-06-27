@@ -1,7 +1,7 @@
 // WPT: streams/readable-streams/byte-source.any.js
 
 use whatwg_streams::{
-    Bytes, ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult,
+    Bytes, BytesMut, ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult,
 };
 
 struct ChunkedByteSource {
@@ -434,4 +434,124 @@ async fn byte_tee_branch_supports_byob_reader() {
         b2.extend_from_slice(&c);
     }
     assert_eq!(b2, b"hello");
+}
+
+// ── BYOB owned-buffer reads (read_owned / byob_request) ─────────────────────────
+
+// A source that fills the reader's buffer directly via byob_request — the
+// zero-copy path — and records whether that path was taken.
+struct DirectFillSource {
+    data: Vec<u8>,
+    sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    used_byob: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReadableByteSource for DirectFillSource {
+    async fn pull(&mut self, controller: &mut ReadableByteStreamController) -> StreamResult<()> {
+        use std::sync::atomic::Ordering;
+        if self.sent.load(Ordering::SeqCst) {
+            controller.close()?;
+            return Ok(());
+        }
+        if let Some(mut req) = controller.byob_request() {
+            self.used_byob.store(true, Ordering::SeqCst);
+            let n = self.data.len().min(req.len());
+            req[..n].copy_from_slice(&self.data[..n]);
+            self.sent.store(true, Ordering::SeqCst);
+            req.respond(n)?;
+        } else {
+            controller.enqueue(self.data.clone())?;
+            self.sent.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+// "read_owned: the source fills the transferred buffer directly (zero-copy path)"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_owned_direct_fill_uses_byob_request() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let used = Arc::new(AtomicBool::new(false));
+    let source = DirectFillSource {
+        data: b"hello byob".to_vec(),
+        sent: Arc::new(AtomicBool::new(false)),
+        used_byob: used.clone(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    let (buf, n) = byob.read_owned(BytesMut::zeroed(64)).await.unwrap();
+    assert_eq!(&buf[..n], b"hello byob");
+    assert!(
+        used.load(Ordering::SeqCst),
+        "the direct byob_request path must have been taken when the queue was empty"
+    );
+
+    let (_buf, n) = byob.read_owned(BytesMut::zeroed(64)).await.unwrap();
+    assert_eq!(n, 0, "EOF after the source closes");
+}
+
+// "read_owned: a source that enqueues instead is served from the queue (fallback)"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_owned_fallback_via_enqueue() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"abc".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    let (buf, n) = byob.read_owned(BytesMut::zeroed(64)).await.unwrap();
+    assert_eq!(&buf[..n], b"abc");
+}
+
+// "read_owned: queued bytes are served first, the remainder on the next read (FIFO)"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_owned_queue_first_serves_remainder() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"abcdef".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    // First read draws the front of a 6-byte chunk; the rest stays queued.
+    let (buf, n) = byob.read_owned(BytesMut::zeroed(3)).await.unwrap();
+    assert_eq!(&buf[..n], b"abc");
+    // Second read is served from the queue remainder, not a fresh pull.
+    let (buf, n) = byob.read_owned(BytesMut::zeroed(3)).await.unwrap();
+    assert_eq!(&buf[..n], b"def");
+}
+
+// "read_owned: a pending read resolves to EOF when the source closes empty"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_owned_eof_when_source_closes_empty() {
+    let source = ChunkedByteSource {
+        chunks: vec![],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    let (_buf, n) = byob.read_owned(BytesMut::zeroed(8)).await.unwrap();
+    assert_eq!(n, 0);
+}
+
+// "read_owned: a pending read rejects when the source errors"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_owned_rejects_when_source_errors() {
+    let stream = ReadableStream::builder_bytes(FailingBytePull).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    let result = byob.read_owned(BytesMut::zeroed(8)).await;
+    assert!(result.is_err(), "a source error must reject a pending read_owned");
 }

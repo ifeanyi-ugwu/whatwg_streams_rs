@@ -11,10 +11,10 @@ pub mod writable;
 pub use byte_source_trait::ReadableByteSource;
 pub use error::StreamError;
 pub use readable::{
-    AsyncStreamSource, BackpressureMode, ByteStream, DefaultStream, IteratorSource, PipeBuilder,
-    ReadableByteStreamController, ReadableSource, ReadableStream, ReadableStreamBYOBReader,
-    ReadableStreamBuilder, ReadableStreamDefaultController, ReadableStreamDefaultReader,
-    StreamPipeOptions, StreamTypeMarker, TeeBuilder, TeeConfig,
+    AsyncStreamSource, BackpressureMode, ByobRequest, ByteStream, DefaultStream, IteratorSource,
+    PipeBuilder, ReadableByteStreamController, ReadableSource, ReadableStream,
+    ReadableStreamBYOBReader, ReadableStreamBuilder, ReadableStreamDefaultController,
+    ReadableStreamDefaultReader, StreamPipeOptions, StreamTypeMarker, TeeBuilder, TeeConfig,
 };
 pub use shared::{AbortController, AbortSignal, StreamResult};
 pub use transform::{

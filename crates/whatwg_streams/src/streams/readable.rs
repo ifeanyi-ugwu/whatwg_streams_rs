@@ -1,4 +1,5 @@
 use super::super::{CountQueuingStrategy, Locked, QueuingStrategy, Unlocked};
+use super::byte_state::{PendingPullInto, PullIntoOutcome};
 use super::shared::AbortSignal;
 use super::shared::StreamResult;
 use super::shared::WakerSet;
@@ -10,7 +11,7 @@ pub use super::{
     writable::{WritableSink, WritableStream},
 };
 use crate::platform::{MaybeSend, MaybeSync, SharedPtr};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{
     FutureExt,
     channel::{
@@ -270,12 +271,72 @@ impl ReadableByteStreamController {
         self.byte_state.error(error);
         Ok(())
     }
+
+    /// If a BYOB owned-buffer read is waiting, returns its buffer for the source
+    /// to fill directly. Filling it and calling [`ByobRequest::respond`] delivers
+    /// the bytes to the reader with no queue copy. Returns `None` when no such
+    /// read is pending — the source should then [`enqueue`](Self::enqueue) as
+    /// usual.
+    pub fn byob_request(&mut self) -> Option<ByobRequest> {
+        self.byte_state.take_pull_into().map(|pending| ByobRequest {
+            pending: Some(pending),
+            byte_state: self.byte_state.clone(),
+        })
+    }
 }
 
 impl Clone for ReadableByteStreamController {
     fn clone(&self) -> Self {
         Self {
             byte_state: self.byte_state.clone(),
+        }
+    }
+}
+
+/// A buffer a BYOB reader transferred into the stream, handed to the source to
+/// fill directly. Deref/DerefMut expose the writable byte slice; [`respond`] hands
+/// it back to the reader filled. Dropping without responding returns the buffer so
+/// the next pull retries.
+///
+/// [`respond`]: ByobRequest::respond
+pub struct ByobRequest {
+    pending: Option<PendingPullInto>,
+    byte_state: SharedPtr<dyn ByteStreamStateInterface>,
+}
+
+impl ByobRequest {
+    /// Hand the filled buffer back to the waiting reader; `n` is the number of
+    /// bytes written into it. Errors (and rejects the reader) if `n` exceeds the
+    /// buffer length.
+    pub fn respond(mut self, n: usize) -> StreamResult<()> {
+        let pending = self.pending.take().expect("respond on an active request");
+        if n > pending.buf_len() {
+            let err = StreamError::from("respond() byte count exceeds the request buffer");
+            pending.complete_err(err.clone());
+            return Err(err);
+        }
+        pending.complete(n);
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for ByobRequest {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.pending.as_ref().expect("active request").buf()
+    }
+}
+
+impl std::ops::DerefMut for ByobRequest {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.pending.as_mut().expect("active request").buf_mut()
+    }
+}
+
+impl Drop for ByobRequest {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.byte_state.return_pull_into(pending);
         }
     }
 }
@@ -2097,6 +2158,31 @@ where
         poll_fn(|cx| self.0.byte_state.as_ref().unwrap().poll_read_into(cx, buf)).await
     }
 
+    /// Read by transferring an owned buffer into the stream and getting it back
+    /// filled — the zero-copy-capable BYOB read.
+    ///
+    /// Returns the same buffer with the bytes in `[..n]` (`n == 0` is EOF). When
+    /// the queue already holds data, it is filled from the queue (one copy,
+    /// preserving FIFO order). When the queue is empty, the buffer is handed to
+    /// the source: a source that fills it via [`ReadableByteStreamController::byob_request`]
+    /// and `respond` writes its bytes straight into this buffer with **no copy**;
+    /// a source that `enqueue`s instead falls back to one copy out of the queue.
+    ///
+    /// `BytesMut` is the transfer unit — Rust's analog of a transferred
+    /// `ArrayBuffer`: ownership leaves the caller for the duration and returns
+    /// here, so the source can fill it safely across tasks. The buffer's length
+    /// bounds how many bytes a single read takes; `freeze()` the result for
+    /// zero-copy onward use, or reuse the buffer across reads.
+    pub async fn read_owned(&self, buf: BytesMut) -> StreamResult<(BytesMut, usize)> {
+        match self.0.byte_state.as_ref().unwrap().begin_pull_into(buf) {
+            PullIntoOutcome::Ready(buf, n) => Ok((buf, n)),
+            PullIntoOutcome::Errored(err) => Err(err),
+            PullIntoOutcome::Registered(rx) => rx.await.unwrap_or_else(|_canceled| {
+                Err(StreamError::from("stream dropped before the read completed"))
+            }),
+        }
+    }
+
     pub fn release_lock(self) -> ReadableStream<Bytes, Source, ByteStream, Unlocked> {
         self.0.locked.store(false, Ordering::Release);
         ReadableStream {
@@ -3100,6 +3186,51 @@ mod tests {
 
         assert!(bytes_read > 0, "BYOB reader should return bytes read");
         assert_eq!(byob_reader.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio_localset_test::localset_test]
+    async fn read_owned_direct_fill_single_threaded() {
+        // The owned-buffer handoff (move out, fill, move back) works under the
+        // single-threaded Rc runtime as well as the multi-threaded one.
+        struct DirectSource {
+            data: Vec<u8>,
+            sent: std::cell::RefCell<bool>,
+        }
+
+        impl ReadableByteSource for DirectSource {
+            async fn pull(
+                &mut self,
+                controller: &mut ReadableByteStreamController,
+            ) -> StreamResult<()> {
+                if *self.sent.borrow() {
+                    controller.close()?;
+                    return Ok(());
+                }
+                if let Some(mut req) = controller.byob_request() {
+                    let n = self.data.len().min(req.len());
+                    req[..n].copy_from_slice(&self.data[..n]);
+                    *self.sent.borrow_mut() = true;
+                    req.respond(n)?;
+                } else {
+                    controller.enqueue(self.data.clone())?;
+                    *self.sent.borrow_mut() = true;
+                }
+                Ok(())
+            }
+        }
+
+        let source = DirectSource {
+            data: b"owned bytes".to_vec(),
+            sent: std::cell::RefCell::new(false),
+        };
+        let stream = ReadableStream::builder_bytes(source).spawn(tokio::task::spawn_local);
+        let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+        let (buf, n) = byob.read_owned(BytesMut::zeroed(32)).await.unwrap();
+        assert_eq!(&buf[..n], b"owned bytes");
+
+        let (_buf, n) = byob.read_owned(BytesMut::zeroed(32)).await.unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio_localset_test::localset_test]
