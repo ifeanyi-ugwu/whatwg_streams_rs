@@ -162,6 +162,34 @@ Alternatives rejected:
   pinch with a one-line change, but delivers no zero-copy: the byte still lands
   in `VecDeque<u8>` by copy. Adequate only if zero-copy is not a goal.
 
+## Deferred: BYOB-direct fast path
+
+A BYOB read still copies once, from the queue into the caller's `&mut [u8]`. The
+optimization that removes it — the source writing bytes directly into the
+consumer's buffer (the spec's `respond(n)` path) — is deliberately deferred.
+
+The WHATWG `ReadableByteStreamController` is a hybrid: a queue plus an
+opportunistic BYOB-direct path, with the queue as the universal fallback. This
+library implements the queue half. BYOB-direct is a single optional layer on the
+same base, not a different architecture.
+
+Its limits are intrinsic, not implementation choices: it can serve only one BYOB
+consumer (the same bytes cannot be written into two buffers, which is why tee
+copies), and it requires an empty queue (FIFO ordering means queued bytes are
+delivered before freshly-pulled ones). So it would fire in exactly one case — one
+BYOB reader waiting, queue empty — and fall back to the queue everywhere else,
+which is precisely where this library's behavior already matches the spec.
+
+The cost not taken is coupling: BYOB-direct threads the consumer's `&mut [u8]`
+into the source's `pull`, welding source to reader and complicating tee,
+default-reader, no-reader, and backpressure handling. The retained single copy is
+a `memcpy` of in-memory bytes, cheap relative to the I/O that produced them.
+
+Revisit when a profile shows that copy is a real bottleneck (e.g. a multi-GB/s
+proxy), and add it then as an opt-in fast path gated on "one BYOB reader, empty
+queue" — never as a replacement for the queue. The full reasoning is in
+[docs/explainers/byte-source-zero-copy.md](../explainers/byte-source-zero-copy.md).
+
 ## Implementation plan
 
 1. **`byte_state.rs` internals.** Replace `VecDeque<u8>` with `VecDeque<Bytes>`;

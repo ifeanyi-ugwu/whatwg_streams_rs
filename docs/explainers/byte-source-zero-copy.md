@@ -1,0 +1,226 @@
+# Why a byte source has one pull method, not two
+
+This explains the reasoning behind `ReadableByteSource`'s single, enqueue-driven
+`pull`: why the WHATWG byte stream offers a source two ways to produce bytes, why
+this library collapses them into one, and the single copy that remains on a BYOB
+read — including the optimization that would remove it and why it is deferred.
+
+The decision is recorded in [ADR 0001](../adr/0001-zero-copy-byte-streams.md).
+This document is the longer "why," meant for understanding rather than for
+deciding.
+
+## What both spec methods are answering
+
+A byte source's whole job is to get bytes into the stream's queue without copying
+them. The WHATWG spec gives a source two ways to do it:
+
+- `controller.enqueue(view)` — the source allocated its own buffer, wrote bytes
+  into it, and hands it over.
+- A BYOB request + `respond(n)` (the `autoAllocateChunkSize` path) — the
+  controller hands the source a buffer, the source fills it, and calls `respond`.
+
+The question is why JavaScript needs both, and why Rust needs only the first.
+
+## Why JavaScript needs two
+
+It comes down to one limitation: JavaScript has no cheap way to transfer ownership
+of memory. A buffer is shared, garbage-collected memory; anyone with a reference
+can read or write it. To move bytes into the stream "without copying" while
+staying safe — no two parties scribbling on the same buffer — the spec uses
+**transfer/detach**, a runtime operation that marks the source's reference dead.
+
+- Method 1 works when the source owns the buffer: it allocates, fills, enqueues,
+  and the runtime detaches it.
+- Method 2 exists for the case the language cannot otherwise express: writing
+  directly into the *consumer's* final buffer. When a BYOB reader supplies a
+  buffer `B`, the ideal is for the source to read straight into `B` — zero hops,
+  source to consumer. JavaScript has no way to hand the source a writable view of
+  `B` except through the controller's BYOB-request machinery.
+
+Two methods, because there are two ownership situations, and JavaScript can only
+bridge them through runtime detachment.
+
+## Why Rust needs only one
+
+Rust has the thing JavaScript lacks: ownership and `move` are first-class and
+free.
+
+"Transfer into the stream" is a `move`. `controller.enqueue(bytes)` moves the
+buffer into the queue, and the borrow checker guarantees the source cannot touch
+it afterward — no runtime "detached" flag, no copy. Because `move` is universal,
+method 1 covers every source, including file and socket readers: allocate an
+owned `Vec`/`BytesMut`, read into it, enqueue it. Zero copy into the queue.
+
+So the only thing method 2 uniquely bought in JavaScript — letting the source
+fill a buffer it did not allocate — was a workaround for not having cheap
+ownership transfer. Rust does not need the workaround.
+
+## The fill path was never the efficient one here
+
+It is tempting to assume the fill-a-buffer path is the fast one — it is, after
+all, the spec's BYOB-direct path. But trace a single chunk through this library's
+*old* fill implementation:
+
+```
+old fill path (FD reader):
+  task allocates scratch S (8192)
+  source: read(fd -> S), return n
+  task: queue.extend(&S[..n])             COPY 1  (S -> queue)
+  later BYOB read: copy(queue -> caller B)  COPY 2  (queue -> B)
+  = 2 copies + 1 allocation per pull
+```
+
+The fill path never performed the spec's trick of writing straight into the
+consumer's buffer, because the queue sits between source and consumer. It was a
+two-copy path wearing the costume of the spec's efficient one.
+
+The enqueue-driven path:
+
+```
+new enqueue path (FD reader):
+  source: let mut buf = ...; read(fd -> buf); enqueue(buf)   MOVE into queue (0 copies)
+  later BYOB read: copy(queue -> caller B)                   1 copy (caller owns B)
+  = 1 copy, 0 scratch allocation
+  (a default reader returning Bytes: 0 copies)
+```
+
+Folding the two shapes into one lost nothing — the spec's optimization was never
+present — and removed a copy and a per-pull allocation.
+
+## Why would a source fill a buffer it did not allocate?
+
+This is the crux, and it sounds bizarre until the scenario is concrete.
+
+BYOB means "bring your own buffer." It is a *consumer* that says: "I already have
+a buffer `B` — read the bytes into `B` directly." Think of a video decoder with a
+pre-allocated frame buffer, or code filling a fixed-size struct. The entire point
+of BYOB is that the bytes land in the consumer's buffer with no detours.
+
+Where do the bytes come from? The source — a file, a socket. For the bytes to get
+from the OS into the consumer's `B` with zero copies, something has to write
+straight into `B`, and the only party holding the bytes is the source. So the
+source must write into `B` — a buffer the *consumer* owns, not the source.
+
+That is the whole motivation. "Let the source fill a buffer it did not allocate"
+means "let the source write directly into the consumer's buffer, so the
+consumer's buffer is the only buffer the bytes ever touch."
+
+Side by side:
+
+```
+source allocates its own buffer (method 1 only):
+  OS read --> S  (source's buffer)     write
+  S --> queue                          COPY 1
+  queue --> B  (consumer's buffer)     COPY 2
+
+source fills the consumer's buffer B (method 2):
+  OS read --> B  (consumer's buffer)   write, directly
+```
+
+Method 2 is the only way JavaScript can achieve true source-to-consumer
+zero-copy. Because `B` belongs to the consumer, the controller has to lend it to
+the source: it takes the consumer's BYOB buffer, presents it to the source as
+"fill this," the source writes into it and calls `respond(n)`, and `B` returns to
+the consumer filled. (`autoAllocateChunkSize` is the same machinery for default
+readers — the controller pre-allocates the buffer so the source's code path is
+always "fill a provided buffer.")
+
+The "did not allocate" part is the point: the buffer has to belong to the
+consumer so the bytes land in the consumer's memory in one shot.
+
+## So why doesn't this library do BYOB-direct?
+
+It is a real, well-understood optimization — exactly what JavaScript's BYOB-direct
+does — and it is deliberately deferred, not unexamined. The reason is an
+architecture tradeoff.
+
+This library is **queue-mediated**: the source always pushes into one central
+byte queue, and readers pull from it. The source has no idea who is reading, how
+many readers there are, or what buffer they hold. That ignorance is a feature —
+it keeps several things simple and uniform:
+
+- **tee** — two readers. If the source wrote directly into "the consumer's
+  buffer," whose buffer? Two buffers cannot be filled at once without copying. A
+  queue fans out by refcount trivially.
+- **default reader** — no buffer is supplied at all. The auto-allocate fallback
+  would be needed anyway.
+- **no reader waiting yet** — the source wants to produce, but no consumer buffer
+  exists. The queue lets it run ahead.
+- **backpressure** — the queue decouples source pace from consumer pace.
+
+BYOB-direct requires threading the consumer's `&mut [u8]` all the way into the
+source's `pull`, which couples the source to the reader and undoes each of those.
+The one BYOB-read copy this library keeps is a `memcpy` of bytes already in
+memory — cheap next to the I/O that produced them — and keeping the queue model
+keeps tee, backpressure, and multi-reader handling clean.
+
+The trigger to revisit would be a profile showing that single queue-to-`B`
+`memcpy` is a real bottleneck — say a proxy pushing gigabytes per second. Even
+then it would be added as an *opt-in fast path*: used only when exactly one BYOB
+reader is waiting and the queue is empty, falling back to queue-mediated
+otherwise — not as a replacement.
+
+Two distinct decisions hide under the same word "copy":
+
+- **The two-shapes fold (producer side)** — a pure win, no tradeoff. A path that
+  was secretly double-copying, and never delivered the spec's benefit, was
+  removed. Nothing lost.
+- **BYOB-direct (consumer side)** — a real optimization with a real cost
+  (coupling), consciously not taken. The remaining single copy is the price of a
+  clean queue model.
+
+## Does JavaScript suffer those same breakages?
+
+No — and the reason matters. JavaScript is not doing *pure* direct-fill. The
+`ReadableByteStreamController` runs a **hybrid**: a queue *and* an opportunistic
+BYOB-direct fast path, falling back to the queue in exactly the cases that would
+break pure direct-fill. It carries both:
+
+- `[[queue]]` + `[[queueTotalSize]]` — the queue-mediated model.
+- `[[pendingPullIntos]]` + `byobRequest` — the BYOB-direct machinery.
+
+and picks per situation:
+
+| Case | What the spec does |
+| --- | --- |
+| No reader waiting | `byobRequest` is `null`; the source enqueues, bytes go in the queue. Fallback. |
+| Default reader | Dequeue from the queue (or, with `autoAllocateChunkSize`, the controller allocates the buffer). Queue is the backstop. |
+| tee (two readers) | `ReadableByteStreamTee` reads one chunk and `CloneAsUint8Array`s it for the second branch — the same copy any implementation needs — then feeds each branch's own queue. The two-readers copy is not dodged. |
+| Backpressure | The queue + `desiredSize` — the same mechanism this library uses. |
+
+BYOB-direct (true source-to-consumer zero-copy) fires in one narrow situation:
+there is a pending BYOB pull-into at the front, and the source chooses to write
+into `byobRequest`'s view and call `respond(n)`. Every other time it is queue,
+copy, or controller-allocated buffer.
+
+So the opt-in fast path described above — used exactly when one BYOB reader is
+waiting and the queue is empty, else fall back to the queue — *is* the WHATWG
+architecture. The real difference between this library and the spec is not a
+different architecture: this library implements the queue half and skips the
+opportunistic fast-path half. Same base, one optional layer missing.
+
+## Would this library's fast path match JavaScript's?
+
+Yes — and more strongly than coincidence. Split the behavior in two.
+
+The **fallback (queue) behavior already matches** the spec. In every non-fast-path
+case (no reader, default reader, tee, backpressure), both are queue-mediated and
+both pay one copy on a BYOB read, copying from the queue into the consumer's
+buffer. That is exactly what `poll_read_into` does from `VecDeque<Bytes>` into the
+caller's `&mut [u8]`.
+
+The **fast path** is the only missing piece, and if added it would fire in the
+same narrow case and carry the same limitations — because the limitations are
+intrinsic to the problem, not to the implementation:
+
+- It can help only one BYOB consumer. The same bytes cannot be written directly
+  into two buffers at once — which is why tee must copy, in any implementation.
+- It requires the queue to be empty. FIFO ordering means already-queued bytes
+  must be delivered before freshly-pulled ones; if anything is queued, even a
+  BYOB reader drains it first (copy), and only then can a fresh pull go direct.
+
+Neither the spec nor a faithful Rust version can escape those, so a Rust fast path
+would trigger in the same scenario and fall back in the same scenarios by
+necessity. Everywhere except that one fast-path scenario, the two are already the
+same; the fast path is purely additive — the single situation where the spec
+currently saves a copy this library does not.
