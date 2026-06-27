@@ -26,15 +26,11 @@ use whatwg_streams::{
 /// BYOB source over the receive half of a WebSocket, yielding binary frame bytes.
 pub struct WebSocketByobSource<S> {
     ws_stream: S,
-    current_frame: Option<Vec<u8>>,
 }
 
 impl<S> WebSocketByobSource<S> {
     pub fn new(ws_stream: S) -> Self {
-        Self {
-            ws_stream,
-            current_frame: None,
-        }
+        Self { ws_stream }
     }
 }
 
@@ -42,36 +38,25 @@ impl<S> ReadableByteSource for WebSocketByobSource<S>
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send + 'static,
 {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableByteStreamController,
-        buffer: &mut [u8],
-    ) -> StreamResult<usize> {
-        if self.current_frame.is_none() {
-            match self.ws_stream.next().await {
-                Some(Ok(Message::Binary(data))) => self.current_frame = Some(data.into()),
-                Some(Ok(Message::Close(_))) | None => {
-                    controller.close()?;
-                    return Ok(0);
-                }
-                // A peer hanging up without a close handshake is a normal end-of-stream here.
-                Some(Err(e)) if e.to_string().contains("Connection reset without closing") => {
-                    controller.close()?;
-                    return Ok(0);
-                }
-                Some(Err(e)) => return Err(format!("WebSocket read error: {e}").into()),
-                Some(Ok(_)) => return Ok(0), // text / ping / pong — ignored in this binary proxy
+    async fn pull(&mut self, controller: &mut ReadableByteStreamController) -> StreamResult<()> {
+        match self.ws_stream.next().await {
+            // The whole frame transfers into the queue; a BYOB consumer drains it
+            // across reads.
+            Some(Ok(Message::Binary(data))) => {
+                let bytes: Vec<u8> = data.into();
+                controller.enqueue(bytes)?;
             }
+            Some(Ok(Message::Close(_))) | None => {
+                controller.close()?;
+            }
+            // A peer hanging up without a close handshake is a normal end-of-stream here.
+            Some(Err(e)) if e.to_string().contains("Connection reset without closing") => {
+                controller.close()?;
+            }
+            Some(Err(e)) => return Err(format!("WebSocket read error: {e}").into()),
+            Some(Ok(_)) => {} // text / ping / pong — ignored in this binary proxy
         }
-
-        let frame = self.current_frame.as_mut().expect("frame set above");
-        let n = frame.len().min(buffer.len());
-        buffer[..n].copy_from_slice(&frame[..n]);
-        frame.drain(..n);
-        if frame.is_empty() {
-            self.current_frame = None;
-        }
-        Ok(n)
+        Ok(())
     }
 }
 

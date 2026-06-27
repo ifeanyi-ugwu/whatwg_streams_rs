@@ -35,17 +35,17 @@ impl ReadableByteSource for FileByobSource {
         Ok(())
     }
 
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableByteStreamController,
-        buffer: &mut [u8],
-    ) -> StreamResult<usize> {
+    async fn pull(&mut self, controller: &mut ReadableByteStreamController) -> StreamResult<()> {
         let file = self.file.as_mut().expect("opened in start");
-        let n = file.read(buffer).await?;
+        let mut buf = vec![0u8; 8192];
+        let n = file.read(&mut buf).await?;
         if n == 0 {
             controller.close()?;
+        } else {
+            buf.truncate(n);
+            controller.enqueue(buf)?;
         }
-        Ok(n)
+        Ok(())
     }
 }
 

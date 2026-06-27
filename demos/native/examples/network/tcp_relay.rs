@@ -37,17 +37,17 @@ impl ReadableByteSource for TcpSource {
         Ok(())
     }
 
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableByteStreamController,
-        buffer: &mut [u8],
-    ) -> StreamResult<usize> {
+    async fn pull(&mut self, controller: &mut ReadableByteStreamController) -> StreamResult<()> {
         let socket = self.socket.as_mut().expect("connected in start");
-        let n = socket.read(buffer).await?;
+        let mut buf = vec![0u8; 8192];
+        let n = socket.read(&mut buf).await?;
         if n == 0 {
             controller.close()?;
+        } else {
+            buf.truncate(n);
+            controller.enqueue(buf)?;
         }
-        Ok(n)
+        Ok(())
     }
 
     async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {

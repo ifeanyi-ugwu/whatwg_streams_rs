@@ -88,16 +88,16 @@ pub struct FileByteSource {
 }
 
 impl ReadableByteSource for FileByteSource {
-    async fn pull(
-        &mut self,
-        controller: &mut ReadableByteStreamController,
-        buffer: &mut [u8],
-    ) -> StreamResult<usize> {
-        let n = self.file.read(buffer).await?;
+    async fn pull(&mut self, controller: &mut ReadableByteStreamController) -> StreamResult<()> {
+        let mut buf = vec![0u8; 8192];
+        let n = self.file.read(&mut buf).await?;
         if n == 0 {
             controller.close()?;
+        } else {
+            buf.truncate(n);
+            controller.enqueue(buf)?;
         }
-        Ok(n)
+        Ok(())
     }
 }
 
