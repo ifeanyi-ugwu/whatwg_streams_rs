@@ -753,11 +753,10 @@ impl ReadableByteSource for TeeSource<Bytes> {
     async fn pull(
         &mut self,
         controller: &mut ReadableByteStreamController,
-        _buffer: &mut [u8],
-    ) -> StreamResult<usize> {
+    ) -> StreamResult<()> {
         if self.branch_canceled.load(Ordering::Acquire) {
             controller.close()?;
-            return Ok(0);
+            return Ok(());
         }
 
         match self.chunk_rx.next().await {
@@ -773,7 +772,7 @@ impl ReadableByteSource for TeeSource<Bytes> {
             }
         }
 
-        Ok(0)
+        Ok(())
     }
 
     async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
@@ -2490,26 +2489,12 @@ async fn readable_byte_stream_task<Source>(
 
                 byte_state.mark_pull_started();
 
-                let mut buffer = vec![0u8; 8192];
                 let size_before = byte_state.buffer_size();
 
-                match source.pull(&mut controller, &mut buffer).await {
-                    Ok(bytes_read) => {
-                        let mut any_data_produced = false;
-
-                        // Directly buffered data
-                        if bytes_read > 0 {
-                            byte_state.enqueue_data(&buffer[..bytes_read]);
-                            any_data_produced = true;
-                        }
-
-                        // Data enqueued via controller
+                match source.pull(&mut controller).await {
+                    Ok(()) => {
+                        // The source produces by enqueueing into the controller.
                         if byte_state.buffer_size() > size_before {
-                            any_data_produced = true;
-                        }
-
-                        // Fulfill pending reads if any data appeared
-                        if any_data_produced {
                             while let Some(completion) = pending_reads.pop_front() {
                                 match poll_fn(|cx| byte_state.poll_read_chunk(cx)).now_or_never() {
                                     Some(Ok(None)) => {
@@ -2530,10 +2515,8 @@ async fn readable_byte_stream_task<Source>(
                             }
                         }
 
-                        // Close stream if EOF and no data was produced via controller either
-                        if bytes_read == 0 && !any_data_produced {
-                            byte_state.close();
-                            // Fulfill any remaining pending reads with EOF
+                        // EOF is explicit: the source signals it with controller.close().
+                        if byte_state.is_closed() {
                             while let Some(completion) = pending_reads.pop_front() {
                                 let _ = completion.send(Ok(None));
                             }
@@ -3047,20 +3030,19 @@ mod tests {
             async fn pull(
                 &mut self,
                 controller: &mut ReadableByteStreamController,
-                _buffer: &mut [u8],
-            ) -> StreamResult<usize> {
+            ) -> StreamResult<()> {
                 let idx = *self.index.borrow();
 
                 if idx >= self.chunks.len() {
                     controller.close()?;
-                    return Ok(0);
+                    return Ok(());
                 }
 
                 let chunk = self.chunks[idx].clone();
                 *self.index.borrow_mut() = idx + 1;
 
                 controller.enqueue(chunk)?;
-                Ok(0)
+                Ok(())
             }
         }
 
@@ -3091,18 +3073,17 @@ mod tests {
             async fn pull(
                 &mut self,
                 controller: &mut ReadableByteStreamController,
-                _buffer: &mut [u8],
-            ) -> StreamResult<usize> {
+            ) -> StreamResult<()> {
                 if *self.consumed.borrow() {
                     controller.close()?;
-                    return Ok(0);
+                    return Ok(());
                 }
 
                 let chunk = self.data.clone();
                 *self.consumed.borrow_mut() = true;
 
                 controller.enqueue(chunk)?;
-                Ok(0)
+                Ok(())
             }
         }
 
@@ -3379,8 +3360,7 @@ mod tests {
             async fn pull(
                 &mut self,
                 controller: &mut ReadableByteStreamController,
-                _buffer: &mut [u8],
-            ) -> StreamResult<usize> {
+            ) -> StreamResult<()> {
                 assert!(
                     self.start_completed.load(Ordering::Acquire),
                     "pull called before start completed"
@@ -3393,7 +3373,7 @@ mod tests {
                 } else {
                     controller.close()?;
                 }
-                Ok(0)
+                Ok(())
             }
         }
 

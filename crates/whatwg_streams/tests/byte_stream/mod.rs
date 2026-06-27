@@ -14,8 +14,7 @@ impl ReadableByteSource for ChunkedByteSource {
     async fn pull(
         &mut self,
         controller: &mut ReadableByteStreamController,
-        _buffer: &mut [u8],
-    ) -> StreamResult<usize> {
+    ) -> StreamResult<()> {
         let idx = {
             let mut i = self.index.lock().unwrap();
             let v = *i;
@@ -27,7 +26,7 @@ impl ReadableByteSource for ChunkedByteSource {
         } else {
             controller.close()?;
         }
-        Ok(0)
+        Ok(())
     }
 
     async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
@@ -46,9 +45,8 @@ impl ReadableByteSource for FailingByteStart {
     async fn pull(
         &mut self,
         _controller: &mut ReadableByteStreamController,
-        _buffer: &mut [u8],
-    ) -> StreamResult<usize> {
-        Ok(0)
+    ) -> StreamResult<()> {
+        Ok(())
     }
 }
 
@@ -58,8 +56,7 @@ impl ReadableByteSource for FailingBytePull {
     async fn pull(
         &mut self,
         _controller: &mut ReadableByteStreamController,
-        _buffer: &mut [u8],
-    ) -> StreamResult<usize> {
+    ) -> StreamResult<()> {
         Err("pull failed".into())
     }
 }
@@ -308,12 +305,11 @@ async fn byte_controller_guards_after_close() {
         async fn pull(
             &mut self,
             controller: &mut ReadableByteStreamController,
-            _buffer: &mut [u8],
-        ) -> StreamResult<usize> {
+        ) -> StreamResult<()> {
             controller.close()?;
             *self.enqueue_err.lock().unwrap() = Some(controller.enqueue(b"x".to_vec()).is_err());
             *self.close_again_err.lock().unwrap() = Some(controller.close().is_err());
-            Ok(0)
+            Ok(())
         }
     }
 
@@ -380,10 +376,9 @@ async fn byte_tee_cancelling_both_branches_cancels_source() {
         async fn pull(
             &mut self,
             controller: &mut ReadableByteStreamController,
-            _buffer: &mut [u8],
-        ) -> StreamResult<usize> {
+        ) -> StreamResult<()> {
             controller.enqueue(b"data".to_vec())?;
-            Ok(0)
+            Ok(())
         }
         async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
             self.cancels.fetch_add(1, Ordering::SeqCst);

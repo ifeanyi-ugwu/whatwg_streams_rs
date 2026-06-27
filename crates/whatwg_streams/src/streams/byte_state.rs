@@ -240,18 +240,8 @@ where
         }
     }
 
-    // Copying enqueue for sources that filled a controller-owned scratch buffer
-    // (the auto-allocate / BYOB-respond path): the bytes are owned by the buffer,
-    // so they must be copied into an owned chunk.
-    pub fn enqueue_data(&self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        self.enqueue_bytes(Bytes::copy_from_slice(data));
-    }
-
-    // Zero-copy enqueue: the producer transfers ownership of an already-allocated
-    // chunk into the queue (the controller.enqueue / transfer path).
+    // The producer transfers ownership of an already-allocated chunk into the
+    // queue without copying its contents.
     pub fn enqueue_bytes(&self, chunk: Bytes) {
         if chunk.is_empty() {
             return;
@@ -404,7 +394,6 @@ where
 pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn desired_size(&self) -> Option<isize>;
     fn close(&self);
-    fn enqueue_data(&self, data: &[u8]);
     fn enqueue_bytes(&self, chunk: Bytes);
     fn error(&self, error: StreamError);
     fn is_buffer_empty(&self) -> bool;
@@ -437,10 +426,6 @@ where
 
     fn close(&self) {
         ByteStreamState::close(self)
-    }
-
-    fn enqueue_data(&self, data: &[u8]) {
-        ByteStreamState::enqueue_data(self, data)
     }
 
     fn enqueue_bytes(&self, chunk: Bytes) {

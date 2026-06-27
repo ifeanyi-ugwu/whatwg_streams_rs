@@ -48,11 +48,12 @@ Boundary shapes:
   below).
 - **BYOB reads** keep the `poll_read_into(&mut [u8])` shape. The destination is
   caller-owned, so this path copies by definition and is unchanged.
-- **Sources** gain a second shape. The existing fill-a-buffer pull
-  (`pull(&mut self, controller, buf: &mut [u8])`) stays for sources that read
-  into scratch (e.g. an FD); a `Bytes`-returning shape is added for sources that
-  already hold buffers (e.g. an HTTP body, an mmap), so the pull side can be
-  zero-copy too.
+- **Sources** produce through a single enqueue-driven `pull(&mut self,
+  controller)`. A chunk held as `Bytes` is enqueued by transfer; a source reading
+  from elsewhere (an FD, an HTTP body) owns its read buffer — fills a `BytesMut`
+  or `Vec<u8>`, then enqueues it — so the bytes reach the queue without being
+  copied through the controller. EOF is signalled with `controller.close()`. The
+  fill-a-buffer shape is dropped: see below.
 
 ## Why this preserves WHATWG semantics
 
@@ -79,7 +80,7 @@ copy-everything `VecDeque<u8>` design was the *less* faithful part.
 | BYOB read | Copies available bytes into caller's `&mut [u8]`, partial allowed | Unchanged — copy is intrinsic to a caller-owned destination |
 | `tee()` | Refcount-shares the same `Bytes` into both branches | Observably identical — see below |
 | Backpressure / desired size | `queueTotalSize = Σ chunk.len()`, `desiredSize = HWM − queueTotalSize` | Unchanged — byte-measured |
-| Source provides bytes | Two shapes: fill-buffer and return-`Bytes` | Both are spec paths — see below |
+| Source provides bytes | One enqueue-driven `pull`: enqueue chunks, `close()` for EOF | Spec's enqueue/transfer path; the auto-allocate path is redundant in Rust — see below |
 
 ### Tee: refcount instead of clone
 
@@ -92,17 +93,24 @@ the identical observable result — both see the same bytes, neither can corrupt
 the other — without the copy. The copy is elided because the type system
 guarantees what JS must enforce by copying.
 
-### Pull: two source shapes are both in the spec
+### Pull: one enqueue-driven shape, not two
 
 The spec gives a source two ways to provide bytes:
 
 - `controller.enqueue(view)` — the source produced its own buffer and transfers
-  it in (zero-copy). The `Bytes`-returning source shape maps onto this.
+  it in (zero-copy).
 - A BYOB request + `respond(n)` — the controller hands the source a buffer (via
-  `autoAllocateChunkSize`) and the source fills it. The fill-a-buffer pull maps
-  onto this; its `8192` scratch is an implicit `autoAllocateChunkSize`.
+  `autoAllocateChunkSize`) and the source fills it.
 
-Supporting both shapes is more complete, not less compliant.
+In Rust both reduce to one: the source enqueues a `Bytes`. The auto-allocate
+path exists in JS only because the source needs the controller to hand it a
+*transferable* `ArrayBuffer` — JS has no other way to give the source a buffer it
+can detach into the stream. A Rust source just owns its read buffer (`BytesMut`),
+fills it, and enqueues the frozen result. So a controller-provided scratch buffer
+buys nothing; it only forced an allocation per pull and a copy out of that
+scratch into the queue. The fill-a-buffer `pull(controller, buf: &mut [u8])` is
+therefore dropped in favor of a single `pull(controller)` that enqueues and
+signals EOF with `close()`.
 
 ## Guardrails
 
@@ -168,8 +176,10 @@ Alternatives rejected:
    the writable core is already chunk-generic, so pipe-through into a
    `WritableSink<Bytes>` is zero-copy automatically. `Bytes` is re-exported at the
    crate root so downstream code can name it.
-3. **Source contract.** Add the `Bytes`-returning pull shape alongside the
-   existing fill-a-buffer shape (the pull side still copies until then).
+3. **Source contract.** Collapse `pull` to a single enqueue-driven
+   `pull(&mut self, controller)`, dropping the fill-a-buffer parameter and the
+   per-pull scratch allocation. Sources enqueue chunks and signal EOF with
+   `controller.close()`.
 
 ## Validation
 
