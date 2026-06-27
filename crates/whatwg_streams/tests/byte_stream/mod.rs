@@ -243,9 +243,9 @@ async fn byob_cancel_calls_source_cancel() {
     assert_eq!(cancel_reason.lock().unwrap().as_deref(), Some("done"));
 }
 
-// ── Trait integrations ─────────────────────────────────────────────────────────
+// ── Trait integrations (library-specific — Rust traits, no WPT equivalent) ──────
 
-// "ReadableByteStream: AsyncRead trait reads bytes to end"
+// AsyncRead: reads bytes to end through the futures::AsyncRead impl
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn async_read_trait_reads_to_end() {
@@ -436,7 +436,13 @@ async fn byte_tee_branch_supports_byob_reader() {
     assert_eq!(b2, b"hello");
 }
 
-// ── BYOB owned-buffer reads (read_owned / byob_request) ─────────────────────────
+// ── BYOB owned-buffer reads: read_owned / byob_request ──────────────────────────
+//
+// Library-specific — no WPT equivalent. read_owned is the Rust owned-buffer handoff
+// (a BytesMut transferred in, filled by the source, moved back); there is no JS
+// behaviour to translate from. The WPT-derived tests above quote the behaviour they
+// mirror; these intentionally do not, because there is none. See
+// docs/explainers/byte-source-zero-copy.md.
 
 // A source that fills the reader's buffer directly via byob_request — the
 // zero-copy path — and records whether that path was taken.
@@ -467,7 +473,7 @@ impl ReadableByteSource for DirectFillSource {
     }
 }
 
-// "read_owned: the source fills the transferred buffer directly (zero-copy path)"
+// read_owned: the source fills the transferred buffer directly (zero-copy path)
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn read_owned_direct_fill_uses_byob_request() {
@@ -493,7 +499,7 @@ async fn read_owned_direct_fill_uses_byob_request() {
     assert_eq!(n, 0, "EOF after the source closes");
 }
 
-// "read_owned: a source that enqueues instead is served from the queue (fallback)"
+// read_owned: a source that enqueues instead is served from the queue (fallback)
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn read_owned_fallback_via_enqueue() {
@@ -509,7 +515,7 @@ async fn read_owned_fallback_via_enqueue() {
     assert_eq!(&buf[..n], b"abc");
 }
 
-// "read_owned: queued bytes are served first, the remainder on the next read (FIFO)"
+// read_owned: queued bytes are served first, the remainder on the next read (FIFO)
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn read_owned_queue_first_serves_remainder() {
@@ -529,7 +535,7 @@ async fn read_owned_queue_first_serves_remainder() {
     assert_eq!(&buf[..n], b"def");
 }
 
-// "read_owned: a pending read resolves to EOF when the source closes empty"
+// read_owned: a pending read resolves to EOF when the source closes empty
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn read_owned_eof_when_source_closes_empty() {
@@ -545,7 +551,7 @@ async fn read_owned_eof_when_source_closes_empty() {
     assert_eq!(n, 0);
 }
 
-// "read_owned: a pending read rejects when the source errors"
+// read_owned: a pending read rejects when the source errors
 #[cfg(feature = "send")]
 #[tokio::test]
 async fn read_owned_rejects_when_source_errors() {
