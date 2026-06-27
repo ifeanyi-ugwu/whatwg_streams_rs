@@ -186,8 +186,12 @@ spec: it serves only one BYOB consumer (the same bytes cannot fill two buffers,
 which is why tee copies), and it requires an empty queue (FIFO). The single BYOB
 reader is guaranteed by the stream lock, so no extra gating is needed.
 
-Deferred follow-ups: multiple pipelined pull-intos (one in-flight is serialized),
-and `autoAllocateChunkSize`-style direct fill for default reads (BYOB-only here).
+`read_owned` supports pipelining: concurrent reads queue and are served in FIFO
+order (a single waiting slot would have silently dropped all but the last).
+`autoAllocateChunkSize`-style direct fill for default reads is intentionally not
+pursued — it removes no copy in Rust (default reads already pop `Bytes` by move,
+and a source already owns its buffer), the same redundancy that retired the
+fill-shape.
 
 The full reasoning is in
 [docs/explainers/byte-source-zero-copy.md](../explainers/byte-source-zero-copy.md).

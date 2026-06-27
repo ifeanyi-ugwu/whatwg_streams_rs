@@ -100,9 +100,9 @@ pub struct ByteStreamState<Source> {
     start_completed: AtomicBool,
     start_wakers: Mutex<Vec<Waker>>,
 
-    // A waiting BYOB owned-buffer read. At most one (a stream has one reader, and
-    // read_owned is awaited before the next), so a single slot suffices.
-    pending_pull_into: Mutex<Option<PendingPullInto>>,
+    // BYOB owned-buffer reads waiting for the source to fill them, in FIFO order.
+    // A stream has one reader, but it may pipeline several read_owned calls.
+    pending_pull_intos: Mutex<VecDeque<PendingPullInto>>,
 }
 
 impl<Source> ByteStreamState<Source>
@@ -125,7 +125,7 @@ where
             desired_size: AtomicIsize::new(high_water_mark as isize),
             start_completed: AtomicBool::new(false),
             start_wakers: Mutex::new(Vec::new()),
-            pending_pull_into: Mutex::new(None),
+            pending_pull_intos: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -306,15 +306,16 @@ where
         }
 
         self.update_desired_size();
-        // A waiting BYOB pull-into gets first claim on freshly enqueued bytes.
-        self.settle_pending_pull_into();
+        // Waiting BYOB pull-intos get first claim on freshly enqueued bytes.
+        self.settle_pending_pull_intos();
         self.wake_readers();
     }
 
-    // Begin a BYOB owned-buffer read. Queue-first (FIFO): if the queue holds data,
-    // fill the buffer from it synchronously; on a closed empty stream, EOF;
-    // otherwise register the buffer as a pending pull-into and force a pull so the
-    // source can fill it directly (zero-copy via byob_request/respond).
+    // Begin a BYOB owned-buffer read. With no reads queued ahead, take the
+    // queue-first fast path (fill from the queue, or EOF on a closed empty
+    // stream). Otherwise register the buffer behind the waiting reads (FIFO) and
+    // force a pull so the source can fill it directly (zero-copy via
+    // byob_request/respond).
     pub fn begin_pull_into(&self, mut buf: BytesMut) -> PullIntoOutcome {
         if self.errored.load(Ordering::Acquire) {
             return PullIntoOutcome::Errored(self.take_error());
@@ -325,93 +326,123 @@ where
 
         let rx = {
             let mut buffer = self.buffer.lock();
-            if !buffer.is_empty() {
-                let n = drain_queue_into(&mut buffer, &mut buf);
-                let new_size = self
-                    .queue_total_size
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(n);
-                self.queue_total_size.store(new_size, Ordering::Release);
-                drop(buffer);
-                self.update_desired_size();
-                self.maybe_trigger_pull();
-                return PullIntoOutcome::Ready(buf, n);
+            let mut pending = self.pending_pull_intos.lock();
+            // Fast paths apply only when nothing is queued ahead of this read.
+            if pending.is_empty() {
+                if !buffer.is_empty() {
+                    let n = drain_queue_into(&mut buffer, &mut buf);
+                    let new_size = self
+                        .queue_total_size
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(n);
+                    self.queue_total_size.store(new_size, Ordering::Release);
+                    drop(pending);
+                    drop(buffer);
+                    self.update_desired_size();
+                    self.maybe_trigger_pull();
+                    return PullIntoOutcome::Ready(buf, n);
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    return PullIntoOutcome::Ready(buf, 0);
+                }
             }
-            if self.closed.load(Ordering::Acquire) {
-                return PullIntoOutcome::Ready(buf, 0);
-            }
-            // Register while holding the buffer lock so an enqueue cannot slip a
-            // chunk into the queue between the emptiness check and registration.
+            // Register behind any waiting reads. Holding the buffer lock keeps an
+            // enqueue from slipping a chunk in between the checks and registration.
             let (tx, rx) = oneshot::channel();
-            *self.pending_pull_into.lock() = Some(PendingPullInto { buf, completion: tx });
+            pending.push_back(PendingPullInto { buf, completion: tx });
             rx
         };
 
         // close()/error() may have fired between the top-of-function check and
         // registration; settle now so the pending read cannot be stranded.
         if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
-            self.settle_pending_pull_into();
+            self.settle_pending_pull_intos();
         }
         self.force_pull();
         PullIntoOutcome::Registered(rx)
     }
 
-    // Take the pending pull-into for the source to fill directly (byob_request).
+    // Take the front pull-into for the source to fill directly (byob_request).
     pub fn take_pull_into(&self) -> Option<PendingPullInto> {
-        self.pending_pull_into.lock().take()
+        self.pending_pull_intos.lock().pop_front()
     }
 
-    // A byob_request dropped without respond() returns its buffer here; retry it.
+    // A byob_request dropped without respond() returns its buffer to the front of
+    // the queue (it is still the oldest waiting read); retry it.
     pub fn return_pull_into(&self, pending: PendingPullInto) {
-        *self.pending_pull_into.lock() = Some(pending);
+        self.pending_pull_intos.lock().push_front(pending);
         if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
-            self.settle_pending_pull_into();
+            self.settle_pending_pull_intos();
         } else {
             self.force_pull();
         }
     }
 
-    // Complete a waiting pull-into from the queue (the source enqueued instead of
-    // responding), or with EOF / the error once the stream is terminal. Locks in
-    // buffer -> pending order, matching begin_pull_into.
-    fn settle_pending_pull_into(&self) {
+    // Complete waiting pull-intos from the front of the queue in FIFO order (the
+    // source enqueued instead of responding), draining EOF / the error to the
+    // rest once the stream is terminal. Locks in buffer -> pending order, matching
+    // begin_pull_into.
+    fn settle_pending_pull_intos(&self) {
         let mut buffer = self.buffer.lock();
-        let mut pending = self.pending_pull_into.lock();
-        if pending.is_none() {
+        let mut pending = self.pending_pull_intos.lock();
+        if pending.is_empty() {
             return;
         }
 
+        // Errored: reject every waiting read.
         if self.errored.load(Ordering::Acquire) {
-            let p = pending.take().unwrap();
+            let waiting: VecDeque<PendingPullInto> = std::mem::take(&mut pending);
             drop(pending);
             drop(buffer);
-            p.complete_err(self.take_error());
+            let err = self.take_error();
+            for p in waiting {
+                p.complete_err(err.clone());
+            }
             return;
         }
 
-        if !buffer.is_empty() {
-            let mut p = pending.take().unwrap();
+        // Fill reads from the front while the queue has data.
+        let mut filled: Vec<(PendingPullInto, usize)> = Vec::new();
+        let mut total_drained = 0;
+        while !buffer.is_empty() {
+            let Some(mut p) = pending.pop_front() else {
+                break;
+            };
             let n = drain_queue_into(&mut buffer, p.buf_mut());
+            total_drained += n;
+            filled.push((p, n));
+        }
+
+        // Once closed, reads the queue could not satisfy resolve to EOF.
+        let eof: VecDeque<PendingPullInto> = if self.closed.load(Ordering::Acquire) {
+            std::mem::take(&mut pending)
+        } else {
+            VecDeque::new()
+        };
+
+        if total_drained > 0 {
             let new_size = self
                 .queue_total_size
                 .load(Ordering::Relaxed)
-                .saturating_sub(n);
+                .saturating_sub(total_drained);
             self.queue_total_size.store(new_size, Ordering::Release);
-            drop(pending);
-            drop(buffer);
-            self.update_desired_size();
-            p.complete(n);
-            self.maybe_trigger_pull();
-            return;
         }
 
-        if self.closed.load(Ordering::Acquire) {
-            let p = pending.take().unwrap();
-            drop(pending);
-            drop(buffer);
+        drop(pending);
+        drop(buffer);
+
+        if total_drained > 0 {
+            self.update_desired_size();
+        }
+        for (p, n) in filled {
+            p.complete(n);
+        }
+        for p in eof {
             p.complete(0); // EOF
         }
-        // else: no data, not terminal — leave pending for the next pull.
+        if total_drained > 0 {
+            self.maybe_trigger_pull();
+        }
     }
 
     // Like maybe_trigger_pull but ignores the high-water-mark gate: a registered
@@ -436,8 +467,8 @@ where
     // Called when pull operation completes
     pub fn mark_pull_completed(&self) {
         self.pull_in_progress.store(false, Ordering::Release);
-        // A still-pending pull-into must keep pulling even at HWM 0.
-        if self.pending_pull_into.lock().is_some() {
+        // Still-pending pull-intos must keep pulling even at HWM 0.
+        if !self.pending_pull_intos.lock().is_empty() {
             self.force_pull();
         } else {
             self.maybe_trigger_pull();
@@ -447,7 +478,7 @@ where
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.update_desired_size();
-        self.settle_pending_pull_into();
+        self.settle_pending_pull_intos();
         self.wake_readers();
         if let Some(waker) = self.pull_waker.lock().take() {
             waker.wake();
@@ -458,7 +489,7 @@ where
         *self.error.lock() = Some(err);
         self.errored.store(true, Ordering::Release);
         self.update_desired_size();
-        self.settle_pending_pull_into();
+        self.settle_pending_pull_intos();
         self.wake_readers();
         if let Some(waker) = self.pull_waker.lock().take() {
             waker.wake();

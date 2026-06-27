@@ -561,3 +561,27 @@ async fn read_owned_rejects_when_source_errors() {
     let result = byob.read_owned(BytesMut::zeroed(8)).await;
     assert!(result.is_err(), "a source error must reject a pending read_owned");
 }
+
+// read_owned: pipelined concurrent reads are served in FIFO order (not dropped)
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_owned_pipelined_reads_served_in_order() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"aa".to_vec(), b"bb".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    // Both reads are issued before either resolves: they queue and fill in order,
+    // rather than the second silently dropping the first.
+    let (ra, rb) = tokio::join!(
+        byob.read_owned(BytesMut::zeroed(8)),
+        byob.read_owned(BytesMut::zeroed(8)),
+    );
+    let (a, na) = ra.unwrap();
+    let (b, nb) = rb.unwrap();
+    assert_eq!(&a[..na], b"aa");
+    assert_eq!(&b[..nb], b"bb");
+}
