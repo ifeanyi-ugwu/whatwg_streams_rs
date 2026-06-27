@@ -3,6 +3,7 @@ use super::{
     readable::ReadableByteStreamController,
 };
 use crate::platform::{MaybeSend, MaybeSync, SharedPtr};
+use bytes::{Buf, Bytes};
 use futures::future::poll_fn;
 use parking_lot::Mutex;
 use std::{
@@ -13,8 +14,10 @@ use std::{
 
 // Enhanced byte state that handles both buffering and source pulling
 pub struct ByteStreamState<Source> {
-    // Primary buffer for accumulated data
-    buffer: Mutex<VecDeque<u8>>,
+    // Queue of immutable byte chunks. Bytes shares its backing allocation on
+    // clone (refcount) and slices via offset math, so chunks move through the
+    // queue and out to readers without copying their contents.
+    buffer: Mutex<VecDeque<Bytes>>,
 
     pub(crate) source: Mutex<Option<Source>>,
 
@@ -58,99 +61,147 @@ where
         })
     }
 
-    // Zero-copy read directly into caller's buffer
+    // Registers `cx` and returns false while start() is still running, so reads
+    // park until the source has had a chance to seed the queue.
+    fn poll_start_ready(&self, cx: &mut Context<'_>) -> bool {
+        if self.start_completed.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut wakers = self.start_wakers.lock();
+        // Recheck under the lock to avoid racing mark_start_completed.
+        if self.start_completed.load(Ordering::Acquire) {
+            return true;
+        }
+        let waker = cx.waker();
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+        false
+    }
+
+    fn take_error(&self) -> StreamError {
+        self.error
+            .lock()
+            .clone()
+            .unwrap_or_else(|| "Stream errored".into())
+    }
+
+    fn register_read_waker(&self, cx: &mut Context<'_>) {
+        let mut wakers = self.read_wakers.lock();
+        let waker = cx.waker();
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+
+    // BYOB read: fill the caller's buffer from the front of the queue, draining
+    // across chunk boundaries. The destination is caller-owned, so this copies;
+    // partial fills are allowed (returns however many bytes were available).
     pub fn poll_read_into(
         &self,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, StreamError>> {
-        // First, ensure start has completed
-        if !self.start_completed.load(Ordering::Acquire) {
-            let mut wakers = self.start_wakers.lock();
-            // Recheck after acquiring lock to avoid race
-            if !self.start_completed.load(Ordering::Acquire) {
-                let waker = cx.waker();
-                if !wakers.iter().any(|w| w.will_wake(waker)) {
-                    wakers.push(waker.clone());
-                }
-                return Poll::Pending;
-            }
+        if !self.poll_start_ready(cx) {
+            return Poll::Pending;
         }
 
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        // Check error state first
         if self.errored.load(Ordering::Acquire) {
-            let error = self
-                .error
-                .lock()
-                .clone()
-                .unwrap_or_else(|| "Stream errored".into());
-            return Poll::Ready(Err(error));
+            return Poll::Ready(Err(self.take_error()));
         }
 
-        // Try to read from buffer
         let bytes_copied = {
             let mut buffer = self.buffer.lock();
-            if !buffer.is_empty() {
-                let bytes_to_read = std::cmp::min(buf.len(), buffer.len());
-
-                // Zero-copy using VecDeque's as_slices for optimal performance
-                let (first_slice, second_slice) = buffer.as_slices();
-                let mut copied = 0;
-
-                // Copy from first slice
-                if !first_slice.is_empty() && copied < bytes_to_read {
-                    let to_copy = std::cmp::min(first_slice.len(), bytes_to_read);
-                    buf[..to_copy].copy_from_slice(&first_slice[..to_copy]);
-                    copied += to_copy;
+            let mut copied = 0;
+            while copied < buf.len() {
+                let Some(front) = buffer.front_mut() else {
+                    break;
+                };
+                let front_len = front.len();
+                let n = std::cmp::min(buf.len() - copied, front_len);
+                buf[copied..copied + n].copy_from_slice(&front[..n]);
+                copied += n;
+                if n == front_len {
+                    buffer.pop_front();
+                } else {
+                    // Offset past the consumed prefix; the remainder stays at the
+                    // front for the next read without moving any bytes.
+                    front.advance(n);
                 }
+            }
 
-                // Copy from second slice if needed
-                if !second_slice.is_empty() && copied < bytes_to_read {
-                    let to_copy = std::cmp::min(second_slice.len(), bytes_to_read - copied);
-                    buf[copied..copied + to_copy].copy_from_slice(&second_slice[..to_copy]);
-                    copied += to_copy;
-                }
-
-                // Remove copied bytes and update size tracking
-                buffer.drain(..copied);
+            if copied > 0 {
                 let new_size = self
                     .queue_total_size
                     .load(Ordering::Relaxed)
                     .saturating_sub(copied);
                 self.queue_total_size.store(new_size, Ordering::Release);
                 self.update_desired_size();
-
-                copied
-            } else {
-                0
             }
+
+            copied
         };
 
         if bytes_copied > 0 {
-            // We got data, try to trigger a pull for next time if buffer is getting low
             self.maybe_trigger_pull();
             return Poll::Ready(Ok(bytes_copied));
         }
 
-        // No data available, check if closed
         if self.closed.load(Ordering::Acquire) {
             return Poll::Ready(Ok(0)); // EOF
         }
 
-        // Register waker for when data becomes available
-        {
-            let mut wakers = self.read_wakers.lock();
-            let waker = cx.waker();
-            if !wakers.iter().any(|w| w.will_wake(waker)) {
-                wakers.push(waker.clone());
-            }
+        self.register_read_waker(cx);
+        self.maybe_trigger_pull();
+
+        Poll::Pending
+    }
+
+    // Default read: hand the consumer one queue entry, whole, without copying its
+    // contents (the spec dequeues exactly one entry per default read). Ok(None)
+    // signals EOF.
+    pub fn poll_read_chunk(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, StreamError>> {
+        if !self.poll_start_ready(cx) {
+            return Poll::Pending;
         }
 
-        // Try to initiate a pull if one isn't already in progress
+        if self.errored.load(Ordering::Acquire) {
+            return Poll::Ready(Err(self.take_error()));
+        }
+
+        let chunk = {
+            let mut buffer = self.buffer.lock();
+            match buffer.pop_front() {
+                Some(chunk) => {
+                    let new_size = self
+                        .queue_total_size
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(chunk.len());
+                    self.queue_total_size.store(new_size, Ordering::Release);
+                    self.update_desired_size();
+                    Some(chunk)
+                }
+                None => None,
+            }
+        };
+
+        if let Some(chunk) = chunk {
+            self.maybe_trigger_pull();
+            return Poll::Ready(Ok(Some(chunk)));
+        }
+
+        if self.closed.load(Ordering::Acquire) {
+            return Poll::Ready(Ok(None)); // EOF
+        }
+
+        self.register_read_waker(cx);
         self.maybe_trigger_pull();
 
         Poll::Pending
@@ -189,16 +240,28 @@ where
         }
     }
 
-    // Called by source when data is produced
+    // Copying enqueue for sources that filled a controller-owned scratch buffer
+    // (the auto-allocate / BYOB-respond path): the bytes are owned by the buffer,
+    // so they must be copied into an owned chunk.
     pub fn enqueue_data(&self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
+        self.enqueue_bytes(Bytes::copy_from_slice(data));
+    }
 
+    // Zero-copy enqueue: the producer transfers ownership of an already-allocated
+    // chunk into the queue (the controller.enqueue / transfer path).
+    pub fn enqueue_bytes(&self, chunk: Bytes) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        let len = chunk.len();
         {
             let mut buffer = self.buffer.lock();
-            buffer.extend(data);
-            let new_size = self.queue_total_size.load(Ordering::Relaxed) + data.len();
+            buffer.push_back(chunk);
+            let new_size = self.queue_total_size.load(Ordering::Relaxed) + len;
             self.queue_total_size.store(new_size, Ordering::Release);
         }
 
@@ -342,6 +405,7 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
     fn desired_size(&self) -> Option<isize>;
     fn close(&self);
     fn enqueue_data(&self, data: &[u8]);
+    fn enqueue_bytes(&self, chunk: Bytes);
     fn error(&self, error: StreamError);
     fn is_buffer_empty(&self) -> bool;
     fn buffer_size(&self) -> usize;
@@ -353,6 +417,10 @@ pub trait ByteStreamStateInterface: MaybeSend + MaybeSync {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, StreamError>>;
+    fn poll_read_chunk(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, StreamError>>;
     fn cancel_source<'a>(
         &'a self,
         reason: Option<String>,
@@ -373,6 +441,10 @@ where
 
     fn enqueue_data(&self, data: &[u8]) {
         ByteStreamState::enqueue_data(self, data)
+    }
+
+    fn enqueue_bytes(&self, chunk: Bytes) {
+        ByteStreamState::enqueue_bytes(self, chunk)
     }
 
     fn error(&self, error: StreamError) {
@@ -405,6 +477,13 @@ where
         buf: &mut [u8],
     ) -> Poll<Result<usize, StreamError>> {
         ByteStreamState::poll_read_into(self, cx, buf)
+    }
+
+    fn poll_read_chunk(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>, StreamError>> {
+        ByteStreamState::poll_read_chunk(self, cx)
     }
 
     fn cancel_source<'a>(

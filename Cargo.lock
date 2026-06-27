@@ -1059,6 +1059,7 @@ dependencies = [
 name = "whatwg_streams"
 version = "0.1.0-alpha.10"
 dependencies = [
+ "bytes",
  "futures",
  "parking_lot",
  "pin-project",

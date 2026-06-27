@@ -13,6 +13,7 @@ send = []          # Multi-threaded: Arc-based, requires Send+Sync
 local = []         # Single-threaded: Rc-based, no Send/Sync required
 
 [dependencies]
+bytes = "1"
 futures = "0.3.31"
 parking_lot = "0.12.4"
 pin-project = "1.1.10"
