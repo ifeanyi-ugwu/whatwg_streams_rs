@@ -55,6 +55,37 @@ async fn cancel_on_closed_stream_returns_ok() {
     assert!(reader.cancel(None).await.is_ok());
 }
 
+// "ReadableStream: cancel() on an errored stream rejects with the stored error"
+// Spec ReadableStreamCancel: closed → resolve, but errored → reject(storedError),
+// without running the controller's cancel steps.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_on_errored_stream_rejects_with_stored_error() {
+    struct FailPullSource;
+    impl ReadableSource<u32> for FailPullSource {
+        async fn pull(
+            &mut self,
+            _c: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Err("pull boom".into())
+        }
+    }
+
+    let stream = ReadableStream::builder(FailPullSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // Drive the stream into the errored state.
+    assert!(reader.read().await.is_err());
+
+    let err = reader
+        .cancel(None)
+        .await
+        .expect_err("cancel() on an errored stream must reject");
+    assert!(
+        err.to_string().contains("pull boom"),
+        "cancel() must reject with the stored error, got: {err}"
+    );
+}
+
 // "Cancel passes the given reason to the underlying source's cancel method"
 #[cfg(feature = "send")]
 #[tokio::test]

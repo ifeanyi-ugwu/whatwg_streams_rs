@@ -2403,8 +2403,15 @@ async fn readable_stream_task<T: 'static, Source>(
                     }
                 }
                 StreamCommand::Cancel { reason, completion } => {
-                    if inner.state == StreamState::Closed || inner.state == StreamState::Errored {
+                    // Spec ReadableStreamCancel: a closed stream resolves with undefined,
+                    // an errored stream rejects with the stored error — in both cases
+                    // without running the controller's cancel steps.
+                    if inner.state == StreamState::Closed {
                         let _ = completion.send(Ok(()));
+                        continue;
+                    }
+                    if inner.state == StreamState::Errored {
+                        let _ = completion.send(Err(inner.get_stored_error()));
                         continue;
                     }
                     if inner.cancel_requested {
