@@ -156,3 +156,64 @@ async fn cancel_while_pull_in_flight_calls_source_cancel() {
         "source.cancel() must be called even when cancel() arrived during a blocking pull()"
     );
 }
+
+// WPT: cancel.any.js —
+// "cancelling before start finishes should prevent pull() from being called"
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_before_start_finishes_prevents_pull() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    struct SlowStartSource {
+        release: Arc<Notify>,
+        pulled: Arc<AtomicBool>,
+    }
+
+    impl ReadableSource<u32> for SlowStartSource {
+        async fn start(
+            &mut self,
+            _c: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Block start() until the test has issued cancel(), so the cancel is
+            // requested while start is still in flight.
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn pull(
+            &mut self,
+            _c: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulled.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let release = Arc::new(Notify::new());
+    let pulled = Arc::new(AtomicBool::new(false));
+    let stream = ReadableStream::builder(SlowStartSource {
+        release: release.clone(),
+        pulled: pulled.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Issue cancel() while start() is still blocked; the command queues behind start.
+    let cancel_fut = tokio::spawn(async move { reader.cancel(Some("early".into())).await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Now let start() finish: the queued cancel is processed, closing the stream
+    // before the pull-trigger runs, so pull() must never fire.
+    release.notify_one();
+    cancel_fut.await.unwrap().unwrap();
+    tokio::task::yield_now().await;
+
+    assert!(
+        !pulled.load(Ordering::Acquire),
+        "pull() must not be called when the stream is cancelled before start() finishes"
+    );
+}

@@ -669,6 +669,93 @@ async fn pipe_to_hwm1_preserves_order() {
     assert_eq!(*collected.lock().unwrap(), data);
 }
 
+// WPT: flow-control.any.js —
+// "pipeTo should read chunks ahead of finishing with previous ones when the
+//  destination desires more" — a HWM > 1 destination is filled ahead: while the
+// first write is still in flight, the pipe reads further chunks into the writable
+// queue (contrast pipe_to_respects_writable_backpressure at HWM 1, and the HWM-0
+// no-read-ahead case).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_reads_ahead_into_hwm_gt_1_destination() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let produced = Arc::new(AtomicU32::new(0));
+
+    struct CountingSource {
+        next: u32,
+        produced: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for CountingSource {
+        async fn pull(
+            &mut self,
+            c: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            if self.next >= 10 {
+                c.close()?;
+                return Ok(());
+            }
+            self.next += 1;
+            c.enqueue(self.next)?;
+            self.produced.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let unblock = Arc::new(tokio::sync::Notify::new());
+    struct BlockFirstSink {
+        unblock: Arc<tokio::sync::Notify>,
+        first: bool,
+    }
+    impl WritableSink<u32> for BlockFirstSink {
+        async fn write(
+            &mut self,
+            _c: u32,
+            _: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            if self.first {
+                self.first = false;
+                self.unblock.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    let source = ReadableStream::builder(CountingSource {
+        next: 0,
+        produced: produced.clone(),
+    })
+    .spawn(tokio::spawn);
+    let dest = WritableStream::builder(BlockFirstSink {
+        unblock: unblock.clone(),
+        first: true,
+    })
+    .strategy(CountQueuingStrategy::new(3))
+    .spawn(tokio::spawn);
+
+    let pipe = tokio::spawn(async move { source.pipe_to(&dest, None).await });
+
+    // While the first write is blocked, the pipe fills the HWM-3 writable queue
+    // ahead: more than the single in-flight chunk is read from the source.
+    for _ in 0..64 {
+        if produced.load(Ordering::Acquire) >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let ahead = produced.load(Ordering::Acquire);
+    assert!(
+        ahead >= 3,
+        "a HWM-3 destination must be filled ahead while the first write is in flight; \
+         only {ahead} chunk(s) were read"
+    );
+
+    // Unblock and let the pipe drain the rest.
+    unblock.notify_one();
+    pipe.await.unwrap().unwrap();
+}
+
 // ── WPT gaps: close-propagation-forward ──────────────────────────────────────
 
 // "Closing must be propagated forward: rejected close promise"
@@ -742,12 +829,18 @@ async fn pipe_to_cancel_rejection_on_dest_close_propagates_backward() {
     let dest = WritableStream::builder(ImmediateCloseSink).spawn(tokio::spawn);
     let (_locked, writer) = dest.get_writer().unwrap();
     writer.close().await.unwrap();
-    drop(_locked);
-    // pipe_to a closed dest should propagate close backward via source.cancel()
-    // which throws — the pipe must not hang
+    // Release the lock so pipe_to can acquire its own writer; the lock guard lives on
+    // the writer, so the writer (not the Locked handle) must be dropped.
+    drop(writer);
+    // Piping into an already-closed dest propagates the close backward by cancelling
+    // the source. The source's cancel() rejects, and per spec shutdown-with-action the
+    // action's failure is what pipe_to rejects with — not the generic closed-dest error.
     let result = source.pipe_to(&dest, None).await;
-    // Either Ok or Err — just must not hang. The exact result depends on timing.
-    let _ = result;
+    let err = result.expect_err("piping into a closed destination must reject");
+    assert!(
+        err.to_string().contains("cancel failed"),
+        "pipe_to must reject with the source.cancel() rejection, got: {err}"
+    );
 }
 
 // ── WPT gaps: error-propagation-forward (rejected abort) ─────────────────────
@@ -830,8 +923,14 @@ async fn pipe_to_cancel_rejection_on_dest_error_propagates_backward() {
         .spawn(tokio::spawn);
     let dest = WritableStream::builder(sink).spawn(tokio::spawn);
     let result = source.pipe_to(&dest, None).await;
-    // pipe must not hang; result reflects the cancel or sink error
-    assert!(result.is_err(), "pipe_to() must reject when both sink errors and source.cancel() rejects");
+    // Spec shutdown-with-action: the dest errors, the source is cancelled, and the
+    // source's cancel() rejection — not the sink write error — is what pipe_to rejects
+    // with (WPT: "pipeTo must reject with the cancel error").
+    let err = result.expect_err("pipe_to() must reject when the destination errors");
+    assert!(
+        err.to_string().contains("cancel failed"),
+        "pipe_to() must reject with the source.cancel() rejection, got: {err}"
+    );
 }
 
 // ── WPT gaps: abort.any.js ────────────────────────────────────────────────────

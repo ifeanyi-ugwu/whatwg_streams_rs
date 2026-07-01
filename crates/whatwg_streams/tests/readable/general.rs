@@ -233,6 +233,61 @@ async fn controller_error_rejects_pending_read() {
     assert!(result.is_err(), "pending read should be rejected by controller.error()");
 }
 
+// WPT: default-reader.any.js — "Reading twice on a stream that gets errored"
+// Two concurrently-pending reads must both reject with the same error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn two_pending_reads_both_reject_with_same_error() {
+    struct ErroringSource;
+
+    impl ReadableSource<u32> for ErroringSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Err("boom".into())
+        }
+    }
+
+    let stream = ReadableStream::builder(ErroringSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    let (a, b) = futures::join!(reader.read(), reader.read());
+    let ea = a.expect_err("first read must reject when the stream errors");
+    let eb = b.expect_err("second read must reject when the stream errors");
+    assert!(ea.to_string().contains("boom"), "got: {ea}");
+    assert_eq!(
+        ea.to_string(),
+        eb.to_string(),
+        "both pending reads must reject with the same error"
+    );
+}
+
+// WPT: default-reader.any.js — "Reading twice on a closed stream"
+// Two concurrently-pending reads must both resolve with None when the stream closes.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn two_pending_reads_both_resolve_none_on_close() {
+    struct ClosingSource;
+
+    impl ReadableSource<u32> for ClosingSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.close()?;
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(ClosingSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    let (a, b) = futures::join!(reader.read(), reader.read());
+    assert_eq!(a.unwrap(), None, "first read must resolve None on close");
+    assert_eq!(b.unwrap(), None, "second read must resolve None on close");
+}
+
 // "ReadableStreamDefaultController: error() makes closed promise reject"
 #[cfg(feature = "send")]
 #[tokio::test]
@@ -465,6 +520,71 @@ async fn controller_desired_size_reflects_hwm() {
     tokio::task::yield_now().await;
 
     assert_eq!(*captured.lock().unwrap(), Some(4));
+}
+
+// WPT: count-queuing-strategy-integration.any.js (HWM 4) —
+// desired_size = HWM minus the committed queue depth (the existing empty-queue case
+// above only pins depth 0). The synchronous per-enqueue decrement and negative
+// overshoot WPT also asserts are not portable here — enqueue() is async (a channel
+// message the task commits later) and pull() only fires while desired_size > 0, so a
+// negative desired_size is never surfaced through the source API. See WPT_COVERAGE.md.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_desired_size_reflects_queue_depth() {
+    use std::sync::{Arc, Mutex};
+
+    struct PrefilledSource {
+        captured: Arc<Mutex<Option<isize>>>,
+    }
+
+    impl ReadableSource<u32> for PrefilledSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            Ok(())
+        }
+
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // The first pull runs once start()'s two enqueues are committed to the
+            // queue (the task drains controller messages before any read): HWM 4 − 2 = 2.
+            let mut c = self.captured.lock().unwrap();
+            if c.is_none() {
+                *c = controller.desired_size();
+            }
+            controller.close()?;
+            Ok(())
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(None));
+    let stream = ReadableStream::builder(PrefilledSource {
+        captured: captured.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(4))
+    .spawn(tokio::spawn);
+
+    let (_locked, reader) = stream.get_reader().unwrap();
+    // The first pull fires autonomously once start()'s enqueues commit (desired_size
+    // 2 > 0), before any read drains the queue. Wait for that capture, then read.
+    for _ in 0..16 {
+        if captured.lock().unwrap().is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        *captured.lock().unwrap(),
+        Some(2),
+        "desired_size must equal HWM minus the committed queue depth"
+    );
+    assert_eq!(reader.read().await.unwrap(), Some(1));
 }
 
 // ── controller edge cases ─────────────────────────────────────────────────────

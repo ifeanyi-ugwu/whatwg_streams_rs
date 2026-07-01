@@ -760,6 +760,79 @@ async fn concurrent_cancel_and_close_call_cancel_at_most_once() {
     );
 }
 
+// WPT: flush.any.js —
+// "closing the writable side should call transformer.flush() and a parallel
+//  readable.cancel() should not reject"
+// When close() wins the race, flush() runs, transformer.cancel() is NOT called, and
+// both the close and the parallel cancel resolve cleanly.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn close_flush_wins_over_parallel_cancel() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::Transformer;
+
+    struct FlushNoCancelT {
+        flushed: Arc<Mutex<bool>>,
+        cancel_called: Arc<Mutex<bool>>,
+    }
+
+    impl Transformer<u32, u32> for FlushNoCancelT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+
+        async fn flush(
+            &mut self,
+            _controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.flushed.lock().unwrap() = true;
+            Ok(())
+        }
+
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_called.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    let flushed = Arc::new(Mutex::new(false));
+    let cancel_called = Arc::new(Mutex::new(false));
+    let ts = TransformStream::builder(FlushNoCancelT {
+        flushed: flushed.clone(),
+        cancel_called: cancel_called.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    // Close the writable first; flush() runs as part of closing (close wins the race).
+    let close_fut = tokio::spawn(async move { writer.close().await });
+    for _ in 0..16 {
+        if *flushed.lock().unwrap() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    // The parallel cancel arrives after flush has won: it must resolve cleanly and
+    // must not invoke transformer.cancel().
+    let cancel_result = reader.cancel(Some("late".into())).await;
+    let close_result = close_fut.await.unwrap();
+
+    assert!(close_result.is_ok(), "writer.close() must resolve: {close_result:?}");
+    assert!(cancel_result.is_ok(), "readable.cancel() must resolve: {cancel_result:?}");
+    assert!(*flushed.lock().unwrap(), "transformer.flush() must be called");
+    assert!(
+        !*cancel_called.lock().unwrap(),
+        "transformer.cancel() must not be called once close/flush has won"
+    );
+}
+
 // ── WPT: transform-streams/backpressure.any.js ───────────────────────────────
 // https://github.com/web-platform-tests/wpt/blob/master/streams/transform-streams/backpressure.any.js
 
@@ -1094,6 +1167,61 @@ async fn readable_cancel_clears_backpressure_and_closes_writer() {
     assert!(
         w.closed().await.is_err(),
         "writer.closed() must reject after readable cancel"
+    );
+}
+
+// WPT: transform errors.any.js —
+// "a write() that was waiting for backpressure should reject if the writable is aborted"
+// The cancel-side counterpart above only checks the parked write does not hang; this
+// pins the abort-side, where the parked write must actually reject.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn abort_rejects_write_parked_on_backpressure() {
+    use std::sync::Arc;
+    use whatwg_streams::CountQueuingStrategy;
+
+    struct EnqueueOnceT {
+        first: bool,
+    }
+
+    impl Transformer<u32, u32> for EnqueueOnceT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            if self.first {
+                self.first = false;
+                controller.enqueue(chunk)?;
+            }
+            Ok(())
+        }
+    }
+
+    let ts = TransformStream::builder(EnqueueOnceT { first: true })
+        .readable_strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, _reader) = readable.get_reader().unwrap();
+
+    // First write fills the readable queue (HWM 1) → backpressure on.
+    writer.write(1u32).await.unwrap();
+
+    // Second write parks on backpressure (the reader never reads).
+    let w = Arc::new(writer);
+    let wc = w.clone();
+    let write2 = tokio::spawn(async move { wc.write(2u32).await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Abort the writable — the parked write must reject, not hang or resolve Ok.
+    w.abort(Some("aborted".into())).await.unwrap();
+
+    let write2_result = write2.await.unwrap();
+    assert!(
+        write2_result.is_err(),
+        "a write parked on backpressure must reject when the writable is aborted, got: {write2_result:?}"
     );
 }
 

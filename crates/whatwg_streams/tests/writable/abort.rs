@@ -572,3 +572,81 @@ async fn abort_succeeds_despite_write_rejection() {
     assert!(write_result.is_err(), "write must reject");
     assert!(abort_result.is_ok(), "abort must succeed despite write rejection, got: {abort_result:?}");
 }
+
+// WPT: aborting.any.js —
+// "Aborting a WritableStream before it starts should cause the writer's unsettled
+//  ready promise to reject"
+// The promise-identity assertion (writer.ready === readyPromise) is a JS idiom (§1);
+// the behavioural core reproduced here is that the pending ready() and the pending
+// write() both reject when abort() fires before start() has finished.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn abort_before_start_rejects_pending_ready_and_write() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    struct SlowStartSink {
+        release: Arc<Notify>,
+        wrote: Arc<AtomicBool>,
+    }
+
+    impl WritableSink<u32> for SlowStartSink {
+        async fn start(&mut self, _c: &mut WritableStreamDefaultController) -> StreamResult<()> {
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _c: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.wrote.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let release = Arc::new(Notify::new());
+    let wrote = Arc::new(AtomicBool::new(false));
+    // HWM 0 backpressures the stream from the start, so ready() is genuinely pending
+    // (rather than resolving Ok before the async write commits).
+    let stream = WritableStream::builder(SlowStartSink {
+        release: release.clone(),
+        wrote: wrote.clone(),
+    })
+    .strategy(whatwg_streams::CountQueuingStrategy::new(0))
+    .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    let writer = Arc::new(writer);
+
+    // A write and a ready() wait, both pending while start() is still blocked.
+    let w1 = writer.clone();
+    let write_fut = tokio::spawn(async move { w1.write(1u32).await });
+    let w2 = writer.clone();
+    let ready_fut = tokio::spawn(async move { w2.ready().await });
+    let wa = writer.clone();
+    let abort_fut = tokio::spawn(async move { wa.abort(Some("error1".into())).await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Unblock start(); abort now proceeds and errors the stream.
+    release.notify_one();
+
+    let abort_result = abort_fut.await.unwrap();
+    let write_result = write_fut.await.unwrap();
+    let ready_result = ready_fut.await.unwrap();
+
+    assert!(abort_result.is_ok(), "abort() must resolve: {abort_result:?}");
+    assert!(
+        write_result.is_err(),
+        "the pending write() must reject when the stream is aborted before start()"
+    );
+    assert!(
+        ready_result.is_err(),
+        "the pending ready() must reject when the stream is aborted before start()"
+    );
+    assert!(
+        !wrote.load(Ordering::Acquire),
+        "sink write() must not be called for a write aborted before start()"
+    );
+}
