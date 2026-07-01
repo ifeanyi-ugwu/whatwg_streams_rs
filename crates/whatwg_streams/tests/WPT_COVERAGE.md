@@ -81,12 +81,61 @@ generics. No public constructor or prototype chain exists to misuse.
 
 ## Per-file ledger
 
+### `readable-streams/general.any.js` + `default-reader.any.js` + `cancel.any.js`
+
+Covered in `readable/`: single and repeated reads, close/error/cancel propagation, the
+controller `desired_size`/`close`/`enqueue`/`error` guards, and reader-lock exclusivity.
+Added behaviours: two concurrently-pending `read()`s resolve together with `None` on close
+and reject with the same error on error (`two_pending_reads_*`); cancelling before `start()`
+finishes prevents `pull()` from ever running (`cancel_before_start_finishes_prevents_pull`);
+and `desired_size` reflects HWM minus the committed queue depth, not just the empty-queue
+case (`controller_desired_size_reflects_queue_depth`).
+
+`desired_size`'s synchronous per-enqueue decrement and negative overshoot (WPT
+`count-queuing-strategy-integration.any.js`) are **not portable**. `controller.enqueue()` is
+an async channel message the stream task commits later, not a synchronous queue mutation, and
+`pull()` fires only while `desired_size > 0` — so a negative `desired_size` is never surfaced
+through the source API. Only the committed, quiescent depth is observable, which the added
+test pins. `floating-point-total-queue-size.any.js` is untranslatable for the same integer
+reason: the queue total is a `usize` and `QueuingStrategy::size(&T) -> usize`, so the f64
+precision drift and clamp-to-zero it exercises cannot arise. `constructor.any.js` is JS
+constructor-ordering (§6); `read-task-handling` / `templated` are microtask-scheduling and
+harness meta with no binding.
+
 ### `writable-streams/aborting.any.js`
 
-Actionable behaviour is covered in `writable/abort.rs`. The remaining ~47 tests are
+Actionable behaviour is covered in `writable/abort.rs`, including: aborting before `start()`
+finishes rejects both the pending `ready()` and the pending `write()` and never calls the
+sink's `write()` (`abort_before_start_rejects_pending_ready_and_write` — the companion
+`writer.ready === readyPromise` identity assertion is §1). The remaining ~47 tests are
 skipped under categories above: ready-promise state/identity (§1), the `releaseLock`
 family (§2), the `AbortSignal` DOM API in tests 56–65 (§3), thenable returns from
 `abort()` (§4), and `this`-binding checks (§5).
+
+The "abort() rejects with the rejection returned from close()" test is behaviour (abort
+adopting a queued close's rejection), not a §1 promise-identity idiom; it is not yet ported.
+
+### `writable-streams/close.any.js`
+
+Covered in `writable/close.rs`: close drains queued writes first, close on an
+already-closed/errored stream rejects, a second in-flight close rejects, `sink.close()`
+rejection errors the stream, and `abort()` during an in-flight close resolves while the
+stream errors (`abort_during_pending_close_resolves`).
+
+The two "sink calls `controller.error()` while close is in-flight" tests (the error is
+ignored, sync and async) are **untranslatable** for the same reason as transform
+`cancel.any.js` tests 6/7: `WritableSink::close(self)` receives no controller, and
+`WritableStreamDefaultController` is not `Clone`, so a sink cannot hold a controller to call
+`error()` from inside `close()`. A sink `close()` that returns `Err` (the throwing-close
+path) is the expressible analogue and is covered.
+
+### `writable-streams/{count,byte-length,floating-point}-queuing-strategy.any.js`, `reentrant-strategy.any.js`
+
+Count/byte-length strategy construction is exercised by every `CountQueuingStrategy::new`
+call. `floating-point-total-queue-size.any.js` is untranslatable (integer `usize` queue
+total, no f64 drift), and `reentrant-strategy.any.js` falls under the reentrancy-inside-`size()`
+skip (see transform strategies below) — `QueuingStrategy::size(&self, &T) -> usize` is a pure
+function with no stream access.
 
 ### `writable-streams/general.any.js`
 
@@ -119,11 +168,13 @@ every pipe test).
 
 ### `piping/flow-control.any.js`
 
-Covered in `piping/mod.rs`: backpressure block-then-drain and in-order delivery, plus
-piping into a zero-HWM destination — which must read nothing (no read-ahead) and
-reject once the destination errors. The zero-HWM case surfaced a construction bug:
-backpressure was hardcoded off at init, so a fresh HWM-0 writable wrongly reported
-`ready`. The remaining tests overlap the covered backpressure behaviour.
+Covered in `piping/mod.rs`: backpressure block-then-drain and in-order delivery, piping
+into a zero-HWM destination — which must read nothing (no read-ahead) and reject once the
+destination errors — and the read-ahead complement: a HWM > 1 destination is filled ahead,
+so the pipe reads further chunks into the writable queue while the first write is still in
+flight (`pipe_to_reads_ahead_into_hwm_gt_1_destination`). The zero-HWM case surfaced a
+construction bug: backpressure was hardcoded off at init, so a fresh HWM-0 writable wrongly
+reported `ready`. The remaining tests overlap the covered backpressure behaviour.
 
 ### `piping/close-propagation-forward.any.js` + `error-propagation-forward.any.js`
 
@@ -157,13 +208,19 @@ the JS getter/duck-typing checks shared with pipe-through.
 
 ### `piping/close-propagation-backward.any.js` + `error-propagation-backward.any.js`
 
-Backward error propagation — a destination that errors (during or after piping)
-cancels the source, with the reason passed through and rejected-cancel propagated —
-is covered by the existing piping suite. Backward *close* propagation is covered too:
-`pipe_to` into an already-closed (or externally-closed) destination cancels the source
-and rejects — pinned by `pipe_to_closed_dest_cancels_source_and_rejects`. The pipe's own
-close (source exhausted → `writer.close()`) is a separate arm that returns directly, so
-this only affects a destination closed out from under the pipe.
+Backward error propagation — a destination that errors (during or after piping) cancels
+the source, with the reason passed through — is covered by the existing piping suite. When
+that `source.cancel()` itself rejects, its rejection (not the destination's write error) is
+what `pipe_to` rejects with, matching the spec's shutdown-with-action finalize step and the
+already-fixed signal-abort path; this closed a divergence where the non-signal backward path
+discarded the cancel rejection, and is pinned by
+`pipe_to_cancel_rejection_on_dest_error_propagates_backward`. Backward *close* propagation is
+covered too: `pipe_to` into an already-closed (or externally-closed) destination cancels the
+source and rejects — with a throwing `source.cancel()` surfacing its rejection, pinned by
+`pipe_to_cancel_rejection_on_dest_close_propagates_backward` — see also
+`pipe_to_closed_dest_cancels_source_and_rejects`. The pipe's own close (source exhausted →
+`writer.close()`) is a separate arm that returns directly, so this only affects a destination
+closed out from under the pipe.
 
 ### `piping/multiple-propagation.any.js`
 
@@ -194,7 +251,13 @@ distinct Rust behaviour.
 Backpressure, cancel/abort propagation, terminate, and flush behaviour are covered by
 the existing transform suite. (Note: backpressure's "writer.closed should resolve after
 readable is canceled" tests assert a *rejection* in their bodies — the title is a WPT
-naming quirk — matching the covered reject-on-cancel behaviour.)
+naming quirk — matching the covered reject-on-cancel behaviour.) Added: a write parked on
+readable backpressure rejects when the writable is aborted (`errors.any.js` — the abort-side
+complement to the covered cancel-side `readable_cancel_clears_backpressure_and_closes_writer`),
+pinned by `abort_rejects_write_parked_on_backpressure`; and when `writable.close()` wins a
+race with a parallel `readable.cancel()`, `flush()` runs, `transformer.cancel()` is not
+called, and both sides resolve cleanly (`flush.any.js` — `close_flush_wins_over_parallel_cancel`),
+the close-wins counterpart to the cancel-wins `close_rejects_when_parallel_cancel_throws`.
 
 `strategies.any.js`: the default strategies are spec-correct — writable HWM 1, readable
 HWM 0 — verified by `default_strategy_hwms`. (The readable default was previously HWM 1;
@@ -231,7 +294,7 @@ This collapses the spec's BYOBRequest machinery. There is no `byobRequest`,
 `respond()`, `respondWithNewView()`, or `autoAllocateChunkSize`, and no
 `ArrayBuffer`/`TypedArray` object model. So the large majority of
 `general.any.js` (85), and all of `bad-buffers-and-views`,
-`enqueue-with-detached-buffer`, `non-transferable-buffers`, and
+`enqueue-with-detached-buffer`, `non-transferable-buffers`, `respond-after-enqueue`, and
 `construct-byob-request`, have no Rust API surface — they test buffer detaching,
 transferable buffers, view element types (`Uint16Array`/`Uint32Array`),
 `respond`/`respondWithNewView` ordering, and direct BYOBReader construction.
@@ -278,3 +341,10 @@ source into the transform's writable). Skipped: duck-typed pass-through (JS stru
 typing of `{readable, writable}`); unhandled-rejection accounting; not-calling-`pipeTo`
 on the prototype; getter rethrow / option-getter side effects; and the locked-`this`
 check (the readable is consumed by move).
+
+`piping/transform-streams.any.js` (identity-transform close propagation) reduces to the
+covered `pipe_through_close_propagates`. `piping/general-addition.any.js` (enqueue must not
+synchronously drive the write algorithm) is implicit in the async pipe model. `piping/
+throwing-options.any.js` and `piping/then-interception.any.js` are whole-file skips —
+throwing option getters / getter-evaluation order (`StreamPipeOptions` is a plain bool
+struct) and `Object.prototype.then` thenable scheduling, respectively.
