@@ -449,8 +449,13 @@ where
                 // from the *previous* iteration's fire-and-forget write, if they have
                 // already propagated by the time we loop back).
                 if let Err(write_err) = writer.ready().await {
+                    // Spec shutdown-with-action: cancel the source; a rejected cancel
+                    // takes precedence over the write error as the pipe's rejection
+                    // (finalize(r)), otherwise reject with the original write error.
                     if !options.prevent_cancel {
-                        let _ = reader.cancel(Some(write_err.to_string())).await;
+                        if let Err(cancel_err) = reader.cancel(Some(write_err.to_string())).await {
+                            return Err(cancel_err);
+                        }
                     }
                     return Err(write_err);
                 }
@@ -473,9 +478,15 @@ where
                         c = closed_fut => {
                             match c {
                                 Err(write_err) => {
-                                    // A prior write errored the stream while source blocked
+                                    // A prior write errored the stream while source blocked.
+                                    // Shutdown-with-action: a rejected source.cancel() takes
+                                    // precedence over the write error (spec finalize(r)).
                                     if !options.prevent_cancel {
-                                        let _ = reader.cancel(Some(write_err.to_string())).await;
+                                        if let Err(cancel_err) =
+                                            reader.cancel(Some(write_err.to_string())).await
+                                        {
+                                            return Err(cancel_err);
+                                        }
                                     }
                                     return Err(write_err);
                                 }
