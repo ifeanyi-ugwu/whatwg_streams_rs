@@ -348,3 +348,116 @@ synchronously drive the write algorithm) is implicit in the async pipe model. `p
 throwing-options.any.js` and `piping/then-interception.any.js` are whole-file skips —
 throwing option getters / getter-evaluation order (`StreamPipeOptions` is a plain bool
 struct) and `Object.prototype.then` thenable scheduling, respectively.
+
+## Exhaustive file-level accounting
+
+A test-by-test pass over the entire live WPT streams suite confirmed every file is
+accounted for. The per-area sections above cover the primary files; the remainder are
+listed here with their disposition so nothing is silently missing.
+
+### Known behavioural divergences
+
+Two portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test
+asserting the spec-correct outcome, kept as executable documentation:
+
+- **transform `errors.any.js`: an exception from `transform()` after `terminate()` must
+  error the readable with the thrown error.** The readable closes eagerly on `terminate()`
+  even with a chunk still queued, so the following `error()` is a no-op and the readable
+  closes cleanly instead of erroring. The spec keeps the stream `readable` (closing) until
+  the queue drains, so a later `error()` still applies. The fix is to defer the readable's
+  `Closed` transition until the queue drains — a core change with wide blast radius
+  (`closed()` timing when data is queued at close). Test:
+  `transform_throw_after_terminate_errors_readable`.
+- **writable `error.any.js`: a surplus `controller.error()` must be a no-op (first error
+  wins).** The `ControllerMsg::Error` handler overwrites the stored error unconditionally
+  (last-wins). A naive first-wins guard regresses the `controller.error()`-then-write-
+  rejection case (currently spec-correct: the write promise carries its own error while the
+  stored error is the controller's), because both paths share the handler and depend on
+  async message ordering. A correct fix needs cross-path first-wins error precedence. Test:
+  `surplus_controller_error_is_noop_first_wins`.
+
+Related accepted decision: writable `abort()` during an in-flight *rejecting* `close()`
+(WPT "abort() should be rejected with the rejection returned from close()") falls under the
+already-accepted abort-during-close divergence (see
+`abort() during close skips sink.abort()` — abort resolves and `sink.abort()` is not
+called). Not re-litigated here.
+
+### Writable files
+
+- `start.any.js` — covered in `writable/start.rs` (write/close deferred until start; start
+  rejection errors the stream; `controller.error()` during start).
+- `constructor.any.js` — controller-to-`start`/`write` and HWM→desiredSize covered;
+  controller-not-to-`close` is structural (`close(self)` takes no controller); the rest are
+  §6 constructor/brand and Infinity-HWM (HWM is `usize`).
+- `error.any.js` — `controller.error()` errors the stream (covered); surplus-error first-wins
+  is the divergence above; `error()` on a closed/errored stream is untranslatable (no
+  controller survives the terminal transition; controller is not `Clone`).
+- `bad-underlying-sinks.any.js` — throwing `close`/`write`/`abort` → reject (covered in
+  close/write/abort.rs); constructor getter-throws and non-function props are §6.
+- `bad-strategies.any.js` — whole-file skip: `size` is infallible `-> usize`, HWM is `usize`;
+  throwing getters are §6.
+- `properties.any.js` — whole-file skip: sink-method arity is fixed by the trait signature
+  (this file is the direct evidence `close()` takes zero args); §6 prototype.
+- `garbage-collection.any.js` — whole-file skip: no GC; "stays alive while a write is pending"
+  is a structural property of the ownership model (`SharedPtr` holds the task).
+
+### Transform files
+
+- `lipfuzz.any.js` — whole-file skip: a concrete JS string-substitution transform over 20
+  vectors; its passthrough + flush-emits-remainder core is already covered.
+- `properties.any.js` — whole-file skip: arg-count / prototype-chain introspection.
+- `patched-global.any.js` — whole-file skip: constructor must avoid patched globals and
+  `Object.prototype` setters.
+- `invalid-realm.tentative.window.js` — whole-file skip: detached-realm lifetime; no analogue.
+
+### Byte-stream files (plus count corrections)
+
+- `patched-global.any.js` — whole-file skip: a patched `then()` observing `byobRequest`.
+- `owning-type.tentative.any.js` (and the `-message-port` / `-video-frame` siblings) — the
+  successor to the now-removed `owning-byte-source.any.js`; whole-file skip: the tentative
+  owning type + `ArrayBuffer` transfer (Rust already moves owned bytes by value).
+- `templated.any.js` — behaviourally covered (empty/closed/errored reads via the byte suite);
+  harness meta otherwise.
+- Count corrections to the byte section above: `general.any.js` is **101** tests (not "85");
+  `construct-byob-request.any.js` is a **16**-case matrix (not one test). Both remain
+  whole-file / near-whole-file skips (buffer model).
+
+### Readable files
+
+- `bad-strategies.any.js` — whole-file skip: infallible `size -> usize`, `usize` HWM (same
+  bucket as the writable equivalent).
+- `bad-underlying-sources.any.js` — throwing `pull`/`cancel` and enqueue/close-after-terminal
+  are covered; throwing getters are §6.
+- `from.any.js`, `async-iterator.any.js` — whole-file skip: `ReadableStream.from` and the
+  async-iterator protocol have no Rust surface.
+- `patched-global.any.js`, `garbage-collection.any.js`, `read-task-handling.window.js` —
+  whole-file skip: patched globals / GC timing / browser microtask-scope.
+- top-level `queuing-strategies.any.js` — ported by `queuing_strategies/mod.rs` (Count
+  `size == 1`, ByteLength `size == chunk len`, valid-HWM construction); the JS
+  function-object introspection is §6.
+- `crashtests/*`, `cross-realm-*`, `idlharness.any.js`, `owning-type*.tentative.*` — out of
+  scope (crash regressions / cross-realm / IDL harness / tentative features).
+
+### Identified portable gaps not yet ported
+
+Distinct spec behaviours the audit surfaced that are neither covered nor a documented skip,
+kept here so the accounting is complete (candidates for a future pass):
+
+- piping `close-propagation-forward`: erroring the writable while flushing queued writes must
+  error `pipeTo` (an in-flight `write()` rejects *during* the close sequence).
+- piping `error-propagation-backward`: when the final write rejects after the source has
+  already closed, the pipe rejects but must not cancel the already-closed readable.
+- piping `abort`: a late signal is a no-op after the *readable* errored with pending writes,
+  and after the *writable* errored (only the readable-errored, no-pending-writes branch is
+  covered).
+- readable `tee`: the coordinator's pull-scheduling bound ("pull only to fill the emptiest
+  branch queue"; stop pulling once the source errors) — tied to the `BackpressureMode`
+  extension's semantics.
+- byte `general`: a parked byte `read()` then `error()`; `desired_size == 0` when closed
+  (both low-value — shared code paths already covered generically).
+
+### Stale test-comment labels (no coverage impact)
+
+The piping test module uses section headers `error-propagation-via-abort.any.js` /
+`error-propagation-via-cancel.any.js`; the real WPT files are `error-propagation-forward` /
+`-backward`. Labels only.
