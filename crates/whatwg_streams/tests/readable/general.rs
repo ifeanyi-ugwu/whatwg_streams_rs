@@ -587,6 +587,61 @@ async fn controller_desired_size_reflects_queue_depth() {
     assert_eq!(reader.read().await.unwrap(), Some(1));
 }
 
+// WPT: general.any.js —
+// "should call pull after enqueueing from inside pull (with no read requests), if the
+//  strategy allows"
+// pull() is driven autonomously by desired_size, not only by reads: with HWM 4 and one
+// enqueue per pull and no reads, pull fires until desired_size reaches 0 — exactly 4
+// times, then stops (does not spin past the HWM).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pull_loops_autonomously_until_hwm_with_no_reads() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    struct CountingPullSource {
+        pulls: Arc<AtomicU32>,
+        next: u32,
+    }
+    impl ReadableSource<u32> for CountingPullSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            self.next += 1;
+            controller.enqueue(self.next)?;
+            Ok(())
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let _stream = ReadableStream::builder(CountingPullSource {
+        pulls: pulls.clone(),
+        next: 0,
+    })
+    .strategy(CountQueuingStrategy::new(4))
+    .spawn(tokio::spawn);
+
+    // No reads issued: pull is driven purely by backpressure until the HWM is reached.
+    for _ in 0..64 {
+        if pulls.load(Ordering::Acquire) >= 4 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    // Give any surplus pull a chance to (wrongly) fire before asserting the exact count.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        4,
+        "pull must fire exactly HWM times autonomously (until desired_size hits 0), then stop"
+    );
+}
+
 // ── controller edge cases ─────────────────────────────────────────────────────
 
 // "ReadableStreamDefaultController: calling close() twice is a no-op on the second call"

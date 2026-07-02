@@ -473,6 +473,80 @@ async fn write_rejection_clears_pending_queue_and_close() {
     assert!(pending_close.is_err(), "a pending close must reject when an earlier write fails");
 }
 
+// WPT: write.any.js —
+// "writer.write(), ready and closed reject with the error passed to controller.error()
+//  made before sink.write rejection"
+// The write() promise carries the sink's own returned error, but the stream's stored
+// error (ready/closed) is the earlier controller.error() value — the first error wins.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_before_write_rejection_wins_stream_error() {
+    struct ErrThenReturnErrSink;
+    impl WritableSink<u32> for ErrThenReturnErrSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            controller.error("error1".into());
+            Err("error2".into())
+        }
+    }
+
+    let stream = WritableStream::builder(ErrThenReturnErrSink).spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    let write_err = writer.write(1u32).await.expect_err("write() must reject");
+    assert!(
+        write_err.to_string().contains("error2"),
+        "write() rejects with the sink's returned error, got: {write_err}"
+    );
+
+    let closed_err = writer.closed().await.expect_err("closed() must reject on the errored stream");
+    assert!(
+        closed_err.to_string().contains("error1"),
+        "the stream's stored error is the controller.error() value (first error wins), got: {closed_err}"
+    );
+}
+
+// WPT: error.any.js — "surplus calls to controller.error() should be a no-op"
+// The first error wins; a second controller.error() does not overwrite the stored error.
+//
+// KNOWN DIVERGENCE (ignored): the ControllerMsg::Error handler overwrites the stored
+// error unconditionally, so a second controller.error() wins ("last wins" instead of
+// "first wins"). A naive first-wins guard regresses the controller.error()-then-write-
+// rejection case (which is currently spec-correct), because both error paths share the
+// handler and depend on async message ordering. A correct fix must make stored_error
+// first-wins across both the controller and write-rejection paths while each write
+// promise still carries its own error. Documented in WPT_COVERAGE.md.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "known divergence: surplus controller.error() overwrites (last-wins) instead of first-wins; correct fix needs cross-path error-precedence rework (see WPT_COVERAGE.md)"]
+async fn surplus_controller_error_is_noop_first_wins() {
+    struct DoubleErrorSink;
+    impl WritableSink<u32> for DoubleErrorSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            controller.error("first".into());
+            controller.error("second".into());
+            Ok(())
+        }
+    }
+
+    let stream = WritableStream::builder(DoubleErrorSink).spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    let _ = writer.write(1u32).await;
+
+    let closed_err = writer.closed().await.expect_err("closed() must reject");
+    assert!(
+        closed_err.to_string().contains("first"),
+        "the first controller.error() wins; the surplus call is a no-op, got: {closed_err}"
+    );
+}
+
 // Skipped from write.any.js — untranslatable to the Rust API, not coverage gaps:
 //
 // - "writing to a released writer should reject": release_lock(self) consumes the

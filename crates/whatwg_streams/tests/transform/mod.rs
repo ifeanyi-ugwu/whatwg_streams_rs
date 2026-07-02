@@ -1602,3 +1602,56 @@ async fn default_strategy_hwms() {
         "default readable strategy is HWM 0"
     );
 }
+
+// WPT: errors.any.js —
+// "an exception from transform() should error the stream if terminate has been
+//  requested but not completed"
+// transform() enqueues, terminates, then throws; the thrown error must win — the
+// readable errors with it rather than closing cleanly from the terminate.
+//
+// KNOWN DIVERGENCE (ignored): the readable closes eagerly on terminate() even with a
+// chunk still queued, so the subsequent error() is a no-op and the readable closes
+// cleanly instead of erroring. The spec keeps the stream `readable` (closing) until the
+// queue drains, so a later error() still applies. Fixing this requires deferring the
+// readable's `Closed` transition until the queue drains — a core change with wide blast
+// radius (closed() timing when data is queued at close). Documented in WPT_COVERAGE.md.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "known divergence: eager readable close on terminate() swallows a following transform error; needs deferred-close rework (see WPT_COVERAGE.md)"]
+async fn transform_throw_after_terminate_errors_readable() {
+    struct ThrowAfterTerminateT;
+
+    impl Transformer<u32, u32> for ThrowAfterTerminateT {
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)?;
+            controller.terminate()?;
+            Err("transform boom".into())
+        }
+    }
+
+    let ts = TransformStream::builder(ThrowAfterTerminateT)
+        .readable_strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    // The write triggers transform(), which enqueues, terminates, then throws.
+    let write_result = writer.write(1u32).await;
+    assert!(
+        write_result.is_err(),
+        "write() must reject with the thrown error, got: {write_result:?}"
+    );
+
+    // The readable must surface the transform error, not close cleanly. reader.closed()
+    // rejects on an errored stream and resolves Ok on a cleanly-closed one.
+    let closed = reader.closed().await;
+    assert!(
+        closed.is_err(),
+        "readable must error with the thrown error, not close cleanly, got: {closed:?}"
+    );
+}
