@@ -91,6 +91,16 @@ finishes prevents `pull()` from ever running (`cancel_before_start_finishes_prev
 and `desired_size` reflects HWM minus the committed queue depth, not just the empty-queue
 case (`controller_desired_size_reflects_queue_depth`).
 
+"should only call pull once upon starting the stream" (`pull_called_once_on_idle_started_stream`)
+surfaced and fixed a real busy-loop divergence: an idle started stream (default HWM 1, whose
+`pull()` enqueues nothing) must call `pull()` exactly once and then stop. The pull gate was
+level-triggered on `desired_size > 0`, so it re-fired forever (measured ~25k pulls in 50 ms —
+a pegged core). Fixed by making the gate edge-triggered via a task-local `needs_pull` flag,
+mirroring the spec's `ReadableStreamDefaultControllerCallPullIfNeeded`/`[[pullAgain]]`: armed
+after start, after each enqueue, and after each read's pull steps; consumed when serviced. The
+autonomous HWM-fill loop (`pull_loops_autonomously_until_hwm_with_no_reads`) still holds — an
+enqueueing pull re-arms the flag, which is exactly `[[pullAgain]]`.
+
 `desired_size`'s synchronous per-enqueue decrement and negative overshoot (WPT
 `count-queuing-strategy-integration.any.js`) are **not portable**. `controller.enqueue()` is
 an async channel message the stream task commits later, not a synchronous queue mutation, and
@@ -461,8 +471,6 @@ kept here so the accounting is complete (candidates for a future pass):
 - transform `general`: closing a HWM-0 writable with no reader closes both sides cleanly
   "even with backpressure" (likely already passing via the default HWM-0 close path; a
   one-line variant on `closing_writable_closes_readable` would pin it).
-- readable `general`: `pull()` is called exactly once on an idle started stream (no reads,
-  no enqueue) — the pull-once-after-start lower/upper bound.
 - readable `bad-underlying-sources`: a chunk already committed to the queue is still
   delivered even if the *next* `pull()` throws (the error surfaces only on the later read).
 
