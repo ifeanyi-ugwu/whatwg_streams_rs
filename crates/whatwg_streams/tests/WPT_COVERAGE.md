@@ -455,6 +455,16 @@ kept here so the accounting is complete (candidates for a future pass):
   extension's semantics.
 - byte `general`: a parked byte `read()` then `error()`; `desired_size == 0` when closed
   (both low-value — shared code paths already covered generically).
+- writable `aborting` / `write`: after `abort(reason)`, a later in-flight `write()` that
+  rejects must not overwrite the stored error — `closed()` rejects with the abort reason
+  while the `write()` promise carries its own error (abort/write error precedence).
+- transform `general`: closing a HWM-0 writable with no reader closes both sides cleanly
+  "even with backpressure" (likely already passing via the default HWM-0 close path; a
+  one-line variant on `closing_writable_closes_readable` would pin it).
+- readable `general`: `pull()` is called exactly once on an idle started stream (no reads,
+  no enqueue) — the pull-once-after-start lower/upper bound.
+- readable `bad-underlying-sources`: a chunk already committed to the queue is still
+  delivered even if the *next* `pull()` throws (the error surfaces only on the later read).
 
 ### Stale test-comment labels (no coverage impact)
 
