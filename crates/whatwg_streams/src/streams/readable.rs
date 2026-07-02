@@ -2312,6 +2312,13 @@ async fn readable_stream_task<T: 'static, Source>(
     let mut cancel_future: Option<crate::platform::PlatformBoxFutureStatic<StreamResult<()>>> =
         None;
 
+    // Edge-triggered pull request, mirroring the spec's ReadableStreamDefaultControllerCallPullIfNeeded.
+    // Armed at each spec call site (after start, after an enqueue, after a read's pull steps) and
+    // consumed when the gate services it. Without this, a level-triggered `desired_size > 0` gate
+    // re-pulls forever on a source whose pull() enqueues nothing (busy loop). Starts armed for the
+    // post-start pull.
+    let mut needs_pull = true;
+
     poll_fn(|cx| {
         // Process controller messages first
         while let Poll::Ready(Some(msg)) = ctrl_rx.poll_next_unpin(cx) {
@@ -2333,6 +2340,10 @@ async fn readable_stream_task<T: 'static, Source>(
                         );
                         inner.ready_wakers.wake_all();
                     }
+                    // Enqueue re-arms the pull (spec: enqueue calls CallPullIfNeeded). This is
+                    // what lets an autonomous source pull again after enqueueing while a pull
+                    // was in flight — the analogue of [[pullAgain]].
+                    needs_pull = true;
                 }
                 ControllerMsg::Close => {
                     if inner.state == StreamState::Readable {
@@ -2396,6 +2407,9 @@ async fn readable_stream_task<T: 'static, Source>(
                     } else {
                         inner.pending_reads.push_back(completion);
                     }
+                    // A read's pull steps re-arm the pull (spec: PullSteps calls
+                    // CallPullIfNeeded), whether it dequeued or parked as a pending read.
+                    needs_pull = true;
                 }
                 StreamCommand::Cancel { reason, completion } => {
                     // Spec ReadableStreamCancel: a closed stream resolves with undefined,
@@ -2472,15 +2486,20 @@ async fn readable_stream_task<T: 'static, Source>(
             }
         }
 
-        // Pull data if needed — spec: ReadableStreamDefaultControllerShouldCallPull
-        // fires when desired_size > 0, not just when the queue is empty.
+        // Pull data if needed — spec: ReadableStreamDefaultControllerCallPullIfNeeded.
+        // Edge-triggered: only when a request is armed (needs_pull), never merely because
+        // desired_size stays positive. Servicing the request consumes it — a fresh enqueue,
+        // read, or pull-again re-arms it — so a source whose pull() enqueues nothing is
+        // pulled exactly once, not in a busy loop.
         let current_ds = desired_size.load(std::sync::atomic::Ordering::Acquire);
-        if inner.state == StreamState::Readable
+        if needs_pull
+            && inner.state == StreamState::Readable
             && !inner.pulling
             && !inner.cancel_requested
-            && (current_ds > 0 || !inner.pending_reads.is_empty())
         {
-            if let Some(source) = inner.source.take() {
+            needs_pull = false;
+            if (current_ds > 0 || !inner.pending_reads.is_empty()) && inner.source.is_some() {
+                let source = inner.source.take().unwrap();
                 inner.pulling = true;
                 let mut ctrl = controller.clone();
                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
