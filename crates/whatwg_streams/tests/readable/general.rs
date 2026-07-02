@@ -642,6 +642,48 @@ async fn pull_loops_autonomously_until_hwm_with_no_reads() {
     );
 }
 
+// WPT: general.any.js — "ReadableStream: should only call pull once upon starting the stream"
+// An idle started stream (default HWM 1, pull enqueues nothing) must call pull exactly once:
+// the pull resolves without enqueueing, so nothing sets pullAgain, and it must NOT re-pull
+// while desired_size stays positive. A gate that re-checks desired_size unconditionally after
+// each pull would spin here.
+#[cfg(feature = "send")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_called_once_on_idle_started_stream() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct IdlePullSource {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for IdlePullSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let _stream = ReadableStream::builder(IdlePullSource {
+        pulls: pulls.clone(),
+    })
+    .spawn(tokio::spawn); // default HWM 1
+
+    // No reads, no enqueues: pull fires once to try to fill desired_size, then must stop
+    // (pullAgain was never set). Give the task ample real time to (wrongly) spin.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        1,
+        "pull must be called exactly once on an idle started stream (default HWM 1)"
+    );
+}
+
 // ── controller edge cases ─────────────────────────────────────────────────────
 
 // "ReadableStreamDefaultController: calling close() twice is a no-op on the second call"
