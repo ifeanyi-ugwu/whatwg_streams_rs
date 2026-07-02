@@ -238,6 +238,13 @@ source and rejects — with a throwing `source.cancel()` surfacing its rejection
 `writer.close()`) is a separate arm that returns directly, so this only affects a destination
 closed out from under the pipe.
 
+The mirror case — the *source* is already closed when the destination errors — must NOT cancel
+the source: the last write rejects, `pipe_to` rejects with that write error, and the source's
+`cancel()` is never invoked (cancelling a closed readable is a no-op; `preventCancel` is
+irrelevant). Already correct — the readable's Cancel command short-circuits a `Closed` stream
+without running the source's cancel steps — pinned by
+`pipe_to_last_write_error_does_not_cancel_already_closed_source`.
+
 ### `piping/multiple-propagation.any.js`
 
 Combinations of an errored/closed source with an erroring/errored/closed/closing
@@ -461,8 +468,6 @@ kept here so the accounting is complete (candidates for a future pass):
 
 - piping `close-propagation-forward`: erroring the writable while flushing queued writes must
   error `pipeTo` (an in-flight `write()` rejects *during* the close sequence).
-- piping `error-propagation-backward`: when the final write rejects after the source has
-  already closed, the pipe rejects but must not cancel the already-closed readable.
 - piping `abort`: a late signal is a no-op after the *readable* errored with pending writes,
   and after the *writable* errored (only the readable-errored, no-pending-writes branch is
   covered).
