@@ -684,6 +684,66 @@ async fn pull_called_once_on_idle_started_stream() {
     );
 }
 
+// WPT: bad-underlying-sources.any.js — "read should not error if it dequeues and pull() throws"
+// A read satisfied from the committed queue must resolve with that chunk even though the pull
+// it triggers throws. The error surfaces only via closed() (and later reads); it must not
+// retroactively fail the already-dequeued read.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn read_succeeds_when_dequeue_triggers_throwing_pull() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct DequeueThrowSource {
+        should_throw: Arc<AtomicBool>,
+        enqueued: Arc<tokio::sync::Notify>,
+    }
+    impl ReadableSource<u32> for DequeueThrowSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            if self.should_throw.load(Ordering::Acquire) {
+                return Err("error1".into());
+            }
+            controller.enqueue(0)?;
+            self.enqueued.notify_one();
+            Ok(())
+        }
+    }
+
+    let should_throw = Arc::new(AtomicBool::new(false));
+    let enqueued = Arc::new(tokio::sync::Notify::new());
+    let stream = ReadableStream::builder(DequeueThrowSource {
+        should_throw: should_throw.clone(),
+        enqueued: enqueued.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(1))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Wait until the initial pull has committed chunk 0 (desired_size now 0, so no further
+    // pull fires until a read drains it — the pull-once gate guarantees exactly one).
+    enqueued.notified().await;
+
+    // Arm the throw: the pull the upcoming read's dequeue triggers will now fail.
+    should_throw.store(true, Ordering::Release);
+
+    // The read is satisfied from the queue → resolves with the committed chunk, not an error.
+    assert_eq!(
+        reader.read().await.unwrap(),
+        Some(0),
+        "read that dequeues a committed chunk must succeed even though the follow-up pull throws"
+    );
+
+    // The throwing pull errors the stream, surfacing only via closed().
+    let err = reader
+        .closed()
+        .await
+        .expect_err("closed() must reject with the pull error");
+    assert!(err.to_string().contains("error1"), "got: {err}");
+}
+
 // ── controller edge cases ─────────────────────────────────────────────────────
 
 // "ReadableStreamDefaultController: calling close() twice is a no-op on the second call"
