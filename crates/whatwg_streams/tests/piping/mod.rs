@@ -555,6 +555,92 @@ async fn pipe_to_dest_error_with_prevent_cancel_skips_source_cancel() {
     );
 }
 
+// WPT: error-propagation-backward.any.js — "becomes errored after piping due to last write;
+// source is closed; preventCancel omitted (but cancel is never called)".
+// The source has already closed by the time the final write rejects, so the backward-error
+// shutdown must reject the pipe with the write error WITHOUT invoking the source's cancel()
+// (cancelling an already-closed readable is a no-op). preventCancel is irrelevant here.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_last_write_error_does_not_cancel_already_closed_source() {
+    use std::sync::{Arc, Mutex};
+
+    struct ClosedSourceCancelTracking {
+        cancel_called: Arc<Mutex<bool>>,
+    }
+    impl ReadableSource<u32> for ClosedSourceCancelTracking {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            controller.enqueue(3)?;
+            controller.close()?;
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Never reached: start() closes the stream, so the pull gate stays shut.
+            Ok(())
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_called.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    struct FailOnValueSink {
+        fail_on: u32,
+        writes: Arc<Mutex<Vec<u32>>>,
+    }
+    impl WritableSink<u32> for FailOnValueSink {
+        async fn write(
+            &mut self,
+            chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.writes.lock().unwrap().push(chunk);
+            if chunk == self.fail_on {
+                Err("error1".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let cancel_called = Arc::new(Mutex::new(false));
+    let source = ReadableStream::builder(ClosedSourceCancelTracking {
+        cancel_called: cancel_called.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let dest = WritableStream::builder(FailOnValueSink {
+        fail_on: 3,
+        writes: writes.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(1))
+    .spawn(tokio::spawn);
+
+    let err = source
+        .pipe_to(&dest, None)
+        .await
+        .expect_err("pipeTo must reject with the last write's error");
+    assert!(err.to_string().contains("error1"), "got: {err}");
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1, 2, 3],
+        "all three chunks are written before the final write rejects"
+    );
+    assert!(
+        !*cancel_called.lock().unwrap(),
+        "source.cancel() must NOT be called — the source is already closed"
+    );
+}
+
 // ── WPT: piping/error-propagation-via-cancel.any.js ──────────────────────────
 
 // "Piping: a slow-closing writable that errors before closing cancels the readable"
