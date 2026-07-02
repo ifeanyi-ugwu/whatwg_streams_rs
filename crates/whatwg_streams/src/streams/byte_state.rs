@@ -697,6 +697,30 @@ where
         reason: Option<String>,
     ) -> crate::platform::PlatformBoxFuture<'a, Result<(), StreamError>> {
         Box::pin(async move {
+            // Spec ReadableStreamCancel terminal-state rules: a closed stream
+            // resolves, an errored stream rejects with its stored error, and neither
+            // runs the source's cancel algorithm.
+            if self.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if self.errored.load(Ordering::Acquire) {
+                return Err(self
+                    .error
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "Stream errored".into()));
+            }
+
+            // Spec byte-controller cancel steps reset the queue; then close the
+            // readable (ReadableStreamClose): settle pending BYOB reads with EOF,
+            // resolve closed(), and mark closed so later reads return EOF rather than
+            // returning stale buffered bytes or stranding.
+            {
+                self.buffer.lock().clear();
+                self.queue_total_size.store(0, Ordering::Release);
+            }
+            self.close();
+
             // Take the source out under lock (synchronously)
             let source_opt = self.source.lock().take();
 

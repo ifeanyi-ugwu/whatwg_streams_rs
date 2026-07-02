@@ -2032,15 +2032,8 @@ where
     }
 
     pub async fn cancel(&self, reason: Option<String>) -> StreamResult<()> {
-        if self.is_byte_stream() {
-            self.0
-                .byte_state
-                .as_ref()
-                .unwrap()
-                .cancel_source(reason.clone())
-                .await?
-        }
-
+        // Byte and default streams both route through their task's Cancel handler,
+        // which applies the spec terminal-state rules and closes the stream.
         let (tx, rx) = oneshot::channel();
         self.0
             .command_tx
@@ -2153,16 +2146,18 @@ where
     }
 
     pub async fn cancel(&self, reason: Option<String>) -> Result<(), StreamError> {
-        if let Some(byte_state_arc) = &self.0.byte_state {
-            // call the trait object's cancel_source helper
-            byte_state_arc
-                .cancel_source(reason)
-                .await
-                .map_err(|e| e.into())
-        } else {
-            // Already canceled or closed
-            Ok(())
-        }
+        // Route through the byte task's Cancel handler, which runs after start_source
+        // has completed — cancelling the source directly here can race task startup and
+        // leave a read gated on start-ready forever.
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .command_tx
+            .unbounded_send(StreamCommand::Cancel {
+                reason,
+                completion: tx,
+            })
+            .map_err(|_| StreamError::TaskDropped)?;
+        rx.await.unwrap_or_else(|_| Err(StreamError::TaskDropped))
     }
 
     pub async fn read(&self, buf: &mut [u8]) -> StreamResult<usize> {
@@ -2692,8 +2687,13 @@ async fn readable_byte_stream_task<Source>(
                     }
                     Some(StreamCommand::Cancel { reason, completion }) => {
                         let cancel_result = byte_state.cancel_source(reason).await;
+                        // cancel_source closed the stream; resolve reads already queued
+                        // in this task with EOF, and keep the task alive so later reads
+                        // also get EOF rather than a dropped-task error.
+                        while let Some(tx) = pending_reads.pop_front() {
+                            let _ = tx.send(Ok(None));
+                        }
                         let _ = completion.send(cancel_result);
-                        break;
                     }
                     Some(_) => {}
                     None => {

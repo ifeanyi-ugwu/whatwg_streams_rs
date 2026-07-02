@@ -243,6 +243,71 @@ async fn byob_cancel_calls_source_cancel() {
     assert_eq!(cancel_reason.lock().unwrap().as_deref(), Some("done"));
 }
 
+// Non-WPT (library-specific): canceling a byte stream must close it — the spec's
+// ReadableStreamCancel runs ReadableStreamClose, so closed() resolves and later reads
+// return EOF instead of hanging or erroring.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_closes_byte_stream_default_reader() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"abc".to_vec(), b"def".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    reader.cancel(Some("stop".into())).await.unwrap();
+    // A read after cancel must return EOF, not a dropped-task error.
+    assert_eq!(reader.read().await.unwrap(), None, "read after cancel must be EOF");
+    // closed() must resolve, not hang.
+    reader.closed().await.unwrap();
+}
+
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_closes_byte_stream_byob_reader() {
+    let source = ChunkedByteSource {
+        chunks: vec![b"abc".to_vec()],
+        index: Default::default(),
+        cancel_reason: Default::default(),
+    };
+    let stream = ReadableStream::builder_bytes(source).spawn(tokio::spawn);
+    let (_locked, byob) = stream.get_byob_reader().unwrap();
+
+    byob.cancel(None).await.unwrap();
+    // A BYOB read after cancel must return EOF (0 bytes), not hang.
+    let mut buf = [0u8; 8];
+    assert_eq!(byob.read(&mut buf).await.unwrap(), 0, "BYOB read after cancel must be EOF");
+    byob.closed().await.unwrap();
+}
+
+// Spec ReadableStreamCancel: cancel on an errored byte stream rejects with the stored
+// error (contrast the closed case, which resolves).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_on_errored_byte_stream_rejects() {
+    struct ErroringByteSource;
+    impl ReadableByteSource for ErroringByteSource {
+        async fn pull(&mut self, _c: &mut ReadableByteStreamController) -> StreamResult<()> {
+            Err("byte boom".into())
+        }
+    }
+
+    let stream = ReadableStream::builder_bytes(ErroringByteSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    assert!(reader.read().await.is_err(), "read must surface the pull error");
+
+    let err = reader
+        .cancel(None)
+        .await
+        .expect_err("cancel on an errored byte stream must reject");
+    assert!(
+        err.to_string().contains("byte boom"),
+        "cancel must reject with the stored error, got: {err}"
+    );
+}
+
 // ── Trait integrations (library-specific — Rust traits, no WPT equivalent) ──────
 
 // AsyncRead: reads bytes to end through the futures::AsyncRead impl
