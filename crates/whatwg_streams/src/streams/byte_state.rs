@@ -515,7 +515,10 @@ where
     }
 
     pub fn desired_size(&self) -> Option<isize> {
-        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
+        // Spec ReadableByteStreamControllerGetDesiredSize: an errored controller reports null; a
+        // closed one reports 0 (update_desired_size stores 0 on close). Only errored collapses to
+        // None — closing must stay distinguishable from erroring.
+        if self.errored.load(Ordering::Acquire) {
             None
         } else {
             Some(self.desired_size.load(Ordering::Acquire))
