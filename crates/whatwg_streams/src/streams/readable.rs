@@ -2639,6 +2639,20 @@ async fn readable_byte_stream_task<Source>(
                                 let _ = completion.send(Ok(None));
                             }
                         }
+
+                        // The source may error via controller.error() while pull() still returns
+                        // Ok. That doesn't hit the Err arm below, so parked reads must be rejected
+                        // here or they strand forever.
+                        if byte_state.errored.load(std::sync::atomic::Ordering::Acquire) {
+                            let error = byte_state
+                                .error
+                                .lock()
+                                .clone()
+                                .unwrap_or_else(|| "Stream errored".into());
+                            while let Some(completion) = pending_reads.pop_front() {
+                                let _ = completion.send(Err(error.clone()));
+                            }
+                        }
                     }
                     Err(err) => {
                         byte_state.error(err.clone());
