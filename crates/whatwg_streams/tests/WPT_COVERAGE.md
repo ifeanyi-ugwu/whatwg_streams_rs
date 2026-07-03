@@ -265,7 +265,10 @@ backpressure, and desiredSize. Added: a flush() error errors both sides; a start
 rejection errors the stream; the writable abort() reason reaches the readable error;
 close() waits for an in-flight transform before closing the readable; and enqueue()
 after terminate() is rejected. All passed — the transform error and ordering paths
-hold.
+hold. Also pinned: closing the writable with no queued chunks closes the readable
+even under readable-side backpressure (explicit readable HWM 0), via
+`closing_writable_closes_readable_under_backpressure` — the explicit-backpressure
+complement to `closing_writable_closes_readable` (which relies on the spec-default HWM 0).
 
 Skipped: identity-default construction (the trait requires a transform method);
 method-as-method / `.apply`-`.call` `this`-binding; the `readableType`/`writableType`
@@ -483,9 +486,6 @@ kept here so the accounting is complete (candidates for a future pass):
 - writable `aborting` / `write`: after `abort(reason)`, a later in-flight `write()` that
   rejects must not overwrite the stored error — `closed()` rejects with the abort reason
   while the `write()` promise carries its own error (abort/write error precedence).
-- transform `general`: closing a HWM-0 writable with no reader closes both sides cleanly
-  "even with backpressure" (likely already passing via the default HWM-0 close path; a
-  one-line variant on `closing_writable_closes_readable` would pin it).
 
 ### Stale test-comment labels (no coverage impact)
 
