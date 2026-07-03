@@ -337,6 +337,15 @@ BYOB read with a view smaller than the queued data serving the remainder on the 
 read, and the controller's post-close guards. The last surfaced a fix: `close()` now
 rejects on an already-closed stream (it had returned Ok), matching `enqueue()`.
 
+`general.any.js` "desiredSize when closed/errored" and "read(), then error()" each surfaced a
+divergence, now fixed. (1) A closed byte controller reported `desiredSize` `null`; the spec
+distinguishes closed → `0` from errored → `null`, so `desired_size()` now collapses to `None`
+only when errored (`byte_controller_desired_size_is_zero_when_closed`,
+`byte_controller_desired_size_is_none_when_errored`). (2) A byte `read()` parked with no data
+stranded forever when the source errored via `controller.error()` while its `pull()` still
+returned `Ok` — the task drained parked reads only on enqueue/close/`pull()`-`Err`. It now
+rejects them when the pull leaves the stream errored (`byte_parked_read_then_error_rejects`).
+
 `read-min.any.js` (`read(view, {min})`) is skipped as untranslatable. The `{min}`
 option resolves a BYOB read only once at least N bytes are filled; both endpoints it
 spans are already reachable — `byob.read(&mut buf)` resolves on the first partial fill
@@ -481,8 +490,6 @@ kept here so the accounting is complete (candidates for a future pass):
 - readable `tee`: the coordinator's pull-scheduling bound ("pull only to fill the emptiest
   branch queue"; stop pulling once the source errors) — tied to the `BackpressureMode`
   extension's semantics.
-- byte `general`: a parked byte `read()` then `error()`; `desired_size == 0` when closed
-  (both low-value — shared code paths already covered generically).
 - writable `aborting` / `write`: after `abort(reason)`, a later in-flight `write()` that
   rejects must not overwrite the stored error — `closed()` rejects with the abort reason
   while the `write()` promise carries its own error (abort/write error precedence).
