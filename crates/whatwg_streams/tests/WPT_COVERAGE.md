@@ -200,6 +200,12 @@ cover the one behaviour those did not: shutdown must wait for an in-flight write
 drain before closing (close-forward) or aborting (error-forward) the destination —
 the pipe's `ready()` gate enforces this.
 
+The close-forward tail case is also pinned: when the source has already closed and the pipe is
+flushing pending writes before closing the destination, an in-flight write that *rejects* mid-
+flush errors `pipe_to` with that write error, leaves the already-closed source uncancelled, and
+dispatches no further chunks to the sink
+(`pipe_to_in_flight_write_error_during_close_flush_errors_pipe`).
+
 These files are large because they cross every prevent-option permutation with
 fulfilled/rejected promises and three source timings. The behaviourally distinct
 cases reduce to a handful: "starts closed" collapses to the empty-source close test,
@@ -466,8 +472,6 @@ called). Not re-litigated here.
 Distinct spec behaviours the audit surfaced that are neither covered nor a documented skip,
 kept here so the accounting is complete (candidates for a future pass):
 
-- piping `close-propagation-forward`: erroring the writable while flushing queued writes must
-  error `pipeTo` (an in-flight `write()` rejects *during* the close sequence).
 - piping `abort`: a late signal is a no-op after the *readable* errored with pending writes,
   and after the *writable* errored (only the readable-errored, no-pending-writes branch is
   covered).
