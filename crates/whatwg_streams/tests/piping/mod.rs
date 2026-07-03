@@ -641,6 +641,102 @@ async fn pipe_to_last_write_error_does_not_cancel_already_closed_source() {
     );
 }
 
+// WPT: close-propagation-forward.any.js — "erroring the writable while flushing pending writes
+// should error pipeTo". The source is closed with chunks still queued in the destination, so the
+// pipe is waiting for pending writes to flush before closing the dest. An in-flight write that
+// rejects during that flush must reject pipeTo with the write error, leave the already-closed
+// source uncancelled, and dispatch no further chunks to the sink.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_in_flight_write_error_during_close_flush_errors_pipe() {
+    use std::sync::{Arc, Mutex};
+
+    struct ClosedSource {
+        cancel_called: Arc<Mutex<bool>>,
+    }
+    impl ReadableSource<u32> for ClosedSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            controller.close()?;
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_called.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    // First write blocks until the test fires `reject`, then fails — modelling a write that is
+    // still in flight when the pipe reaches its close-flush phase.
+    struct BlockThenRejectSink {
+        writes: Arc<Mutex<Vec<u32>>>,
+        write_started: Arc<tokio::sync::Notify>,
+        reject: Arc<tokio::sync::Notify>,
+    }
+    impl WritableSink<u32> for BlockThenRejectSink {
+        async fn write(
+            &mut self,
+            chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.writes.lock().unwrap().push(chunk);
+            self.write_started.notify_one();
+            self.reject.notified().await;
+            Err("error1".into())
+        }
+    }
+
+    let cancel_called = Arc::new(Mutex::new(false));
+    let source = ReadableStream::builder(ClosedSource {
+        cancel_called: cancel_called.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let write_started = Arc::new(tokio::sync::Notify::new());
+    let reject = Arc::new(tokio::sync::Notify::new());
+    // HWM 3 so both chunks are accepted into the destination without backpressure blocking the
+    // pipe's reads; the source is then observed as closed while write(1) is still in flight.
+    let dest = WritableStream::builder(BlockThenRejectSink {
+        writes: writes.clone(),
+        write_started: write_started.clone(),
+        reject: reject.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(3))
+    .spawn(tokio::spawn);
+
+    let pipe = tokio::spawn(async move { source.pipe_to(&dest, None).await });
+
+    // Wait until the first write is in flight, then reject it mid-flush.
+    write_started.notified().await;
+    reject.notify_one();
+
+    let err = pipe
+        .await
+        .unwrap()
+        .expect_err("pipeTo must reject with the in-flight write's error");
+    assert!(err.to_string().contains("error1"), "got: {err}");
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![1],
+        "only the first chunk reaches the sink; the second is never dispatched after the error"
+    );
+    assert!(
+        !*cancel_called.lock().unwrap(),
+        "source.cancel() must NOT be called — the source is already closed"
+    );
+}
+
 // ── WPT: piping/error-propagation-via-cancel.any.js ──────────────────────────
 
 // "Piping: a slow-closing writable that errors before closing cancels the readable"
