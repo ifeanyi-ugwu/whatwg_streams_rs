@@ -1,7 +1,8 @@
 // WPT: streams/readable-streams/byte-source.any.js
 
 use whatwg_streams::{
-    Bytes, BytesMut, ReadableByteSource, ReadableByteStreamController, ReadableStream, StreamResult,
+    ByteLengthQueuingStrategy, Bytes, BytesMut, ReadableByteSource, ReadableByteStreamController,
+    ReadableStream, StreamResult,
 };
 
 struct ChunkedByteSource {
@@ -649,4 +650,142 @@ async fn read_owned_pipelined_reads_served_in_order() {
     let (b, nb) = rb.unwrap();
     assert_eq!(&a[..na], b"aa");
     assert_eq!(&b[..nb], b"bb");
+}
+
+// WPT: readable-byte-streams/general.any.js — "desiredSize when closed".
+// A closed byte controller reports desiredSize 0 (not null); only an errored one reports null.
+// desired_size() previously returned None for both, dropping the closed → 0 distinction.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_controller_desired_size_is_zero_when_closed() {
+    use std::sync::{Arc, Mutex};
+
+    struct Probe {
+        initial: Arc<Mutex<Option<isize>>>,
+        after_close: Arc<Mutex<Option<isize>>>,
+    }
+    impl ReadableByteSource for Probe {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            *self.initial.lock().unwrap() = controller.desired_size();
+            controller.close()?;
+            *self.after_close.lock().unwrap() = controller.desired_size();
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let initial = Arc::new(Mutex::new(None));
+    let after_close = Arc::new(Mutex::new(None));
+    let stream = ReadableStream::builder_bytes(Probe {
+        initial: initial.clone(),
+        after_close: after_close.clone(),
+    })
+    .strategy(ByteLengthQueuingStrategy::new(10))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // drive the task so start() runs to completion
+
+    assert_eq!(
+        *initial.lock().unwrap(),
+        Some(10),
+        "desiredSize must start at the highWaterMark"
+    );
+    assert_eq!(
+        *after_close.lock().unwrap(),
+        Some(0),
+        "after closing, desiredSize must be 0 (not null)"
+    );
+}
+
+// WPT: readable-byte-streams/general.any.js — "desiredSize when errored".
+// An errored byte controller reports desiredSize null.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_controller_desired_size_is_none_when_errored() {
+    use std::sync::{Arc, Mutex};
+
+    struct Probe {
+        after_error: Arc<Mutex<Option<isize>>>,
+        captured: Arc<Mutex<bool>>,
+    }
+    impl ReadableByteSource for Probe {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            controller.error("boom".into())?;
+            *self.after_error.lock().unwrap() = controller.desired_size();
+            *self.captured.lock().unwrap() = true;
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let after_error = Arc::new(Mutex::new(Some(999)));
+    let captured = Arc::new(Mutex::new(false));
+    let stream = ReadableStream::builder_bytes(Probe {
+        after_error: after_error.clone(),
+        captured: captured.clone(),
+    })
+    .strategy(ByteLengthQueuingStrategy::new(10))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // drive the task so start() runs
+
+    assert!(*captured.lock().unwrap(), "start() must have run");
+    assert_eq!(
+        *after_error.lock().unwrap(),
+        None,
+        "after erroring, desiredSize must be null"
+    );
+}
+
+// WPT: readable-byte-streams/general.any.js — "read(), then error()".
+// A byte read() parked with no data available must reject once the controller errors.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn byte_parked_read_then_error_rejects() {
+    use std::sync::Arc;
+
+    struct ParkThenError {
+        fire: Arc<tokio::sync::Notify>,
+    }
+    impl ReadableByteSource for ParkThenError {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            self.fire.notified().await;
+            controller.error("error1".into())?;
+            Ok(())
+        }
+    }
+
+    let fire = Arc::new(tokio::sync::Notify::new());
+    let stream = ReadableStream::builder_bytes(ParkThenError { fire: fire.clone() }).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    let read_fut = tokio::spawn(async move { reader.read().await });
+
+    // Let the read park (pull is awaiting the notify), then fire the error.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    fire.notify_one();
+
+    let result = read_fut.await.unwrap();
+    let err = result.expect_err("parked read() must reject once the controller errors");
+    assert!(err.to_string().contains("error1"), "got: {err}");
 }
