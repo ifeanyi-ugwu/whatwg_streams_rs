@@ -142,6 +142,25 @@ async fn closing_writable_closes_readable() {
     assert_eq!(reader.read().await.unwrap(), None);
 }
 
+// WPT: transform-streams/general.any.js —
+// "closing the writable should close the readable when there are no queued chunks, even with
+// backpressure". An explicit readable HWM 0 backpressures the readable from the start; closing
+// the writable with no writes must still close the readable cleanly (nothing is queued to flush).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn closing_writable_closes_readable_under_backpressure() {
+    let ts = TransformStream::builder(DoubleT)
+        .readable_strategy(CountQueuingStrategy::new(0))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_locked, writer) = writable.get_writer().unwrap();
+    let (_locked, reader) = readable.get_reader().unwrap();
+
+    writer.close().await.unwrap();
+    assert_eq!(reader.read().await.unwrap(), None);
+    reader.closed().await.unwrap();
+}
+
 // WPT: transform-streams/errors.any.js —
 // "TransformStream: error in transform() errors both sides"
 #[cfg(feature = "send")]
