@@ -493,6 +493,13 @@ kept here so the accounting is complete (candidates for a future pass):
 - writable `aborting` / `write`: after `abort(reason)`, a later in-flight `write()` that
   rejects must not overwrite the stored error — `closed()` rejects with the abort reason
   while the `write()` promise carries its own error (abort/write error precedence).
+- readable `general` / count-queuing: the **default** controller's `desired_size()` has the
+  same closed → `null` divergence just fixed for byte streams (readable.rs ~166 returns `None`
+  when `closed || errored`; spec: closed → 0, errored → null). Unlike the byte controller, the
+  default `close()` is an async channel message, so the *synchronous* WPT assertion
+  (`desiredSize === 0` right after `c.close()` inside `start()`) is unreachable without making
+  close synchronous; the post-close *observed* value (via a captured controller clone) should
+  still be `0`, not `None`. Fix = mirror the byte one (gate `None` on errored only).
 
 ### Stale test-comment labels (no coverage impact)
 
