@@ -225,6 +225,22 @@ signal's reason propagates into `source.cancel()`, `sink.abort()`, and the `pipe
 rejection — `StreamPipeOptions::signal` is a reason-carrying `AbortSignal`, so the
 pipe forwards the real reason instead of a hardcoded placeholder.
 
+The "abort does nothing after termination" family is split by which side terminated and where
+the pipe is at the time. Covered: abort after the readable errored with a write still pending —
+the readable's error, delivered on the pipe's next read, wins over the late abort, so `pipeTo`
+rejects with it and `preventAbort` keeps the writable usable
+(`pipe_to_late_abort_no_effect_after_readable_errored_with_pending_write`), plus the
+no-pending-writes variant already covered.
+
+Divergence (`#[ignore]`d, asserts the spec outcome): abort after the *writable* errored while
+the pipe is blocked awaiting a source read. The pipe watches the abort signal continuously (a
+`select!` arm) but only notices the destination's terminal state at a write point, so a
+destination error that occurs while it is reading goes unobserved and a later abort wins —
+`pipeTo` rejects with "Stream was aborted" instead of the writable's error (a no-abort probe with
+the same setup hangs, confirming the dest error is never seen). Fixing it means watching the
+destination's terminal state alongside the read in the pipe loop — invasive, deferred:
+`pipe_to_late_abort_no_effect_after_writable_errored`.
+
 Skipped: the teed-byte-stream priority case (byte sources are a separate area), and
 the JS getter/duck-typing checks shared with pipe-through.
 
@@ -398,9 +414,17 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-Two portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test
+Three portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test
 asserting the spec-correct outcome, kept as executable documentation:
 
+- **piping `abort.any.js`: a late abort must do nothing after the *writable* errored.** The pipe
+  watches the abort signal continuously (a `select!` arm) but only observes the destination's
+  terminal state at a write point; a destination error that lands while the pipe is blocked
+  awaiting a source read goes unnoticed, so a later abort wins and `pipeTo` rejects with "Stream
+  was aborted" instead of the writable's error. (The readable-errored variants pass — that error
+  arrives on the read the pipe awaits.) The fix is to watch the destination's terminal state
+  alongside the read in the pipe loop — invasive, deferred. Test:
+  `pipe_to_late_abort_no_effect_after_writable_errored`.
 - **transform `errors.any.js`: an exception from `transform()` after `terminate()` must
   error the readable with the thrown error.** The readable closes eagerly on `terminate()`
   even with a chunk still queued, so the following `error()` is a no-op and the readable
@@ -484,9 +508,6 @@ called). Not re-litigated here.
 Distinct spec behaviours the audit surfaced that are neither covered nor a documented skip,
 kept here so the accounting is complete (candidates for a future pass):
 
-- piping `abort`: a late signal is a no-op after the *readable* errored with pending writes,
-  and after the *writable* errored (only the readable-errored, no-pending-writes branch is
-  covered).
 - readable `tee`: the coordinator's pull-scheduling bound ("pull only to fill the emptiest
   branch queue"; stop pulling once the source errors) — tied to the `BackpressureMode`
   extension's semantics.
