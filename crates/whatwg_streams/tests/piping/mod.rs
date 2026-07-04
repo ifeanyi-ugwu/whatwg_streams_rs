@@ -1692,17 +1692,12 @@ async fn pipe_to_closed_dest_cancels_source_and_rejects() {
 // WPT: abort.any.js — "abort should do nothing after the writable is errored".
 // Once the destination has errored, a late abort signal is a no-op: pipe_to rejects with the
 // writable's error (not the abort), and with preventCancel the source is never cancelled.
-//
-// Divergence (asserts the spec-correct outcome): the pipe rejects with "Stream was aborted"
-// instead of the writable's error. Root cause: the pipe watches the abort signal continuously
-// (a select! arm) but only observes the destination's errored state at a write point — while it
-// is blocked awaiting a source read, a destination error goes unnoticed, so a later abort wins.
-// A no-abort probe with this same setup hangs, confirming the pipe never reacts to the dest
-// error while reading. Fixing it means watching the destination's terminal state alongside the
-// read in the pipe loop — invasive, deferred. See WPT_COVERAGE.md.
+// The pipe already selects on writer.closed() alongside the read, so a destination error while
+// the pipe is blocked reading is observed — once the writable task wakes to process the
+// controller.error() message (it now polls ctrl_rx with a registered waker, not a non-waking
+// try_next() that stranded the error while the task was idle).
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore = "pipe does not observe a destination error while blocked on a read; late abort wins (see WPT_COVERAGE.md)"]
 async fn pipe_to_late_abort_no_effect_after_writable_errored() {
     use std::sync::{Arc, Mutex};
     use whatwg_streams::AbortController;
