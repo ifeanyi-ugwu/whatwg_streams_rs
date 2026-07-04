@@ -509,6 +509,60 @@ async fn controller_error_before_write_rejection_wins_stream_error() {
     );
 }
 
+// WPT: general.any.js — a controller.error() raised while the stream is otherwise idle (no
+// write in flight, no command pending) must still reject a waiting closed()/ready(). The task
+// used to drain controller messages with a non-waking try_next(), so an error sent while it was
+// parked sat unprocessed until the next command; closed() then hung. It now polls ctrl_rx with a
+// registered waker.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_while_idle_rejects_closed_promptly() {
+    use std::sync::{Arc, Mutex};
+
+    struct CapturingSink {
+        ctrl: Arc<Mutex<Option<WritableStreamDefaultController>>>,
+    }
+    impl WritableSink<u32> for CapturingSink {
+        async fn start(
+            &mut self,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            Ok(())
+        }
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let ctrl_slot: Arc<Mutex<Option<WritableStreamDefaultController>>> = Arc::new(Mutex::new(None));
+    let stream = WritableStream::builder(CapturingSink {
+        ctrl: ctrl_slot.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    // No writes are issued: the task is idle. Wait for start() to capture the controller.
+    let ctrl = loop {
+        if let Some(c) = ctrl_slot.lock().unwrap().clone() {
+            break c;
+        }
+        tokio::task::yield_now().await;
+    };
+
+    // Error the idle stream from outside, then await closed() — it must reject, not hang.
+    ctrl.error("boom".into());
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), writer.closed())
+        .await
+        .expect("closed() must settle promptly after controller.error() on an idle stream");
+    let err = closed.expect_err("closed() must reject with the controller error");
+    assert!(err.to_string().contains("boom"), "got: {err}");
+}
+
 // WPT: error.any.js — "surplus calls to controller.error() should be a no-op"
 // The first error wins; a second controller.error() does not overwrite the stored error.
 //
