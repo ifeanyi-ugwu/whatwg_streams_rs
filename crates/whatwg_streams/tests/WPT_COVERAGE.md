@@ -232,14 +232,14 @@ rejects with it and `preventAbort` keeps the writable usable
 (`pipe_to_late_abort_no_effect_after_readable_errored_with_pending_write`), plus the
 no-pending-writes variant already covered.
 
-Divergence (`#[ignore]`d, asserts the spec outcome): abort after the *writable* errored while
-the pipe is blocked awaiting a source read. The pipe watches the abort signal continuously (a
-`select!` arm) but only notices the destination's terminal state at a write point, so a
-destination error that occurs while it is reading goes unobserved and a later abort wins —
-`pipeTo` rejects with "Stream was aborted" instead of the writable's error (a no-abort probe with
-the same setup hangs, confirming the dest error is never seen). Fixing it means watching the
-destination's terminal state alongside the read in the pipe loop — invasive, deferred:
-`pipe_to_late_abort_no_effect_after_writable_errored`.
+Also covered: abort after the *writable* errored while the pipe is blocked awaiting a source read
+(`pipe_to_late_abort_no_effect_after_writable_errored`). The pipe already selects `writer.closed()`
+alongside the read, so it observes a destination error while reading — but this surfaced a
+writable-task bug: controller messages were drained with a non-waking `try_next()`, so a
+`controller.error()` arriving while the task was idle (no command, no in-flight write) sat
+unprocessed and `closed()`/`ready()` never settled. The task now polls `ctrl_rx` with a registered
+waker, fixing that whole class (also pinned directly, independent of piping, by
+`controller_error_while_idle_rejects_closed_promptly`).
 
 Skipped: the teed-byte-stream priority case (byte sources are a separate area), and
 the JS getter/duck-typing checks shared with pipe-through.
@@ -414,17 +414,9 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-Three portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test
+Two portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test
 asserting the spec-correct outcome, kept as executable documentation:
 
-- **piping `abort.any.js`: a late abort must do nothing after the *writable* errored.** The pipe
-  watches the abort signal continuously (a `select!` arm) but only observes the destination's
-  terminal state at a write point; a destination error that lands while the pipe is blocked
-  awaiting a source read goes unnoticed, so a later abort wins and `pipeTo` rejects with "Stream
-  was aborted" instead of the writable's error. (The readable-errored variants pass — that error
-  arrives on the read the pipe awaits.) The fix is to watch the destination's terminal state
-  alongside the read in the pipe loop — invasive, deferred. Test:
-  `pipe_to_late_abort_no_effect_after_writable_errored`.
 - **transform `errors.any.js`: an exception from `transform()` after `terminate()` must
   error the readable with the thrown error.** The readable closes eagerly on `terminate()`
   even with a chunk still queued, so the following `error()` is a no-op and the readable
