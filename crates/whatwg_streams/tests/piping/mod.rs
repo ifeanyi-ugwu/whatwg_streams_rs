@@ -1688,3 +1688,210 @@ async fn pipe_to_closed_dest_cancels_source_and_rejects() {
         "the source must be cancelled when the destination is already closed"
     );
 }
+
+// WPT: abort.any.js — "abort should do nothing after the writable is errored".
+// Once the destination has errored, a late abort signal is a no-op: pipe_to rejects with the
+// writable's error (not the abort), and with preventCancel the source is never cancelled.
+//
+// Divergence (asserts the spec-correct outcome): the pipe rejects with "Stream was aborted"
+// instead of the writable's error. Root cause: the pipe watches the abort signal continuously
+// (a select! arm) but only observes the destination's errored state at a write point — while it
+// is blocked awaiting a source read, a destination error goes unnoticed, so a later abort wins.
+// A no-abort probe with this same setup hangs, confirming the pipe never reacts to the dest
+// error while reading. Fixing it means watching the destination's terminal state alongside the
+// read in the pipe loop — invasive, deferred. See WPT_COVERAGE.md.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "pipe does not observe a destination error while blocked on a read; late abort wins (see WPT_COVERAGE.md)"]
+async fn pipe_to_late_abort_no_effect_after_writable_errored() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::AbortController;
+
+    struct BlockingCancelSource {
+        cancel_called: Arc<Mutex<bool>>,
+    }
+    impl ReadableSource<u32> for BlockingCancelSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            futures::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            *self.cancel_called.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    struct CapturingSink {
+        ctrl: Arc<Mutex<Option<WritableStreamDefaultController>>>,
+    }
+    impl WritableSink<u32> for CapturingSink {
+        async fn start(
+            &mut self,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            Ok(())
+        }
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let cancel_called = Arc::new(Mutex::new(false));
+    let ctrl_slot: Arc<Mutex<Option<WritableStreamDefaultController>>> = Arc::new(Mutex::new(None));
+
+    let source = ReadableStream::builder(BlockingCancelSource {
+        cancel_called: cancel_called.clone(),
+    })
+    .spawn(tokio::spawn);
+    let dest = WritableStream::builder(CapturingSink {
+        ctrl: ctrl_slot.clone(),
+    })
+    .spawn(tokio::spawn);
+
+    let abort = AbortController::new();
+    let signal = abort.signal();
+
+    let pipe = tokio::spawn(async move {
+        source
+            .pipe_to(
+                &dest,
+                Some(StreamPipeOptions {
+                    signal: Some(signal),
+                    prevent_cancel: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+    });
+
+    // Let the pipe start and the sink's start() capture the controller.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let writer_ctrl = ctrl_slot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("sink start() must have captured the controller");
+
+    // Error the writable, let the pipe observe it, then fire a late abort — a no-op.
+    writer_ctrl.error("error1".into());
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    abort.abort(None);
+
+    let err = pipe.await.unwrap().expect_err("pipe must reject");
+    assert!(
+        err.to_string().contains("error1"),
+        "pipe must reject with the writable error, not the abort; got: {err}"
+    );
+    assert!(
+        !*cancel_called.lock().unwrap(),
+        "source.cancel() must not be called (preventCancel)"
+    );
+}
+
+// WPT: abort.any.js — "abort should do nothing after the readable is errored, even with pending
+// writes". The sink errors the readable mid-write (write still pending); a late abort must be a
+// no-op, so pipe_to rejects with the readable's error (preventAbort keeps the writable usable).
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_late_abort_no_effect_after_readable_errored_with_pending_write() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::AbortController;
+
+    type ReadCtrlSlot = Arc<Mutex<Option<ReadableStreamDefaultController<u32>>>>;
+
+    struct CapturingSource {
+        ctrl: ReadCtrlSlot,
+    }
+    impl ReadableSource<u32> for CapturingSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            controller.enqueue(1)?;
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    // Errors the readable mid-write, then blocks until released — modelling a pending write that
+    // is still in flight when the readable errors and the abort fires.
+    struct ErrorReadableThenBlockSink {
+        read_ctrl: ReadCtrlSlot,
+        release: Arc<tokio::sync::Notify>,
+        write_started: Arc<tokio::sync::Notify>,
+    }
+    impl WritableSink<u32> for ErrorReadableThenBlockSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            if let Some(rc) = self.read_ctrl.lock().unwrap().clone() {
+                let _ = rc.error("error1".into());
+            }
+            self.write_started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    let ctrl_slot: ReadCtrlSlot = Arc::new(Mutex::new(None));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let write_started = Arc::new(tokio::sync::Notify::new());
+
+    let source = ReadableStream::builder(CapturingSource {
+        ctrl: ctrl_slot.clone(),
+    })
+    .spawn(tokio::spawn);
+    let dest = WritableStream::builder(ErrorReadableThenBlockSink {
+        read_ctrl: ctrl_slot.clone(),
+        release: release.clone(),
+        write_started: write_started.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(3))
+    .spawn(tokio::spawn);
+
+    let abort = AbortController::new();
+    let signal = abort.signal();
+
+    let pipe = tokio::spawn(async move {
+        source
+            .pipe_to(
+                &dest,
+                Some(StreamPipeOptions {
+                    signal: Some(signal),
+                    prevent_abort: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+    });
+
+    // Wait until the write is in flight (readable already errored), then fire the late abort and
+    // release the write.
+    write_started.notified().await;
+    abort.abort(None);
+    release.notify_one();
+
+    let err = pipe.await.unwrap().expect_err("pipe must reject");
+    assert!(
+        err.to_string().contains("error1"),
+        "pipe must reject with the readable error, not the abort; got: {err}"
+    );
+}
