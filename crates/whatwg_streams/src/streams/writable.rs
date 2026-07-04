@@ -946,7 +946,7 @@ async fn stream_task<T, Sink>(
     }
 
     poll_fn(|cx| {
-        process_controller_msgs(&mut inner, &mut ctrl_rx);
+        process_controller_msgs(&mut inner, &mut ctrl_rx, cx);
         update_atomic_counters(&inner, &queue_total_size);
         // Dual-layer waker management to handle race conditions in concurrent scenarios:
         //
@@ -1716,8 +1716,12 @@ enum ControllerMsg {
 fn process_controller_msgs<T, Sink>(
     inner: &mut WritableStreamInner<T, Sink>,
     ctrl_rx: &mut UnboundedReceiver<ControllerMsg>,
+    cx: &mut Context<'_>,
 ) {
-    while let Ok(Some(msg)) = ctrl_rx.try_next() {
+    // Poll (not try_next) so the task registers a waker on ctrl_rx: a controller.error() that
+    // arrives while the task is otherwise idle (no commands, no in-flight write) must still wake
+    // it, or the error sits unprocessed and closed()/ready() never settle.
+    while let Poll::Ready(Some(msg)) = ctrl_rx.poll_next_unpin(cx) {
         match msg {
             ControllerMsg::Error(err) => {
                 inner.state = StreamState::Errored;
