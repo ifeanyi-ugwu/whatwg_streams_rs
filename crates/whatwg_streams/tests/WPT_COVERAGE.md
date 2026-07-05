@@ -146,12 +146,13 @@ already-closed/errored stream rejects, a second in-flight close rejects, `sink.c
 rejection errors the stream, and `abort()` during an in-flight close resolves while the
 stream errors (`abort_during_pending_close_resolves`).
 
-The two "sink calls `controller.error()` while close is in-flight" tests (the error is
-ignored, sync and async) are **untranslatable** for the same reason as transform
-`cancel.any.js` tests 6/7: `WritableSink::close(self)` receives no controller, and
-`WritableStreamDefaultController` is not `Clone`, so a sink cannot hold a controller to call
-`error()` from inside `close()`. A sink `close()` that returns `Err` (the throwing-close
-path) is the expressible analogue and is covered.
+The two "sink calls `controller.error()` while close is in-flight" tests (sync and async) are
+now covered: `WritableStreamDefaultController` is `Clone`, so a sink captures it in `start()` and
+calls `error()` from inside `close(self)` even though `close` receives no controller
+(`controller_error_during_close_is_discarded`, `controller_error_during_inflight_close_is_discarded`).
+Both surfaced a divergence, now fixed: the error errored the stream instead of being discarded. The
+`ControllerMsg::Error` handler now no-ops unless the stream is still `Writable` with no close in
+flight, so a successful close wins and clears the error (spec `WritableStreamFinishInFlightClose`).
 
 ### `writable-streams/{count,byte-length,floating-point}-queuing-strategy.any.js`, `reentrant-strategy.any.js`
 
