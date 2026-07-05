@@ -88,11 +88,12 @@ async fn abort_puts_stream_in_errored_state_with_reason() {
     );
 }
 
-// "Aborting a WritableStream causes outstanding write() promises to be rejected with the reason"
-// WPT abort.any.js test 13
+// WPT: abort.any.js — "Aborting a WritableStream prevents further writes after any that are in
+// progress". A write already dispatched to the sink finishes with its own result; writes still
+// queued behind it are rejected with the abort reason.
 #[cfg(feature = "send")]
 #[tokio::test]
-async fn abort_rejects_outstanding_writes_with_reason() {
+async fn abort_rejects_queued_writes_but_in_flight_finishes() {
     use std::sync::Arc;
     use whatwg_streams::{StreamResult, WritableSink, WritableStreamDefaultController};
 
@@ -113,25 +114,36 @@ async fn abort_rejects_outstanding_writes_with_reason() {
     let (_locked, writer) = stream.get_writer().unwrap();
     let w = Arc::new(writer);
 
-    // Enqueue a slow write — it blocks until notified
-    let wc = w.clone();
-    let write_fut = tokio::spawn(async move { wc.write(1u32).await });
+    // write(1) is dispatched to the sink and blocks there — it is the in-flight write.
+    let w1 = w.clone();
+    let write1 = tokio::spawn(async move { w1.write(1u32).await });
+    tokio::task::yield_now().await;
     tokio::task::yield_now().await;
 
-    // Spawn abort concurrently — abort() waits for the in-flight write's sink.write()
-    // to complete before calling sink.abort(), so we must not await it before unblocking.
+    // write(2) is queued behind the in-flight write(1).
+    let w2 = w.clone();
+    let write2 = tokio::spawn(async move { w2.write(2u32).await });
+    tokio::task::yield_now().await;
+
+    // Abort with a reason. abort() waits for the in-flight write to settle before sink.abort().
     let wa = w.clone();
     let abort_fut = tokio::spawn(async move { wa.abort(Some("abort reason".into())).await });
     tokio::task::yield_now().await;
 
-    // Unblock the sink write — sink.write() completes, then sink.abort() runs
+    // Let the in-flight write's sink.write() complete (Ok), then sink.abort() runs.
     unblock.notify_one();
-
     abort_fut.await.unwrap().unwrap();
 
-    // The write completion was sent Err as soon as abort() was queued
-    let write_result = write_fut.await.unwrap();
-    assert!(write_result.is_err(), "in-flight write must reject when stream is aborted");
+    // The in-flight write finishes with its own result; the queued write rejects with the reason.
+    assert!(
+        write1.await.unwrap().is_ok(),
+        "the in-flight write finishes with its own (successful) result, not the abort error"
+    );
+    let queued = write2.await.unwrap().expect_err("a queued write must reject on abort");
+    assert!(
+        queued.to_string().contains("abort reason"),
+        "the queued write rejects with the abort reason, got: {queued}"
+    );
 }
 
 // "a sink interrupted mid-write can read the abort reason from the controller"
@@ -648,5 +660,67 @@ async fn abort_before_start_rejects_pending_ready_and_write() {
     assert!(
         !wrote.load(Ordering::Acquire),
         "sink write() must not be called for a write aborted before start()"
+    );
+}
+
+// WPT: aborting.any.js — ".closed should not resolve before rejected write(); write() error
+// should not overwrite abort() error". A write in flight rejects with its own error while an
+// abort(reason) is pending: the write() promise carries the write's error, while closed() rejects
+// with the abort reason — first-wins, so the later write rejection must not overwrite it.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn abort_error_not_overwritten_by_later_write_rejection() {
+    use futures::FutureExt;
+    use std::sync::Arc;
+
+    struct BlockThenRejectSink {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl WritableSink<u32> for BlockThenRejectSink {
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Err("error1".into())
+        }
+    }
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let stream = WritableStream::builder(BlockThenRejectSink {
+        started: started.clone(),
+        release: release.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    writer.ready().await.unwrap();
+
+    let write_fut = writer.write(1u32);
+    let orchestrate = async {
+        started.notified().await; // the sink's write() is in flight
+        let abort_fut = writer.abort(Some("error2".to_string()));
+        futures::pin_mut!(abort_fut);
+        // Send the abort command while the write is still in flight, then let the write finish.
+        let _ = futures::poll!(&mut abort_fut);
+        release.notify_one();
+        abort_fut.await
+    };
+    let (write_res, abort_res) = futures::join!(write_fut, orchestrate);
+
+    let write_err = write_res.expect_err("write() must reject");
+    assert!(
+        write_err.to_string().contains("error1"),
+        "write() carries its own error, got: {write_err}"
+    );
+    abort_res.expect("abort() must fulfill");
+
+    let closed_err = writer.closed().await.expect_err("closed() must reject");
+    assert!(
+        closed_err.to_string().contains("error2"),
+        "closed() rejects with the abort reason, not the later write error, got: {closed_err}"
     );
 }

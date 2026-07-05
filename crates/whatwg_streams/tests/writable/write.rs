@@ -565,17 +565,11 @@ async fn controller_error_while_idle_rejects_closed_promptly() {
 
 // WPT: error.any.js — "surplus calls to controller.error() should be a no-op"
 // The first error wins; a second controller.error() does not overwrite the stored error.
-//
-// KNOWN DIVERGENCE (ignored): the ControllerMsg::Error handler overwrites the stored
-// error unconditionally, so a second controller.error() wins ("last wins" instead of
-// "first wins"). A naive first-wins guard regresses the controller.error()-then-write-
-// rejection case (which is currently spec-correct), because both error paths share the
-// handler and depend on async message ordering. A correct fix must make stored_error
-// first-wins across both the controller and write-rejection paths while each write
-// promise still carries its own error. Documented in WPT_COVERAGE.md.
+// stored_error is first-wins across the controller and write-rejection paths; each write promise
+// still carries its own error. Its companion `controller_error_before_write_rejection_wins_stream_error`
+// pins that a controller.error() inside a sink write() still wins over that write's own rejection.
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore = "known divergence: surplus controller.error() overwrites (last-wins) instead of first-wins; correct fix needs cross-path error-precedence rework (see WPT_COVERAGE.md)"]
 async fn surplus_controller_error_is_noop_first_wins() {
     struct DoubleErrorSink;
     impl WritableSink<u32> for DoubleErrorSink {
