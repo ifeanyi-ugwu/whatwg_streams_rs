@@ -1189,58 +1189,65 @@ async fn readable_cancel_clears_backpressure_and_closes_writer() {
     );
 }
 
-// WPT: transform errors.any.js —
-// "a write() that was waiting for backpressure should reject if the writable is aborted"
-// The cancel-side counterpart above only checks the parked write does not hang; this
-// pins the abort-side, where the parked write must actually reject.
+// WPT: transform errors.any.js — aborting the writable while a transform is in flight rejects the
+// writes still queued behind it with the abort reason, while the in-flight transform finishes with
+// its own result. (The in-flight write carrying its own outcome, not the abort error, mirrors the
+// writable-level `abort_rejects_queued_writes_but_in_flight_finishes`.)
 #[cfg(feature = "send")]
 #[tokio::test]
-async fn abort_rejects_write_parked_on_backpressure() {
+async fn abort_rejects_queued_write_through_transform() {
     use std::sync::Arc;
-    use whatwg_streams::CountQueuingStrategy;
 
-    struct EnqueueOnceT {
-        first: bool,
+    struct GateT {
+        gate: Arc<tokio::sync::Notify>,
     }
-
-    impl Transformer<u32, u32> for EnqueueOnceT {
+    impl Transformer<u32, u32> for GateT {
         async fn transform(
             &mut self,
             chunk: u32,
             controller: &mut TransformStreamDefaultController<u32>,
         ) -> StreamResult<()> {
-            if self.first {
-                self.first = false;
-                controller.enqueue(chunk)?;
-            }
-            Ok(())
+            // Block the first transform so its write stays in flight while the next write queues.
+            self.gate.notified().await;
+            controller.enqueue(chunk)
         }
     }
 
-    let ts = TransformStream::builder(EnqueueOnceT { first: true })
-        .readable_strategy(CountQueuingStrategy::new(1))
-        .spawn(tokio::spawn);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let ts = TransformStream::builder(GateT { gate: gate.clone() }).spawn(tokio::spawn);
     let (readable, writable) = ts.split();
     let (_locked, writer) = writable.get_writer().unwrap();
     let (_locked, _reader) = readable.get_reader().unwrap();
 
-    // First write fills the readable queue (HWM 1) → backpressure on.
-    writer.write(1u32).await.unwrap();
-
-    // Second write parks on backpressure (the reader never reads).
     let w = Arc::new(writer);
-    let wc = w.clone();
-    let write2 = tokio::spawn(async move { wc.write(2u32).await });
+    // write(1) is in flight (its transform is blocked on the gate).
+    let w1 = w.clone();
+    let write1 = tokio::spawn(async move { w1.write(1u32).await });
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
+    // write(2) is queued behind the in-flight write(1).
+    let w2 = w.clone();
+    let write2 = tokio::spawn(async move { w2.write(2u32).await });
+    tokio::task::yield_now().await;
 
-    // Abort the writable — the parked write must reject, not hang or resolve Ok.
-    w.abort(Some("aborted".into())).await.unwrap();
+    // Abort with a reason; then release the gate so the in-flight transform completes and the
+    // abort can proceed.
+    let wa = w.clone();
+    let abort_fut = tokio::spawn(async move { wa.abort(Some("aborted".into())).await });
+    tokio::task::yield_now().await;
+    gate.notify_one();
+    abort_fut.await.unwrap().unwrap();
 
-    let write2_result = write2.await.unwrap();
+    // The queued write rejects with the abort reason; the in-flight one finishes with its own
+    // result (it was released, so it succeeds — not the abort error).
+    let queued = write2.await.unwrap().expect_err("a queued write must reject on abort");
     assert!(
-        write2_result.is_err(),
-        "a write parked on backpressure must reject when the writable is aborted, got: {write2_result:?}"
+        queued.to_string().contains("aborted"),
+        "the queued write rejects with the abort reason, got: {queued}"
+    );
+    assert!(
+        write1.await.unwrap().is_ok(),
+        "the in-flight write finishes with its own result"
     );
 }
 
