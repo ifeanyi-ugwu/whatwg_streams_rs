@@ -201,3 +201,112 @@ async fn ready_is_fulfilled_for_writer_on_closed_stream() {
         "ready() must not be Pending after stream is closed"
     );
 }
+
+// WPT: close.any.js — "when sink calls error synchronously while closing, the stream should not
+// become errored". A controller.error() raised from inside close() is discarded once the close
+// succeeds: the stream ends up closed (close() and closed() both resolve), not errored.
+// Expressible now that WritableStreamDefaultController is Clone — the sink captures it in start().
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_during_close_is_discarded() {
+    use std::sync::{Arc, Mutex};
+
+    struct ErrorOnCloseSink {
+        ctrl: Arc<Mutex<Option<WritableStreamDefaultController>>>,
+    }
+    impl WritableSink<u32> for ErrorOnCloseSink {
+        async fn start(
+            &mut self,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            Ok(())
+        }
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+        async fn close(self) -> StreamResult<()> {
+            if let Some(c) = self.ctrl.lock().unwrap().clone() {
+                c.error("error me".into());
+            }
+            Ok(())
+        }
+    }
+
+    let ctrl = Arc::new(Mutex::new(None));
+    let stream = WritableStream::builder(ErrorOnCloseSink { ctrl: ctrl.clone() }).spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+
+    writer.close().await.expect("close() must resolve");
+    writer
+        .closed()
+        .await
+        .expect("closed() must resolve — an error raised during close is discarded once close succeeds");
+}
+
+// WPT: close.any.js — "when sink calls error asynchronously while sink close is in-flight, the
+// stream should not become errored". A controller.error() raised while the sink's close() is still
+// pending is discarded when that close later succeeds: the stream closes cleanly.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_error_during_inflight_close_is_discarded() {
+    use std::sync::{Arc, Mutex};
+
+    struct SlowCloseSink {
+        ctrl: Arc<Mutex<Option<WritableStreamDefaultController>>>,
+        close_started: Arc<tokio::sync::Notify>,
+        resolve_close: Arc<tokio::sync::Notify>,
+    }
+    impl WritableSink<u32> for SlowCloseSink {
+        async fn start(
+            &mut self,
+            controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            Ok(())
+        }
+        async fn write(
+            &mut self,
+            _chunk: u32,
+            _controller: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+        async fn close(self) -> StreamResult<()> {
+            self.close_started.notify_one();
+            self.resolve_close.notified().await;
+            Ok(())
+        }
+    }
+
+    let ctrl_slot = Arc::new(Mutex::new(None));
+    let close_started = Arc::new(tokio::sync::Notify::new());
+    let resolve_close = Arc::new(tokio::sync::Notify::new());
+    let stream = WritableStream::builder(SlowCloseSink {
+        ctrl: ctrl_slot.clone(),
+        close_started: close_started.clone(),
+        resolve_close: resolve_close.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (_locked, writer) = stream.get_writer().unwrap();
+    let w = Arc::new(writer);
+
+    let wc = w.clone();
+    let close_fut = tokio::spawn(async move { wc.close().await });
+
+    // The sink's close() is now in flight (blocked). Error the controller mid-close.
+    close_started.notified().await;
+    let ctrl = ctrl_slot.lock().unwrap().clone().unwrap();
+    ctrl.error("error1".into());
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Let the close complete: it wins, discarding the error.
+    resolve_close.notify_one();
+    close_fut.await.unwrap().expect("close() must resolve");
+    w.closed().await.expect("closed() must resolve — the mid-close error is discarded");
+}
