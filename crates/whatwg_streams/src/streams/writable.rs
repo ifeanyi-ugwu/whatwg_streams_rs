@@ -1740,10 +1740,12 @@ fn process_controller_msgs<T, Sink>(
     while let Poll::Ready(Some(msg)) = ctrl_rx.poll_next_unpin(cx) {
         match msg {
             ControllerMsg::Error(err) => {
-                // First error wins: a surplus controller.error() on an already-errored stream is a
-                // no-op (spec: WritableStreamDefaultControllerError only starts erroring while the
-                // stream is still "writable").
-                if inner.state == StreamState::Errored {
+                // controller.error() only takes effect while the stream is still "writable" (spec
+                // WritableStreamDefaultControllerError). Once errored it is a surplus no-op (first
+                // error wins); once closed it is a no-op; and while a close is in flight it is
+                // discarded in favour of the close outcome — a successful close wins, matching
+                // WritableStreamFinishInFlightClose clearing the stored error.
+                if inner.state != StreamState::Writable || inner.close_requested {
                     continue;
                 }
                 *inner.stored_error.write() = Some(err.clone());
