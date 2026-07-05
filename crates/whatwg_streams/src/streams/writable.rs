@@ -990,13 +990,13 @@ async fn stream_task<T, Sink>(
             // Cancel inflight write or close operations immediately
             if let Some(inflight_op) = &mut inflight {
                 match inflight_op {
-                    InFlight::Write { completion, chunk_size, .. } => {
-                        inner.queue_total_size = inner.queue_total_size.saturating_sub(*chunk_size);
-                        update_atomic_counters(&inner, &queue_total_size);
-                        if let Some(sender) = completion.take() {
-                            let _ = sender.send(Err(StreamError::Aborted(None)));
-                        }
-                    }
+                    // The in-flight write is left to finish with its own result (spec
+                    // WritableStreamFinishInFlightWrite[WithError]); its promise must carry the
+                    // write's own outcome, not the abort error, and the abort proceeds once it
+                    // settles (handled in the Poll::Ready arm below). Only the stored error that
+                    // closed() sees becomes the abort reason, pinned first-wins when abort was
+                    // requested.
+                    InFlight::Write { .. } => {}
                     InFlight::Close { completions, .. } => {
                         // Reject the in-flight close completions.
                         let abort_reason = inner.abort_reason.take();
@@ -1115,9 +1115,13 @@ async fn stream_task<T, Sink>(
                                 let abort_fut = Box::pin(async move { sink.abort(reason).await });
                                 let completions = std::mem::take(&mut inner.abort_completions);
 
-                                // Notify write completion with abort error
+                                // The in-flight write finishes with its own outcome even though an
+                                // abort is pending: its promise carries the write's result, not the
+                                // abort error (spec WritableStreamFinishInFlightWrite[WithError]).
+                                // The abort error stays the stream's stored error (closed()), set
+                                // first-wins when the abort was requested.
                                 if let Some(sender) = completion.take() {
-                                    let _ = sender.send(Err(StreamError::Aborted(None)));
+                                    let _ = sender.send(result);
                                 }
 
                                 inflight = Some(InFlight::Abort {
@@ -1127,13 +1131,19 @@ async fn stream_task<T, Sink>(
                                 // Wake so InFlight::Abort is polled in the next pass
                                 cx.waker().wake_by_ref();
                             } else {
+                                // A controller.error() raised inside this write's sink body was
+                                // sent to ctrl_rx while the future ran; drain it now so it — not
+                                // this write's own rejection — becomes the (first-wins) stored
+                                // error, matching the spec's synchronous ordering.
+                                process_controller_msgs(&mut inner, &mut ctrl_rx, cx);
+
                                 // Normal case: restore sink
                                 if result.is_err() {
                                     if let Err(e) = result.clone() {
                                         inner.set_stored_error(e);
                                     }
                                     inner.state = StreamState::Errored;
-                                } else {
+                                } else if inner.state != StreamState::Errored {
                                     inner.sink = Some(sink);
                                 }
 
@@ -1628,9 +1638,15 @@ impl<T: MaybeSend + 'static, Sink> WritableStreamInner<T, Sink> {
             .unwrap_or_else(|| "Stream is errored".into())
     }
 
+    /// Record the stream's stored error, first-wins. The spec fixes `[[storedError]]` when the
+    /// stream first leaves the "writable" state (`WritableStreamStartErroring`); every later error
+    /// source is a no-op for it. Each write/close/abort *promise* still carries its own error
+    /// through its own completion channel — only this shared stored error is pinned to the first.
     fn set_stored_error(&self, err: StreamError) {
         let mut guard = self.stored_error.write();
-        *guard = Some(err);
+        if guard.is_none() {
+            *guard = Some(err);
+        }
     }
 
     /// Reject every request still waiting on the stream with the stored error.
@@ -1724,9 +1740,15 @@ fn process_controller_msgs<T, Sink>(
     while let Poll::Ready(Some(msg)) = ctrl_rx.poll_next_unpin(cx) {
         match msg {
             ControllerMsg::Error(err) => {
-                inner.state = StreamState::Errored;
+                // First error wins: a surplus controller.error() on an already-errored stream is a
+                // no-op (spec: WritableStreamDefaultControllerError only starts erroring while the
+                // stream is still "writable").
+                if inner.state == StreamState::Errored {
+                    continue;
+                }
                 *inner.stored_error.write() = Some(err.clone());
                 inner.abort_reason = Some(format!("Controller error: {:?}", err));
+                inner.state = StreamState::Errored;
                 inner.queue.clear();
                 inner.queue_total_size = 0;
                 inner.ready_wakers.wake_all();
