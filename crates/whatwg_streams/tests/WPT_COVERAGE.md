@@ -131,6 +131,14 @@ family (§2), the `AbortSignal` DOM API in tests 56–65 (§3), thenable returns
 The "abort() rejects with the rejection returned from close()" test is behaviour (abort
 adopting a queued close's rejection), not a §1 promise-identity idiom; it is not yet ported.
 
+Abort/write error precedence is covered. A write already dispatched to the sink finishes with its
+own result even while an abort is pending — its promise carries the write's outcome, not the abort
+error — while `closed()` rejects with the abort reason, pinned first-wins so a later in-flight
+write rejection cannot overwrite it (`abort_error_not_overwritten_by_later_write_rejection`).
+Writes still queued behind the in-flight one reject with the abort reason
+(`abort_rejects_queued_writes_but_in_flight_finishes`, and through a transform
+`abort_rejects_queued_write_through_transform`).
+
 ### `writable-streams/close.any.js`
 
 Covered in `writable/close.rs`: close drains queued writes first, close on an
@@ -166,6 +174,15 @@ Covered in `writable/write.rs`, including close-waits-for-pending-writes, large-
 draining, and write-rejection clearing the queue and pending close. Skipped:
 write-to-released-writer (§2), thenable from `write()` (§4), and manual /
 failing-constructor writer tests (§6).
+
+The stored error is first-wins: a surplus `controller.error()` on an already-errored stream is a
+no-op (`surplus_controller_error_is_noop_first_wins`), and a `controller.error()` raised inside a
+sink `write()` that then rejects still wins over that write's own rejection as the stored error —
+its message ordering is resolved by draining controller messages before recording the write
+rejection (`controller_error_before_write_rejection_wins_stream_error`). Each write promise still
+carries its own error; only the shared stored error (`closed()`/`ready()`) is pinned to the first.
+A `controller.error()` on an otherwise idle stream still settles a waiting `closed()`
+(`controller_error_while_idle_rejects_closed_promptly`).
 
 ### `piping/general.any.js`
 
@@ -414,8 +431,8 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-Two portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test
-asserting the spec-correct outcome, kept as executable documentation:
+One portable spec behaviour is currently *not* matched. It has an `#[ignore]`d test asserting the
+spec-correct outcome, kept as executable documentation:
 
 - **transform `errors.any.js`: an exception from `transform()` after `terminate()` must
   error the readable with the thrown error.** The readable closes eagerly on `terminate()`
@@ -425,13 +442,6 @@ asserting the spec-correct outcome, kept as executable documentation:
   `Closed` transition until the queue drains — a core change with wide blast radius
   (`closed()` timing when data is queued at close). Test:
   `transform_throw_after_terminate_errors_readable`.
-- **writable `error.any.js`: a surplus `controller.error()` must be a no-op (first error
-  wins).** The `ControllerMsg::Error` handler overwrites the stored error unconditionally
-  (last-wins). A naive first-wins guard regresses the `controller.error()`-then-write-
-  rejection case (currently spec-correct: the write promise carries its own error while the
-  stored error is the controller's), because both paths share the handler and depend on
-  async message ordering. A correct fix needs cross-path first-wins error precedence. Test:
-  `surplus_controller_error_is_noop_first_wins`.
 
 Related accepted decision: writable `abort()` during an in-flight *rejecting* `close()`
 (WPT "abort() should be rejected with the rejection returned from close()") falls under the
@@ -446,9 +456,10 @@ called). Not re-litigated here.
 - `constructor.any.js` — controller-to-`start`/`write` and HWM→desiredSize covered;
   controller-not-to-`close` is structural (`close(self)` takes no controller); the rest are
   §6 constructor/brand and Infinity-HWM (HWM is `usize`).
-- `error.any.js` — `controller.error()` errors the stream (covered); surplus-error first-wins
-  is the divergence above; `error()` on a closed/errored stream is untranslatable (no
-  controller survives the terminal transition; controller is not `Clone`).
+- `error.any.js` — `controller.error()` errors the stream and surplus-error first-wins are both
+  covered (see `write.any.js` above). `error()` on an already-errored stream is a no-op (the
+  `ControllerMsg::Error` handler short-circuits); the closed-stream no-op variant is not
+  separately pinned.
 - `bad-underlying-sinks.any.js` — throwing `close`/`write`/`abort` → reject (covered in
   close/write/abort.rs); constructor getter-throws and non-function props are §6.
 - `bad-strategies.any.js` — whole-file skip: `size` is infallible `-> usize`, HWM is `usize`;
@@ -503,9 +514,6 @@ kept here so the accounting is complete (candidates for a future pass):
 - readable `tee`: the coordinator's pull-scheduling bound ("pull only to fill the emptiest
   branch queue"; stop pulling once the source errors) — tied to the `BackpressureMode`
   extension's semantics.
-- writable `aborting` / `write`: after `abort(reason)`, a later in-flight `write()` that
-  rejects must not overwrite the stored error — `closed()` rejects with the abort reason
-  while the `write()` promise carries its own error (abort/write error precedence).
 - readable `general` / count-queuing: the **default** controller's `desired_size()` has the
   same closed → `null` divergence just fixed for byte streams (readable.rs ~166 returns `None`
   when `closed || errored`; spec: closed → 0, errored → null). Unlike the byte controller, the
