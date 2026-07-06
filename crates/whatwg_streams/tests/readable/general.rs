@@ -744,6 +744,93 @@ async fn read_succeeds_when_dequeue_triggers_throwing_pull() {
     assert!(err.to_string().contains("error1"), "got: {err}");
 }
 
+// WPT: general.any.js — "ReadableStream: desiredSize when closed" / "when errored".
+// Read synchronously inside start(): after closing an empty queue desiredSize is 0 (not null),
+// after erroring it is null. close()/error() set their request flags synchronously, so the read
+// in the same frame reflects the transition. Previously desiredSize() collapsed closed to None.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn default_controller_desired_size_when_closed_and_errored() {
+    use std::sync::{Arc, Mutex};
+
+    // Closed run.
+    struct CloseProbe {
+        initial: Arc<Mutex<Option<isize>>>,
+        after_close: Arc<Mutex<Option<isize>>>,
+    }
+    impl ReadableSource<u32> for CloseProbe {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.initial.lock().unwrap() = controller.desired_size();
+            controller.close()?;
+            *self.after_close.lock().unwrap() = controller.desired_size();
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let initial = Arc::new(Mutex::new(None));
+    let after_close = Arc::new(Mutex::new(None));
+    let stream = ReadableStream::builder(CloseProbe {
+        initial: initial.clone(),
+        after_close: after_close.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(10))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await; // drive the task through start()
+
+    assert_eq!(*initial.lock().unwrap(), Some(10), "desiredSize starts at the HWM");
+    assert_eq!(
+        *after_close.lock().unwrap(),
+        Some(0),
+        "after closing an empty queue, desiredSize is 0 (not null)"
+    );
+
+    // Errored run.
+    struct ErrorProbe {
+        after_error: Arc<Mutex<Option<isize>>>,
+    }
+    impl ReadableSource<u32> for ErrorProbe {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.error("boom".into())?;
+            *self.after_error.lock().unwrap() = controller.desired_size();
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let after_error = Arc::new(Mutex::new(Some(999)));
+    let stream = ReadableStream::builder(ErrorProbe {
+        after_error: after_error.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(10))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let _ = reader.read().await;
+
+    assert_eq!(
+        *after_error.lock().unwrap(),
+        None,
+        "after erroring, desiredSize is null"
+    );
+}
+
 // ── controller edge cases ─────────────────────────────────────────────────────
 
 // "ReadableStreamDefaultController: calling close() twice is a no-op on the second call"
