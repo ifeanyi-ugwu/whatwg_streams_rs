@@ -164,10 +164,20 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
     }
 
     pub fn desired_size(&self) -> Option<isize> {
-        if self.closed.load(Ordering::Acquire) || self.errored.load(Ordering::Acquire) {
+        // Spec ReadableStreamDefaultControllerGetDesiredSize: errored → null, closed → 0, else
+        // HWM − queue size. error()/close() set error_requested/close_requested synchronously, so a
+        // read in the same frame (e.g. from start()) reflects the transition before the task commits
+        // it. Closing an empty queue is "closed" at once (spec ReadableStreamClose); closing with a
+        // queue still draining stays "readable", keeping HWM − queue size until it empties.
+        if self.errored.load(Ordering::Acquire) || self.error_requested.load(Ordering::Acquire) {
             return None;
         }
-
+        if self.closed.load(Ordering::Acquire)
+            || (self.close_requested.load(Ordering::Acquire)
+                && self.queue_total_size.load(Ordering::Acquire) == 0)
+        {
+            return Some(0);
+        }
         Some(self.desired_size.load(Ordering::Acquire))
     }
 
