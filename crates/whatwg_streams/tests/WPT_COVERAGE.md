@@ -107,6 +107,13 @@ resolves with that chunk even though the follow-up `pull()` it triggers throws �
 surfaces only via `closed()`, never retroactively failing the already-dequeued read. Already
 correct (the Read command sends the chunk before the pull gate fires); kept as a regression test.
 
+`desiredSize` at the terminal transitions is covered and was fixed: closing an empty queue reports
+`0` (not `null`) and erroring reports `null`, read synchronously from inside `start()` — `close()`
+and `error()` set their request flags synchronously, so `desired_size()` reflects the transition in
+the same frame (`default_controller_desired_size_when_closed_and_errored`). A close whose queue is
+still draining stays `readable`, keeping `HWM − queue` until it empties. `desired_size()` previously
+collapsed closed to `None`, the same divergence fixed for byte streams.
+
 `desired_size`'s synchronous per-enqueue decrement and negative overshoot (WPT
 `count-queuing-strategy-integration.any.js`) are **not portable**. `controller.enqueue()` is
 an async channel message the stream task commits later, not a synchronous queue mutation, and
@@ -524,13 +531,6 @@ kept here so the accounting is complete (candidates for a future pass):
 - readable `tee`: the coordinator's pull-scheduling bound ("pull only to fill the emptiest
   branch queue"; stop pulling once the source errors) — tied to the `BackpressureMode`
   extension's semantics.
-- readable `general` / count-queuing: the **default** controller's `desired_size()` has the
-  same closed → `null` divergence just fixed for byte streams (readable.rs ~166 returns `None`
-  when `closed || errored`; spec: closed → 0, errored → null). Unlike the byte controller, the
-  default `close()` is an async channel message, so the *synchronous* WPT assertion
-  (`desiredSize === 0` right after `c.close()` inside `start()`) is unreachable without making
-  close synchronous; the post-close *observed* value (via a captured controller clone) should
-  still be `0`, not `None`. Fix = mirror the byte one (gate `None` on errored only).
 
 ### Stale test-comment labels (no coverage impact)
 
