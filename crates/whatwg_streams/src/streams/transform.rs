@@ -120,6 +120,19 @@ pub struct TransformStreamDefaultController<O: MaybeSend + 'static> {
     space_signal: SharedPtr<SpaceSignal>,
 }
 
+// Hand-written rather than derived so it does not require `O: Clone` — every field is a
+// `SharedPtr`, so cloning shares the same controllers. A transformer can capture a clone in
+// `start()` and reach it from `cancel()`/`flush()`, which receive no controller.
+impl<O: MaybeSend + 'static> Clone for TransformStreamDefaultController<O> {
+    fn clone(&self) -> Self {
+        Self {
+            readable_controller: self.readable_controller.clone(),
+            writable_controller: self.writable_controller.clone(),
+            space_signal: self.space_signal.clone(),
+        }
+    }
+}
+
 impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
     fn new(
         readable_controller: SharedPtr<ReadableStreamDefaultController<O>>,
