@@ -730,6 +730,73 @@ async fn close_rejects_when_parallel_cancel_throws() {
     );
 }
 
+// WPT: cancel.any.js test 6 — "readable.cancel() and a parallel writable.close() should reject if
+// a transformer.cancel() calls controller.error()". The transformer captures the controller in
+// start() (expressible now that TransformStreamDefaultController is Clone) and errors it from
+// cancel() instead of returning Err; both the cancel and the parallel close must reject with that
+// error.
+//
+// Divergence (`#[ignore]`d, asserts the spec outcome): two problems, both non-trivial. (1) The
+// cancel routing returns Transformer::cancel()'s result verbatim, so an Ok that errored the
+// controller resolves readable.cancel() with Ok instead of rejecting with the stored error (spec
+// TransformStreamDefaultSourceCancelAlgorithm: a fulfilled cancel whose readable is now errored
+// rejects with readable.[[storedError]]). (2) TransformReadableSource::cancel pre-errors the
+// writable with the cancel *reason*, which — now that the writable stored error is first-wins —
+// makes the parallel writable.close() reject with the reason ("original") instead of the thrown
+// error. Observed: cancel_res = Ok(()), close_res = Err("original"). Fixing both means reworking
+// the cancel/error routing and the writable-error precedence — deferred. The idiomatic
+// Err-returning-cancel outcome is covered by `cancel_that_throws_rejects_readable_cancel`.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "controller.error() from transformer.cancel() is not propagated as the cancel/close rejection (see comment)"]
+async fn cancel_calling_controller_error_rejects_cancel_and_parallel_close() {
+    use std::sync::{Arc, Mutex};
+    use whatwg_streams::Transformer;
+
+    struct ErrorOnCancelT {
+        ctrl: Arc<Mutex<Option<TransformStreamDefaultController<u32>>>>,
+    }
+    impl Transformer<u32, u32> for ErrorOnCancelT {
+        async fn start(
+            &mut self,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            Ok(())
+        }
+        async fn transform(
+            &mut self,
+            chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(chunk)
+        }
+        async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
+            // Signal failure by erroring the controller, not by returning Err.
+            if let Some(c) = self.ctrl.lock().unwrap().clone() {
+                c.error("thrown".into())?;
+            }
+            Ok(())
+        }
+    }
+
+    let ctrl = Arc::new(Mutex::new(None));
+    let ts = TransformStream::builder(ErrorOnCancelT { ctrl: ctrl.clone() }).spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_rl, reader) = readable.get_reader().unwrap();
+    let (_wl, writer) = writable.get_writer().unwrap();
+
+    let cancel_fut = tokio::spawn(async move { reader.cancel(Some("original".into())).await });
+    let close_fut = tokio::spawn(async move { writer.close().await });
+    let cancel_res = cancel_fut.await.unwrap();
+    let close_res = close_fut.await.unwrap();
+
+    let cancel_err = cancel_res.expect_err("readable.cancel() must reject with the controller error");
+    assert!(cancel_err.to_string().contains("thrown"), "cancel got: {cancel_err}");
+    let close_err = close_res.expect_err("parallel writable.close() must reject with the controller error");
+    assert!(close_err.to_string().contains("thrown"), "close got: {close_err}");
+}
+
 // "readable.cancel() should not call cancel() when flush() is already executing from writable.close()"
 // WPT: cancel.any.js test 8 (structural variant) — when close triggers flush and readable.cancel()
 // arrives concurrently, cancel fires once and close completes without double-calling cancel.
