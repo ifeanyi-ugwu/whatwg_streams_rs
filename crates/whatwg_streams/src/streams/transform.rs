@@ -118,6 +118,11 @@ pub struct TransformStreamDefaultController<O: MaybeSend + 'static> {
     readable_controller: SharedPtr<ReadableStreamDefaultController<O>>,
     writable_controller: SharedPtr<WritableStreamDefaultController>,
     space_signal: SharedPtr<SpaceSignal>,
+    // The first error passed to `error()`, captured synchronously. A transformer's `cancel()` may
+    // signal failure by calling `error()` rather than returning `Err`; the cancel routing reads
+    // this back to reject the cancel with the same error (the readable/writable stored errors are
+    // set through async channel messages, so their values are not readable synchronously).
+    errored_with: SharedPtr<std::sync::Mutex<Option<StreamError>>>,
 }
 
 // Hand-written rather than derived so it does not require `O: Clone` — every field is a
@@ -129,6 +134,7 @@ impl<O: MaybeSend + 'static> Clone for TransformStreamDefaultController<O> {
             readable_controller: self.readable_controller.clone(),
             writable_controller: self.writable_controller.clone(),
             space_signal: self.space_signal.clone(),
+            errored_with: self.errored_with.clone(),
         }
     }
 }
@@ -143,6 +149,7 @@ impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
             readable_controller,
             writable_controller,
             space_signal,
+            errored_with: SharedPtr::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -155,10 +162,30 @@ impl<O: MaybeSend + 'static> TransformStreamDefaultController<O> {
 
     /// Errors both the readable and writable side of the transform stream
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
+        self.record_error(&error);
         self.readable_controller.error(error.clone())?;
         self.writable_controller.error(error);
         self.space_signal.wake_pull();
         Ok(())
+    }
+
+    fn record_error(&self, error: &StreamError) {
+        let mut guard = self.errored_with.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(error.clone());
+        }
+    }
+
+    /// The first error raised via `error()`, if any. The cancel routing uses this to detect a
+    /// `Transformer::cancel()` that errored the controller instead of returning `Err`.
+    pub(super) fn error_raised(&self) -> Option<StreamError> {
+        self.errored_with.lock().unwrap().clone()
+    }
+
+    /// Error only the writable side (spec `TransformStreamErrorWritableAndUnblockWrite`), leaving
+    /// the readable to be closed by its own cancel path.
+    pub(super) fn error_writable(&self, error: StreamError) {
+        self.writable_controller.error(error);
     }
 
     /// Closes the readable side and errors the writable side of the stream
@@ -399,22 +426,25 @@ impl<O: MaybeSend + 'static> ReadableSource<O> for TransformReadableSource<O> {
     }
 
     async fn cancel(&mut self, reason: Option<String>) -> StreamResult<()> {
-        // Per spec §6.3.4: error the writable side with the cancel reason.
-        let error = match &reason {
-            Some(r) => StreamError::from(r.as_str()),
-            None => StreamError::Canceled,
-        };
-        self.writable_controller.error(error);
-
+        // Unblock a transform parked on backpressure so the task can run the cancel algorithm.
         self.space_signal.cancel_fired();
 
-        // Route the cancel reason into the transform task so it can call
-        // Transformer::cancel(reason). If the task is already gone, treat as Ok.
+        // The writable is errored by the task *after* Transformer::cancel() runs, not
+        // pre-emptively: the spec errors it with the cancel reason only when the algorithm
+        // fulfils without erroring the readable — a cancel() that errors the controller must leave
+        // its error as the writable's stored error. Route the reason into the transform task; if
+        // the task is already gone, error the writable with the reason directly.
         let (result_tx, result_rx) = oneshot::channel();
-        if self.cancel_tx.unbounded_send((reason, result_tx)).is_ok() {
-            result_rx.await.unwrap_or(Ok(()))
-        } else {
-            Ok(())
+        match self.cancel_tx.unbounded_send((reason.clone(), result_tx)) {
+            Ok(()) => result_rx.await.unwrap_or(Ok(())),
+            Err(_) => {
+                let error = match &reason {
+                    Some(r) => StreamError::from(r.as_str()),
+                    None => StreamError::Canceled,
+                };
+                self.writable_controller.error(error);
+                Ok(())
+            }
         }
     }
 }
@@ -518,11 +548,15 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
                             cancel_rx.next().now_or_never()
                         {
                             let result = transformer.cancel(reason).await;
-                            let reject_err = result
+                            let effective = match result {
+                                Ok(()) => controller.error_raised().map_or(Ok(()), Err),
+                                err => err,
+                            };
+                            let reject_err = effective
                                 .clone()
                                 .err()
                                 .unwrap_or(StreamError::Canceled);
-                            let _ = cancel_completion.send(result);
+                            let _ = cancel_completion.send(effective);
                             let _ = controller.error(reject_err.clone());
                             let _ = close_completion.send(Err(reject_err));
                             break;
@@ -543,11 +577,23 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
                         // Call Transformer::cancel() — spec §6.3.2 uses the same
                         // [[cancelAlgorithm]] for both readable.cancel() and writable.abort().
                         let cancel_result = transformer.cancel(reason.clone()).await;
-                        // Error the readable side with the abort reason.
-                        // (The writable side is already being handled by the writable task.)
-                        let _ = controller.error(StreamError::Aborted(reason));
+                        let effective = match cancel_result {
+                            Ok(()) => controller.error_raised().map_or(Ok(()), Err),
+                            err => err,
+                        };
+                        // A clean cancel errors both sides with the abort reason. If the cancel
+                        // failed or errored the controller, that error already stands on both
+                        // sides — do not overwrite the readable's stored error with the reason.
+                        match &effective {
+                            Ok(()) => {
+                                let _ = controller.error(StreamError::Aborted(reason));
+                            }
+                            Err(e) => {
+                                let _ = controller.error(e.clone());
+                            }
+                        }
                         // Per spec: abort() resolves/rejects with the cancel algorithm result.
-                        let _ = completion.send(cancel_result);
+                        let _ = completion.send(effective);
                         break;
                     }
 
@@ -559,14 +605,30 @@ async fn transform_task<I: MaybeSend + 'static, O: MaybeSend + 'static, T>(
             cancel_msg = cancel_rx.next().fuse() => {
                 match cancel_msg {
                     Some((reason, completion)) => {
-                        let result = transformer.cancel(reason).await;
-                        let cancel_err = result.clone().err();
-                        let _ = completion.send(result);
+                        let result = transformer.cancel(reason.clone()).await;
+                        // A cancel() may signal failure by erroring the controller instead of
+                        // returning Err; treat that as the cancel's rejection (spec: a fulfilled
+                        // cancel whose readable is now errored rejects with the stored error).
+                        let effective = match result {
+                            Ok(()) => controller.error_raised().map_or(Ok(()), Err),
+                            err => err,
+                        };
+                        let cancel_err = effective.clone().err();
+                        let _ = completion.send(effective);
 
-                        // If cancel threw, error both sides so concurrent cancel+close
-                        // or cancel+write callers get a proper rejection (cancel.any.js test 5).
-                        if let Some(ref e) = cancel_err {
-                            let _ = controller.error(e.clone());
+                        // Error the writable so concurrent writes/close reject: with the failure
+                        // error if the cancel failed (both sides errored), else with the cancel
+                        // reason (the readable is already closed by its own cancel path — spec
+                        // TransformStreamErrorWritableAndUnblockWrite).
+                        match &cancel_err {
+                            Some(e) => {
+                                let _ = controller.error(e.clone());
+                            }
+                            None => {
+                                let reason_err = reason
+                                    .map_or(StreamError::Canceled, |r| StreamError::from(r.as_str()));
+                                controller.error_writable(reason_err);
+                            }
                         }
 
                         // Drain any writable commands that arrived concurrently so their
