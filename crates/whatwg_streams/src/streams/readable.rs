@@ -2397,10 +2397,13 @@ async fn readable_stream_task<T: 'static, Source>(
                     }
                 }
                 ControllerMsg::Error(err) => {
-                    if inner.state != StreamState::Closed {
-                        // A pending close is overridden by the error (the stream was still
-                        // "readable"/closing, so error() applies — this is the terminate()-then-
-                        // throw case).
+                    // First error wins: apply only while the stream can still error — i.e. while
+                    // "readable" (which includes the closing/close_pending window, so a later
+                    // error() still applies — the terminate()-then-throw case). An error on an
+                    // already-errored stream is a no-op (matching the spec and the writable side);
+                    // this also makes a concurrent two-clone error() race first-wins rather than
+                    // last-wins.
+                    if inner.state == StreamState::Readable {
                         close_pending = false;
                         inner.state = StreamState::Errored;
                         errored.store(true, Ordering::Release);
