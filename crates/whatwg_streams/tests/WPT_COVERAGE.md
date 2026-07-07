@@ -343,18 +343,18 @@ pure function with no stream access); and the `strategies.any.js` size-function-
 RangeError-for-bad-HWM cases (size is an infallible trait method; HWM is `usize`).
 
 `cancel.any.js` tests 6/7 — where the transformer's `cancel()` calls `controller.error()` — are
-now expressible: `TransformStreamDefaultController` is `Clone`, so a transformer captures it in
-`start()` and reaches it from `cancel()` (which receives no controller). They are a documented
-divergence (`#[ignore]`d): `cancel_calling_controller_error_rejects_cancel_and_parallel_close`. Two
-non-trivial problems surface. (1) The cancel routing returns `Transformer::cancel()`'s result
-verbatim, so an `Ok` that errored the controller resolves `readable.cancel()` with `Ok` instead of
-rejecting with the readable's stored error (spec `TransformStreamDefaultSourceCancelAlgorithm`: a
-fulfilled cancel whose readable is now errored rejects with `readable.[[storedError]]`). (2)
-`TransformReadableSource::cancel` pre-errors the writable with the cancel *reason*, which — now that
-the writable stored error is first-wins — makes the parallel `writable.close()` reject with the
-reason rather than the thrown error. The idiomatic `Err`-returning-`cancel()` outcome (cancel/abort
-reject) is covered by `cancel_that_throws_rejects_readable_cancel` and
-`abort_that_throws_rejects_writable_abort`.
+covered (`cancel_calling_controller_error_rejects_cancel_and_parallel_close`,
+`abort_calling_controller_error_rejects_abort_and_later_cancel`), expressible because
+`TransformStreamDefaultController` is `Clone`, so a transformer captures it in `start()` and reaches
+it from `cancel()` (which receives no controller). Two fixes made this work. (1) The cancel routing
+reads the controller error back (`error_raised()`): a `cancel()` that returns `Ok` but errored the
+controller now rejects with that error (spec `TransformStreamDefaultSourceCancelAlgorithm`: a
+fulfilled cancel whose readable is now errored rejects with `readable.[[storedError]]`). (2) The
+writable is errored *after* the cancel algorithm runs, not pre-errored with the reason — so a
+`cancel()` that errors the controller leaves that error as the writable's stored error (the parallel
+`writable.close()` rejects with it), while a clean cancel errors the writable with the reason
+(`TransformStreamErrorWritableAndUnblockWrite`). The idiomatic `Err`-returning-`cancel()` outcome is
+also covered by `cancel_that_throws_rejects_readable_cancel` / `abort_that_throws_rejects_writable_abort`.
 
 ## Byte streams (`readable-byte-streams/`)
 
@@ -440,8 +440,8 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-Two portable spec behaviours are currently *not* matched. Each has an `#[ignore]`d test asserting
-the spec-correct outcome, kept as executable documentation:
+One portable spec behaviour is currently *not* matched. It has an `#[ignore]`d test asserting the
+spec-correct outcome, kept as executable documentation:
 
 - **transform `errors.any.js`: an exception from `transform()` after `terminate()` must
   error the readable with the thrown error.** The readable closes eagerly on `terminate()`
@@ -451,14 +451,6 @@ the spec-correct outcome, kept as executable documentation:
   `Closed` transition until the queue drains — a core change with wide blast radius
   (`closed()` timing when data is queued at close). Test:
   `transform_throw_after_terminate_errors_readable`.
-- **transform `cancel.any.js` 6/7: a `transformer.cancel()` that calls `controller.error()` must
-  reject the cancel and any parallel close with that error.** The cancel routing returns
-  `Transformer::cancel()`'s `Ok` verbatim (dropping the controller error), and
-  `TransformReadableSource::cancel` pre-errors the writable with the cancel *reason*, which — with
-  the first-wins writable stored error — makes the parallel `writable.close()` reject with the
-  reason, not the thrown error. Expressible now that the controller is `Clone`; fixing it reworks
-  the cancel/error routing and writable-error precedence. Test:
-  `cancel_calling_controller_error_rejects_cancel_and_parallel_close`.
 
 Related accepted decision: writable `abort()` during an in-flight *rejecting* `close()`
 (WPT "abort() should be rejected with the rejection returned from close()") falls under the
