@@ -89,7 +89,10 @@ Added behaviours: two concurrently-pending `read()`s resolve together with `None
 and reject with the same error on error (`two_pending_reads_*`); cancelling before `start()`
 finishes prevents `pull()` from ever running (`cancel_before_start_finishes_prevents_pull`);
 and `desired_size` reflects HWM minus the committed queue depth, not just the empty-queue
-case (`controller_desired_size_reflects_queue_depth`).
+case (`controller_desired_size_reflects_queue_depth`). A surplus `controller.error()` is a
+no-op — the first error wins (`controller_surplus_error_is_noop_first_wins`), matching the
+writable side; the `ControllerMsg::Error` handler applies only while the stream is still
+`readable`, so a concurrent two-clone `error()` race is first-wins rather than last-wins.
 
 "should only call pull once upon starting the stream" (`pull_called_once_on_idle_started_stream`)
 surfaced and fixed a real busy-loop divergence: an idle started stream (default HWM 1, whose

@@ -310,6 +310,34 @@ async fn controller_error_rejects_closed_promise() {
     assert!(reader.closed().await.is_err());
 }
 
+// "ReadableStreamDefaultController: a surplus error() is a no-op — the first error wins"
+// Mirrors the writable-side error.any.js surplus-error test. controller.error() sets
+// error_requested synchronously, so the second call is a no-op and the stored error is the first.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn controller_surplus_error_is_noop_first_wins() {
+    struct DoubleErrorSource;
+
+    impl ReadableSource<u32> for DoubleErrorSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.error("first".into())?;
+            let _ = controller.error("second".into());
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(DoubleErrorSource).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+    let err = reader.read().await.expect_err("read must reject on the errored stream");
+    assert!(
+        err.to_string().contains("first"),
+        "the first controller.error() wins; the surplus call is a no-op, got: {err}"
+    );
+}
+
 // "ReadableStreamDefaultController: error() after close() is a no-op"
 #[cfg(feature = "send")]
 #[tokio::test]
