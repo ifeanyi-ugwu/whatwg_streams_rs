@@ -1747,15 +1747,11 @@ async fn default_strategy_hwms() {
 // transform() enqueues, terminates, then throws; the thrown error must win — the
 // readable errors with it rather than closing cleanly from the terminate.
 //
-// KNOWN DIVERGENCE (ignored): the readable closes eagerly on terminate() even with a
-// chunk still queued, so the subsequent error() is a no-op and the readable closes
-// cleanly instead of erroring. The spec keeps the stream `readable` (closing) until the
-// queue drains, so a later error() still applies. Fixing this requires deferring the
-// readable's `Closed` transition until the queue drains — a core change with wide blast
-// radius (closed() timing when data is queued at close). Documented in WPT_COVERAGE.md.
+// The readable defers its `Closed` transition while the queue still holds chunks (it stays
+// "readable"/closing until a read drains the last one), so the error() following terminate()
+// still applies and the readable errors with the thrown error rather than closing cleanly.
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore = "known divergence: eager readable close on terminate() swallows a following transform error; needs deferred-close rework (see WPT_COVERAGE.md)"]
 async fn transform_throw_after_terminate_errors_readable() {
     struct ThrowAfterTerminateT;
 
