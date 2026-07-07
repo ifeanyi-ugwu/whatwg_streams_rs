@@ -222,8 +222,15 @@ impl<T: MaybeSend + 'static> ReadableStreamDefaultController<T> {
     }
 
     pub fn error(&self, error: StreamError) -> StreamResult<()> {
-        // Per spec §3.6.5: if state is not "readable", return (no-op, no throw).
-        if self.is_stream_unusable() {
+        // Spec §3.6.5: error() takes effect while the state is "readable". A close() whose queue
+        // is still draining stays "readable" (closing), so error() must still apply then — hence
+        // this does NOT gate on `close_requested` (unlike enqueue/close). Only a closed, errored,
+        // or already-erroring stream is a no-op. A close of an *empty* queue is "closed" at once;
+        // the message still sends, but the task's Error handler skips it once state is Closed.
+        if self.closed.load(Ordering::Acquire)
+            || self.errored.load(Ordering::Acquire)
+            || self.error_requested.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         self.error_requested.store(true, Ordering::Release);
@@ -2329,6 +2336,11 @@ async fn readable_stream_task<T: 'static, Source>(
     // post-start pull.
     let mut needs_pull = true;
 
+    // A close() requested while the queue still holds chunks. The spec keeps the stream
+    // "readable" (closing) until the queue drains, so a controller.error() in that window still
+    // errors the stream. The Closed transition is deferred until the read that empties the queue.
+    let mut close_pending = false;
+
     poll_fn(|cx| {
         // Process controller messages first
         while let Poll::Ready(Some(msg)) = ctrl_rx.poll_next_unpin(cx) {
@@ -2357,18 +2369,31 @@ async fn readable_stream_task<T: 'static, Source>(
                 }
                 ControllerMsg::Close => {
                     if inner.state == StreamState::Readable {
-                        inner.state = StreamState::Closed;
-                        closed.store(true, Ordering::Release);
+                        // Closing: no more chunks can be accepted, so desiredSize is 0.
                         desired_size.store(0, Ordering::Release);
-                        while let Some(tx) = inner.pending_reads.pop_front() {
-                            let _ = tx.send(Ok(None));
+                        if inner.queue.is_empty() {
+                            inner.state = StreamState::Closed;
+                            closed.store(true, Ordering::Release);
+                            while let Some(tx) = inner.pending_reads.pop_front() {
+                                let _ = tx.send(Ok(None));
+                            }
+                            inner.closed_wakers.wake_all();
+                            inner.ready_wakers.wake_all();
+                        } else {
+                            // Queue not empty: stay "readable" (closing) so a later
+                            // controller.error() still applies. The read that drains the last
+                            // chunk finalizes the close. (pending_reads is empty here — a pending
+                            // read would have dequeued from the queue.)
+                            close_pending = true;
                         }
-                        inner.closed_wakers.wake_all();
-                        inner.ready_wakers.wake_all();
                     }
                 }
                 ControllerMsg::Error(err) => {
                     if inner.state != StreamState::Closed {
+                        // A pending close is overridden by the error (the stream was still
+                        // "readable"/closing, so error() applies — this is the terminate()-then-
+                        // throw case).
+                        close_pending = false;
                         inner.state = StreamState::Errored;
                         errored.store(true, Ordering::Release);
                         inner.stored_error = Some(err.clone());
@@ -2414,6 +2439,16 @@ async fn readable_stream_task<T: 'static, Source>(
                             &errored,
                         );
                         let _ = completion.send(Ok(Some(chunk)));
+                        // Draining the last chunk of a stream that was closing finalizes the
+                        // deferred close (spec: the queue is empty, so ReadableStreamClose runs).
+                        if close_pending && inner.queue.is_empty() {
+                            close_pending = false;
+                            inner.state = StreamState::Closed;
+                            closed.store(true, Ordering::Release);
+                            desired_size.store(0, Ordering::Release);
+                            inner.closed_wakers.wake_all();
+                            inner.ready_wakers.wake_all();
+                        }
                     } else {
                         inner.pending_reads.push_back(completion);
                     }
@@ -2436,6 +2471,7 @@ async fn readable_stream_task<T: 'static, Source>(
                     if inner.cancel_requested {
                         inner.cancel_completions.push(completion);
                     } else {
+                        close_pending = false;
                         inner.cancel_requested = true;
                         inner.cancel_reason = reason.clone();
                         inner.cancel_completions.push(completion);
