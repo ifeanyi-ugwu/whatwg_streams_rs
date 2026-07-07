@@ -440,17 +440,15 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-One portable spec behaviour is currently *not* matched. It has an `#[ignore]`d test asserting the
-spec-correct outcome, kept as executable documentation:
+No portable spec behaviours are currently unmatched — the suite has no `#[ignore]`d divergences.
 
-- **transform `errors.any.js`: an exception from `transform()` after `terminate()` must
-  error the readable with the thrown error.** The readable closes eagerly on `terminate()`
-  even with a chunk still queued, so the following `error()` is a no-op and the readable
-  closes cleanly instead of erroring. The spec keeps the stream `readable` (closing) until
-  the queue drains, so a later `error()` still applies. The fix is to defer the readable's
-  `Closed` transition until the queue drains — a core change with wide blast radius
-  (`closed()` timing when data is queued at close). Test:
-  `transform_throw_after_terminate_errors_readable`.
+Previously divergent, now fixed: **an exception from `transform()` after `terminate()` errors the
+readable with the thrown error** (WPT transform `errors.any.js`). The readable used to close
+eagerly on `terminate()` even with a chunk still queued, so the following `error()` no-op'd. A
+close whose queue is still draining now stays `readable` (closing) — the `Closed` transition is
+deferred until a read empties the queue, and the controller's `error()` no longer gates on
+`close_requested` — so the later `error()` applies. Pinned by
+`transform_throw_after_terminate_errors_readable`.
 
 Related accepted decision: writable `abort()` during an in-flight *rejecting* `close()`
 (WPT "abort() should be rejected with the rejection returned from close()") falls under the
