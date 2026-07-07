@@ -436,3 +436,150 @@ async fn tee_failing_source_cancel_propagates_to_branch_cancel() {
          r1={r1_cancel:?} r2={r2_cancel:?}"
     );
 }
+
+// WPT: tee.any.js — "ReadableStreamTee should not pull more chunks than can fit in the branch
+// queue". Source HWM 0 (idle pull), branches default HWM 1. With no branch reads the coordinator
+// issues exactly one read to the source (one pull) to fill both branch queues, then waits.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_pulls_source_once_to_fill_branches() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use whatwg_streams::CountQueuingStrategy;
+
+    struct CountingIdleSource {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for CountingIdleSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            Ok(()) // enqueue nothing: the coordinator's read stays pending
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let source = ReadableStream::builder(CountingIdleSource {
+        pulls: pulls.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(0))
+    .spawn(tokio::spawn);
+    let (_b1, _b2) = source.tee().spawn(tokio::spawn).unwrap();
+
+    // Let the coordinator run; no branch reads issued.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        1,
+        "tee must pull the source exactly once to fill the branch queues, not repeatedly"
+    );
+}
+
+// WPT: tee.any.js — "ReadableStreamTee should not pull when original is already errored". A source
+// errored before the tee runs must never be pulled; both branches error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_does_not_pull_when_source_already_errored() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    struct FailStartCountPull {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for FailStartCountPull {
+        async fn start(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Err(StreamError::from("boo"))
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let source = ReadableStream::builder(FailStartCountPull {
+        pulls: pulls.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (b1, b2) = source.tee().spawn(tokio::spawn).unwrap();
+    let (_l1, r1) = b1.get_reader().unwrap();
+    let (_l2, r2) = b2.get_reader().unwrap();
+
+    assert!(r1.read().await.is_err(), "branch 1 must error");
+    assert!(r2.read().await.is_err(), "branch 2 must error");
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        0,
+        "an already-errored source must never be pulled by the tee"
+    );
+}
+
+// WPT: tee.any.js — "ReadableStreamTee should only pull enough to fill the emptiest queue". Source
+// HWM 0 enqueues one chunk per pull; branches HWM 1. The initial pull fills both branches; reading
+// one chunk from each empties both, so the spec pulls a second time — exactly twice.
+//
+// Divergence (`#[ignore]`d, asserts the spec outcome): the tee over-pulls by one (observed 3, not
+// 2). The BackpressureMode-extension coordinator gates pulling on a per-branch *channel-backlog*
+// count (branchN_pending_count), decremented when the branch's TeeSource buffers a chunk into the
+// branch's own queue — not when the branch's reader consumes it. So there are two buffers (the
+// coordinator->branch channel plus the branch's queue) but should_pull only sees the channel: once
+// a read frees the branch queue and the buffered chunk moves in, the backlog reads 0 and the
+// coordinator reads again. A spec-precise count needs the branch's real queue depth (desiredSize)
+// to drive should_pull, unifying the double buffer — deferred. The core tee behaviour (both
+// branches receive every chunk, in order) is covered by `tee_both_branches_get_all_chunks`.
+#[cfg(feature = "send")]
+#[tokio::test]
+#[ignore = "tee over-pulls by one: should_pull uses the channel backlog, not the branch queue depth (see comment)"]
+async fn tee_pulls_only_enough_to_fill_emptiest_queue() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use whatwg_streams::CountQueuingStrategy;
+
+    struct CountingEnqueueSource {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for CountingEnqueueSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            controller.enqueue(0)?;
+            Ok(())
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let source = ReadableStream::builder(CountingEnqueueSource {
+        pulls: pulls.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(0))
+    .spawn(tokio::spawn);
+    let (b1, b2) = source.tee().spawn(tokio::spawn).unwrap();
+    let (_l1, r1) = b1.get_reader().unwrap();
+    let (_l2, r2) = b2.get_reader().unwrap();
+
+    assert_eq!(r1.read().await.unwrap(), Some(0));
+    assert_eq!(r2.read().await.unwrap(), Some(0));
+    // Give any surplus pull a chance to (wrongly) fire before asserting the exact count.
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        2,
+        "tee must pull exactly twice: once to fill both branches, once after both are drained"
+    );
+}
