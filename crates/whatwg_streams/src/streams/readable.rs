@@ -2346,6 +2346,14 @@ async fn readable_stream_task<T: 'static, Source>(
         while let Poll::Ready(Some(msg)) = ctrl_rx.poll_next_unpin(cx) {
             match msg {
                 ControllerMsg::Enqueue { chunk } => {
+                    // No chunk may enter the queue once the stream is closing (close_pending),
+                    // closed, or errored. The controller's enqueue() rejects this synchronously in
+                    // the usual single-task case; this also drops a stray enqueue from a cross-task
+                    // enqueue/close race (the controller is Clone and Send, so that race is real in
+                    // Rust even though it cannot happen in single-threaded JS).
+                    if close_pending || inner.state != StreamState::Readable {
+                        continue;
+                    }
                     if let Some(tx) = inner.pending_reads.pop_front() {
                         let _ = tx.send(Ok(Some(chunk)));
                     } else {
