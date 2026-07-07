@@ -579,13 +579,7 @@ async fn pipe_to_last_write_error_does_not_cancel_already_closed_source() {
             controller.close()?;
             Ok(())
         }
-        async fn pull(
-            &mut self,
-            _controller: &mut ReadableStreamDefaultController<u32>,
-        ) -> StreamResult<()> {
-            // Never reached: start() closes the stream, so the pull gate stays shut.
-            Ok(())
-        }
+        // No pull: start() enqueues everything and closes.
         async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
             *self.cancel_called.lock().unwrap() = true;
             Ok(())
@@ -664,12 +658,7 @@ async fn pipe_to_in_flight_write_error_during_close_flush_errors_pipe() {
             controller.close()?;
             Ok(())
         }
-        async fn pull(
-            &mut self,
-            _controller: &mut ReadableStreamDefaultController<u32>,
-        ) -> StreamResult<()> {
-            Ok(())
-        }
+        // No pull: start() enqueues everything and closes.
         async fn cancel(&mut self, _reason: Option<String>) -> StreamResult<()> {
             *self.cancel_called.lock().unwrap() = true;
             Ok(())
