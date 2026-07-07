@@ -11,6 +11,10 @@ pub trait ReadableByteSource: MaybeSend + 'static {
 
     /// Produce bytes into the stream.
     ///
+    /// Optional (spec: a source with no `pull` gets a no-op pull algorithm) — implement it for the
+    /// usual pull-driven source; omit it for one that enqueues everything in `start()` or pushes
+    /// via a captured controller.
+    ///
     /// Hand chunks to the controller with `controller.enqueue(impl Into<Bytes>)`:
     /// a chunk already held as `Bytes` transfers in without a copy. A source
     /// reading from elsewhere owns its read buffer (e.g. fill a `BytesMut`, then
@@ -18,8 +22,10 @@ pub trait ReadableByteSource: MaybeSend + 'static {
     /// through the controller. Signal end-of-stream with `controller.close()`.
     fn pull(
         &mut self,
-        controller: &mut ReadableByteStreamController,
-    ) -> impl Future<Output = StreamResult<()>> + MaybeSend;
+        #[allow(unused)] controller: &mut ReadableByteStreamController,
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
+        async { Ok(()) }
+    }
 
     fn cancel(
         &mut self,

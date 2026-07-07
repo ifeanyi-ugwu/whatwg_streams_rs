@@ -66,10 +66,15 @@ pub trait ReadableSource<T: MaybeSend + 'static>: MaybeSend + 'static {
         async { Ok(()) }
     }
 
+    /// Called when the stream wants more data. Optional (spec: a source with no `pull` gets a
+    /// no-op pull algorithm) — implement it for the usual pull-driven source; omit it for a source
+    /// that enqueues everything in `start()` or pushes via a captured controller.
     fn pull(
         &mut self,
-        controller: &mut ReadableStreamDefaultController<T>,
-    ) -> impl Future<Output = StreamResult<()>> + MaybeSend;
+        #[allow(unused)] controller: &mut ReadableStreamDefaultController<T>,
+    ) -> impl Future<Output = StreamResult<()>> + MaybeSend {
+        async { Ok(()) }
+    }
 
     fn cancel(
         &mut self,
