@@ -440,7 +440,19 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-No portable spec behaviours are currently unmatched — the suite has no `#[ignore]`d divergences.
+One approximation remains, with an `#[ignore]`d test asserting the spec-precise outcome:
+
+- **readable `tee`: exact pull count under backpressure.** The tee should read from the source only
+  enough to fill the emptiest branch queue; it over-reads by a bounded amount (one per branch queue
+  slot). The `BackpressureMode`-extension coordinator gates `should_pull` on a per-branch
+  *channel-backlog* count that is decremented when a branch buffers a chunk into its own queue, not
+  when the branch's reader consumes it — so with the coordinator→branch channel plus the branch
+  queue there are two buffers but only the channel is counted. A spec-precise count needs the
+  branch's real queue depth (desiredSize) to drive `should_pull`, unifying the double buffer — a
+  rework, deferred. The no-read cases are exact and covered (`tee_pulls_source_once_to_fill_branches`,
+  `tee_does_not_pull_when_source_already_errored`); the post-read count is pinned by the ignored
+  `tee_pulls_only_enough_to_fill_emptiest_queue`. This is a backpressure-precision issue, not a
+  correctness one — every chunk still reaches both branches in order.
 
 Previously divergent, now fixed: **an exception from `transform()` after `terminate()` errors the
 readable with the thrown error** (WPT transform `errors.any.js`). The readable used to close
@@ -515,12 +527,9 @@ called). Not re-litigated here.
 
 ### Identified portable gaps not yet ported
 
-Distinct spec behaviours the audit surfaced that are neither covered nor a documented skip,
-kept here so the accounting is complete (candidates for a future pass):
-
-- readable `tee`: the coordinator's pull-scheduling bound ("pull only to fill the emptiest
-  branch queue"; stop pulling once the source errors) — tied to the `BackpressureMode`
-  extension's semantics.
+None. Every portable spec behaviour the audit surfaced is now either covered or a documented
+skip/divergence. The one remaining approximation — the tee's exact pull count under backpressure —
+is recorded under "Known behavioural divergences" (its `#[ignore]`d test asserts the spec outcome).
 
 ### Stale test-comment labels (no coverage impact)
 
