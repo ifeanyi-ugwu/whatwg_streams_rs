@@ -802,9 +802,6 @@ pub struct TeeSource<T: MaybeSend + 'static> {
     // Branch → coordinator: "this branch wants data". Shared by both branches; the
     // coordinator coalesces (an AtomicBool collapses concurrent signals into one wake).
     pull_signal: AsyncSignal,
-    // Coordinator → this branch: "I have served you (enqueue/close/error)". Only the
-    // byte pull path waits on it; see the ReadableByteSource impl below.
-    served: AsyncSignal,
 
     // Cancel coordination — both TeeSource instances share these.
     first_cancel_done: SharedPtr<AtomicBool>,
@@ -879,14 +876,11 @@ impl ReadableByteSource for TeeSource<Bytes> {
         &mut self,
         _controller: &mut ReadableByteStreamController,
     ) -> StreamResult<()> {
-        // Same request-to-coordinator handshake as the default branch, but the byte
-        // task's pull gate is level-triggered on desiredSize: it re-pulls as long as the
-        // buffer is below the high-water mark. If this returned before the coordinator
-        // enqueued, the gate would re-pull in a tight loop. Block until the coordinator
-        // has served this branch so the completed pull sees an up-to-date buffer and the
-        // gate settles.
+        // Identical to the default branch: signal the coordinator and return. This pull
+        // enqueues nothing, so the byte task's pull gate (edge-triggered on buffer growth
+        // — see mark_pull_completed) does not re-arm, so no busy loop. The coordinator's
+        // out-of-band enqueue then reaches a parked read via the byte task's serve gate.
         self.pull_signal.signal();
-        self.served.wait().await;
         Ok(())
     }
 
@@ -915,10 +909,6 @@ where
 
     // A branch's pull() signals this; the coordinator waits on it for the next demand.
     pull_signal: AsyncSignal,
-    // Fired after the coordinator serves a branch (enqueue/close/error), releasing a byte
-    // branch's pull that is parked on it.
-    branch1_served: AsyncSignal,
-    branch2_served: AsyncSignal,
 }
 
 impl<T: MaybeSend + 'static, Source, StreamType, LockState, B>
@@ -979,30 +969,21 @@ where
         if self.branch2_active() && self.branch2.enqueue(chunk).is_err() {
             self.branch2_canceled.store(true, Ordering::Release);
         }
-        self.serve_signals();
     }
 
     fn close_branches(&self) {
         let _ = self.branch1.close();
         let _ = self.branch2.close();
-        self.serve_signals();
     }
 
     fn error_branches(&self, err: StreamError) {
         let _ = self.branch1.error(err.clone());
         let _ = self.branch2.error(err);
-        self.serve_signals();
-    }
-
-    fn serve_signals(&self) {
-        self.branch1_served.signal();
-        self.branch2_served.signal();
     }
 
     async fn finish_both_canceled(&self) {
         // Both branches are gone: cancel the source and broadcast its result to any
-        // branch cancel() still waiting. Release any byte pull parked on `served` first.
-        self.serve_signals();
+        // branch cancel() still waiting.
         let result = self
             .reader
             .cancel(Some("Both tee branches terminated".to_string()))
@@ -1027,8 +1008,8 @@ where
 
             // Wait for a branch to ask for data (its pull() signals). Reading only after a
             // fresh signal — never looping straight back into another read — is what keeps
-            // the pull count exact: a served branch whose queue is now full sends no new
-            // signal, so the coordinator parks here instead of over-pulling.
+            // the pull count exact: a branch just handed a chunk, its queue now full, sends
+            // no new signal, so the coordinator parks here instead of over-pulling.
             self.pull_signal.wait().await;
 
             // A cancel (which also signals) may have woken us.
@@ -1065,8 +1046,6 @@ struct TeeSetup {
     branch1_canceled: SharedPtr<AtomicBool>,
     branch2_canceled: SharedPtr<AtomicBool>,
     pull_signal: AsyncSignal,
-    branch1_served: AsyncSignal,
-    branch2_served: AsyncSignal,
     first_cancel_done: SharedPtr<AtomicBool>,
     cancel_result: SharedPtr<TeeCancelResult>,
 }
@@ -1077,8 +1056,6 @@ impl TeeSetup {
             branch1_canceled: SharedPtr::new(AtomicBool::new(false)),
             branch2_canceled: SharedPtr::new(AtomicBool::new(false)),
             pull_signal: AsyncSignal::new(),
-            branch1_served: AsyncSignal::new(),
-            branch2_served: AsyncSignal::new(),
             first_cancel_done: SharedPtr::new(AtomicBool::new(false)),
             cancel_result: SharedPtr::new(TeeCancelResult::new()),
         }
@@ -1088,7 +1065,6 @@ impl TeeSetup {
         let source1 = TeeSource {
             branch_canceled: self.branch1_canceled.clone(),
             pull_signal: self.pull_signal.clone(),
-            served: self.branch1_served.clone(),
             first_cancel_done: self.first_cancel_done.clone(),
             cancel_result: self.cancel_result.clone(),
             _phantom: PhantomData,
@@ -1096,7 +1072,6 @@ impl TeeSetup {
         let source2 = TeeSource {
             branch_canceled: self.branch2_canceled.clone(),
             pull_signal: self.pull_signal.clone(),
-            served: self.branch2_served.clone(),
             first_cancel_done: self.first_cancel_done.clone(),
             cancel_result: self.cancel_result.clone(),
             _phantom: PhantomData,
@@ -1125,8 +1100,6 @@ impl TeeSetup {
             cancel_result: self.cancel_result,
             backpressure_mode: mode,
             pull_signal: self.pull_signal,
-            branch1_served: self.branch1_served,
-            branch2_served: self.branch2_served,
         }
     }
 }
