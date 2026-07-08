@@ -86,6 +86,12 @@ pub struct ByteStreamState<Source> {
 
     pub(crate) read_wakers: Mutex<Vec<Waker>>,
     pull_waker: Mutex<Option<Waker>>,
+    // Wakes the byte task to hand buffered data (or a terminal EOF/error) to default reads parked
+    // in its task-local `pending_reads`. enqueue/close/error mutate the shared state directly, out
+    // of any pull, and a parked default read is not one of the state-level `read_wakers` (only BYOB
+    // /AsyncRead reads poll the state directly). Without this a push-model source — one that
+    // enqueues out of band from another task — would strand such a read.
+    serve_waker: Mutex<Option<Waker>>,
 
     pub(crate) closed: AtomicBool,
     pub(crate) errored: AtomicBool,
@@ -93,6 +99,7 @@ pub struct ByteStreamState<Source> {
 
     pub(crate) pull_in_progress: AtomicBool,
     needs_pull: AtomicBool,
+    serve_pending: AtomicBool,
 
     pub(crate) queue_total_size: AtomicUsize,
     pub(crate) high_water_mark: AtomicUsize,
@@ -115,11 +122,13 @@ where
             source: Mutex::new(Some(source)),
             read_wakers: Mutex::new(Vec::new()),
             pull_waker: Mutex::new(None),
+            serve_waker: Mutex::new(None),
             closed: AtomicBool::new(false),
             errored: AtomicBool::new(false),
             error: Mutex::new(None),
             pull_in_progress: AtomicBool::new(false),
             needs_pull: AtomicBool::new(false),
+            serve_pending: AtomicBool::new(false),
             queue_total_size: AtomicUsize::new(0),
             high_water_mark: AtomicUsize::new(high_water_mark),
             desired_size: AtomicIsize::new(high_water_mark as isize),
@@ -290,6 +299,31 @@ where
         }
     }
 
+    // Ask the byte task to revisit its parked default reads (see `serve_waker`). Called from
+    // enqueue/close/error, which run outside any pull. Level-triggered latch consumed by
+    // poll_serve_needed.
+    fn notify_serve(&self) {
+        self.serve_pending.store(true, Ordering::Release);
+        if let Some(waker) = self.serve_waker.lock().take() {
+            waker.wake();
+        }
+    }
+
+    // The byte task's serve gate. Fires once per enqueue/close/error so the task can drain its
+    // task-local `pending_reads` from the current buffer / terminal state.
+    pub fn poll_serve_needed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.serve_pending.swap(false, Ordering::AcqRel) {
+            return Poll::Ready(());
+        }
+        *self.serve_waker.lock() = Some(cx.waker().clone());
+        // Re-check after registering so a notify racing the park is not lost.
+        if self.serve_pending.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     // The producer transfers ownership of an already-allocated chunk into the
     // queue without copying its contents.
     pub fn enqueue_bytes(&self, chunk: Bytes) {
@@ -309,6 +343,9 @@ where
         // Waiting BYOB pull-intos get first claim on freshly enqueued bytes.
         self.settle_pending_pull_intos();
         self.wake_readers();
+        // Wake the byte task too: a default read parked in its `pending_reads` is not a state-level
+        // read_waker, so wake_readers() alone would leave it stranded on an out-of-band enqueue.
+        self.notify_serve();
     }
 
     // Begin a BYOB owned-buffer read. With no reads queued ahead, take the
@@ -484,6 +521,8 @@ where
         self.update_desired_size();
         self.settle_pending_pull_intos();
         self.wake_readers();
+        // Resolve default reads parked in the task with EOF, even for an out-of-band close.
+        self.notify_serve();
         if let Some(waker) = self.pull_waker.lock().take() {
             waker.wake();
         }
@@ -495,6 +534,8 @@ where
         self.update_desired_size();
         self.settle_pending_pull_intos();
         self.wake_readers();
+        // Reject default reads parked in the task, even for an out-of-band error.
+        self.notify_serve();
         if let Some(waker) = self.pull_waker.lock().take() {
             waker.wake();
         }

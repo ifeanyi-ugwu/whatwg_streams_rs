@@ -2621,8 +2621,9 @@ async fn readable_byte_stream_task<Source>(
 
     loop {
         let pull_fut = poll_fn(|cx| byte_state.poll_pull_needed(cx)).fuse();
+        let serve_fut = poll_fn(|cx| byte_state.poll_serve_needed(cx)).fuse();
         let cmd_fut = command_rx.next().fuse();
-        futures::pin_mut!(pull_fut, cmd_fut);
+        futures::pin_mut!(pull_fut, serve_fut, cmd_fut);
 
         futures::select! {
             // 1️⃣ Pull data from source if needed
@@ -2716,7 +2717,32 @@ async fn readable_byte_stream_task<Source>(
                 // Note: Don't break here even if closed/errored - continue to handle commands
             }
 
-            // 2️⃣ Handle Read commands
+            // 2️⃣ Serve parked reads from an out-of-band enqueue/close/error. The pull branch only
+            // drains pending_reads after a pull that grew the buffer; a push-model source produces
+            // outside any pull, so its enqueue (or terminal close/error) must be able to hand data
+            // — or EOF/error — to a read already parked here. Mirrors the cmd branch's immediate
+            // read, popping FIFO until the buffer runs dry (then the read stays parked).
+            _ = serve_fut => {
+                while let Some(completion) = pending_reads.pop_front() {
+                    match poll_fn(|cx| byte_state.poll_read_chunk(cx)).now_or_never() {
+                        Some(Ok(Some(chunk))) => {
+                            let _ = completion.send(Ok(Some(chunk)));
+                        }
+                        Some(Ok(None)) => {
+                            let _ = completion.send(Ok(None));
+                        }
+                        Some(Err(err)) => {
+                            let _ = completion.send(Err(err));
+                        }
+                        None => {
+                            pending_reads.push_front(completion);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 3️⃣ Handle Read commands
             cmd = cmd_fut => {
                 match cmd {
                     Some(StreamCommand::Read { completion }) => {
