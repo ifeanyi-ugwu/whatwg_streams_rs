@@ -444,8 +444,23 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-No `#[ignore]`d tests remain, and no behavioural divergences are outstanding. The items below were
-divergent and are now fixed.
+One deferred gap is outstanding, pinned by a single `#[ignore]`d test; the rest of this section was
+divergent and is now fixed.
+
+Outstanding (deferred): **a push-model byte source strands a default reader.** A source whose `pull()`
+produces nothing and that `enqueue`s later, out of band, from another task (a captured controller
+clone) leaves a *default* reader's `read()` hanging when the read parks before the push arrives.
+`enqueue_bytes` wakes `read_wakers` (which BYOB / `AsyncRead` readers register by polling the state
+directly) but never wakes the byte task, so a read parked in the task's `pending_reads` is never
+served — the data sits in the buffer unread. BYOB/`AsyncRead` readers, pull-model sources, and the
+`tee` (whose byte branch forces the coordinator's push into the pull window via its `served`
+handshake) are all immune; the bad ordering (read-before-push) is the common one for a push source.
+It is not a regression — the pre-fix busy-loop stranded the same case, just while pegging a core. Fix
+shape: have `enqueue_bytes` wake the task and drain `pending_reads` from the current buffer (the same
+change that would let the `tee` drop `served`). Deferred: the read-serving path is central to every
+byte stream and BYOB is a working alternative. Full walk-through in
+`docs/explainers/byte-push-default-reader-stranding.md`; pinned by the `#[ignore]`d
+`push_model_default_reader_strands` (asserts the read completes; currently times out).
 
 Previously divergent, now fixed: **byte stream pull gate re-fired a progress-less `pull()`.** The
 spec gates both controllers through `CallPullIfNeeded` with `[[pulling]]`/`[[pullAgain]]` —
@@ -548,8 +563,9 @@ called). Not re-litigated here.
 ### Identified portable gaps not yet ported
 
 None. Every portable spec behaviour the audit surfaced is now either covered or a documented
-skip/divergence. The one remaining approximation — the tee's exact pull count under backpressure —
-is recorded under "Known behavioural divergences" (its `#[ignore]`d test asserts the spec outcome).
+skip/divergence. The one outstanding gap — a push-model byte source stranding a default reader — is
+recorded under "Known behavioural divergences" (its `#[ignore]`d test asserts the correct outcome and
+currently times out).
 
 ### Stale test-comment labels (no coverage impact)
 
