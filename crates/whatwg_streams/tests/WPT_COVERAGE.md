@@ -409,7 +409,8 @@ branch and read into their own buffer — pinned by `byte_tee_branch_supports_by
 Both branches drain the full content independently (each owns its `Vec<u8>`), cancel-one
 keeps the other live, and canceling both fires the source's `cancel()` exactly once —
 covered by the byte-tee tests plus the generic tee suite in `readable/tee.rs` (the
-coordinator and channels are shared between default and byte tee).
+coordinator is shared between default and byte tee; it enqueues directly into each
+branch's controller, with the byte branch's pull blocking on a `served` signal until served).
 
 This was previously a divergence (byte tee yielded *default* branches). It is now
 implemented: `tee()` stays universal, and the `TeeBuilder` terminal methods are split by
@@ -443,19 +444,31 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-One approximation remains, with an `#[ignore]`d test asserting the spec-precise outcome:
+No `#[ignore]`d tests remain. One divergence is documented as a deferred follow-up:
 
-- **readable `tee`: exact pull count under backpressure.** The tee should read from the source only
-  enough to fill the emptiest branch queue; it over-reads by a bounded amount (one per branch queue
-  slot). The `BackpressureMode`-extension coordinator gates `should_pull` on a per-branch
-  *channel-backlog* count that is decremented when a branch buffers a chunk into its own queue, not
-  when the branch's reader consumes it — so with the coordinator→branch channel plus the branch
-  queue there are two buffers but only the channel is counted. A spec-precise count needs the
-  branch's real queue depth (desiredSize) to drive `should_pull`, unifying the double buffer — a
-  rework, deferred. The no-read cases are exact and covered (`tee_pulls_source_once_to_fill_branches`,
-  `tee_does_not_pull_when_source_already_errored`); the post-read count is pinned by the ignored
-  `tee_pulls_only_enough_to_fill_emptiest_queue`. This is a backpressure-precision issue, not a
-  correctness one — every chunk still reaches both branches in order.
+- **byte stream pull gate: level-triggered, not spec `[[pullAgain]]`.** The spec gates both
+  controllers through `CallPullIfNeeded` with `[[pulling]]`/`[[pullAgain]]` — edge-triggered: after a
+  pull resolves it re-pulls only if an enqueue/read happened *during* the pull. The default task
+  implements this faithfully (`needs_pull` is `[[pullAgain]]`, armed on start/enqueue/read). The byte
+  task instead re-arms on pull completion whenever `buffer < hwm` (`maybe_trigger_pull` in
+  `mark_pull_completed`) — level-triggered. For a source that enqueues or `.await`s inside `pull()`
+  the buffer fills and the gate settles, so the observable behaviour matches. But a source whose
+  `pull()` returns `Ok(())` without enqueuing and without awaiting re-pulls in a tight loop with no
+  yield point, starving a current-thread runtime; the default side parks in the same case. This
+  includes the default no-op `pull()` (omitted `pull()`), so the "seed in `start()`, omit `pull()`"
+  pattern the `ReadableByteSource::pull` doc suggests can hang. A spec-faithful fix is to make the
+  byte task edge-triggered like the default side (which would also let the `tee` byte branch drop its
+  `served` handshake); deferred as its own change since the byte task is central to every byte stream.
+
+Previously divergent, now fixed: **readable `tee` exact pull count under backpressure.** The tee
+over-read by one because `should_pull` counted a per-branch *channel backlog* decremented when a
+branch buffered a chunk into its own queue, not when its reader consumed it — two buffers (the
+coordinator→branch channel plus the branch queue), only the channel counted. The tee was rewritten to
+the spec model (`ReadableStreamDefaultTee`): no channel, the coordinator enqueues directly into both
+branch controllers and gates `should_pull` on their real `desiredSize`, so the branch queue is the
+only buffer and the count is exact. `tee_pulls_only_enough_to_fill_emptiest_queue` is un-ignored and
+green, alongside the no-read cases (`tee_pulls_source_once_to_fill_branches`,
+`tee_does_not_pull_when_source_already_errored`).
 
 Previously divergent, now fixed: **an exception from `transform()` after `terminate()` errors the
 readable with the thrown error** (WPT transform `errors.any.js`). The readable used to close
