@@ -444,23 +444,23 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-One deferred gap is outstanding, pinned by a single `#[ignore]`d test; the rest of this section was
-divergent and is now fixed.
+No `#[ignore]`d tests remain, and no behavioural divergences are outstanding. The items below were
+divergent and are now fixed.
 
-Outstanding (deferred): **a push-model byte source strands a default reader.** A source whose `pull()`
-produces nothing and that `enqueue`s later, out of band, from another task (a captured controller
-clone) leaves a *default* reader's `read()` hanging when the read parks before the push arrives.
-`enqueue_bytes` wakes `read_wakers` (which BYOB / `AsyncRead` readers register by polling the state
-directly) but never wakes the byte task, so a read parked in the task's `pending_reads` is never
-served — the data sits in the buffer unread. BYOB/`AsyncRead` readers, pull-model sources, and the
-`tee` (whose byte branch forces the coordinator's push into the pull window via its `served`
-handshake) are all immune; the bad ordering (read-before-push) is the common one for a push source.
-It is not a regression — the pre-fix busy-loop stranded the same case, just while pegging a core. Fix
-shape: have `enqueue_bytes` wake the task and drain `pending_reads` from the current buffer (the same
-change that would let the `tee` drop `served`). Deferred: the read-serving path is central to every
-byte stream and BYOB is a working alternative. Full walk-through in
-`docs/explainers/byte-push-default-reader-stranding.md`; pinned by the `#[ignore]`d
-`push_model_default_reader_strands` (asserts the read completes; currently times out).
+Previously divergent, now fixed: **a push-model byte source stranded a default reader.** A source
+whose `pull()` produces nothing and that `enqueue`s later, out of band, from another task (a captured
+controller clone) left a *default* reader's `read()` hanging when the read parked before the push
+arrived: `enqueue_bytes` woke `read_wakers` (which BYOB / `AsyncRead` readers register by polling the
+state directly) but not the byte task, so a read parked in the task's `pending_reads` was never
+served. `enqueue`/`close`/`error` now also ring the byte task's serve gate (`notify_serve` /
+`poll_serve_needed`), and the task drains `pending_reads` from the current buffer / terminal state via
+a third `select!` branch — data, EOF, or error reaches a parked read whether the source produces
+inside or outside a pull. BYOB/`AsyncRead` readers and pull-model sources were always fine; the bad
+ordering (read-before-push) is the common one for a push source. Pinned by
+`push_model_default_reader_is_served` and `push_model_default_reader_gets_eof_on_out_of_band_close`;
+full walk-through in `docs/explainers/byte-read-delivery.md`. (The serve gate makes the `tee` byte
+branch's `served` handshake redundant for correctness, but it is kept — the tee's exact pull count is
+verified against it.)
 
 Previously divergent, now fixed: **byte stream pull gate re-fired a progress-less `pull()`.** The
 spec gates both controllers through `CallPullIfNeeded` with `[[pulling]]`/`[[pullAgain]]` —
@@ -475,9 +475,7 @@ doc suggests could hang. In the byte task's inline `pull().await` an enqueue (bu
 only event that can occur during a pull, so buffer growth *is* the `[[pullAgain]]` edge:
 `mark_pull_completed` now re-arms only when the pull made progress (or a BYOB pull-into is still
 outstanding), never on `desiredSize` alone. Pinned by
-`byte_pull_gate_does_not_spin_on_progressless_pull`. The `tee` byte branch keeps its `served`
-handshake: its coordinator enqueues from a separate task (a push producer) that the byte task does
-not wake for task-queued default reads, so the handshake is still required.
+`byte_pull_gate_does_not_spin_on_progressless_pull`.
 
 Previously divergent, now fixed: **readable `tee` exact pull count under backpressure.** The tee
 over-read by one because `should_pull` counted a per-branch *channel backlog* decremented when a
@@ -563,9 +561,7 @@ called). Not re-litigated here.
 ### Identified portable gaps not yet ported
 
 None. Every portable spec behaviour the audit surfaced is now either covered or a documented
-skip/divergence. The one outstanding gap — a push-model byte source stranding a default reader — is
-recorded under "Known behavioural divergences" (its `#[ignore]`d test asserts the correct outcome and
-currently times out).
+skip/divergence, and no `#[ignore]`d tests remain.
 
 ### Stale test-comment labels (no coverage impact)
 
