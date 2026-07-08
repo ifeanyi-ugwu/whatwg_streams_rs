@@ -844,17 +844,14 @@ async fn byte_pull_gate_does_not_spin_on_progressless_pull() {
     );
 }
 
-// KNOWN GAP — see docs/explainers/byte-push-default-reader-stranding.md.
 // A push-model byte source (no-op pull(), enqueues later from another task via a captured
-// controller) paired with a *default* reader strands when the read parks before the push:
-// enqueue_bytes wakes read_wakers (which BYOB/AsyncRead register) but never wakes the byte
-// task, so a read parked in the task's pending_reads is never served. This asserts the
-// correct outcome (the read completes); it is #[ignore]d because it currently times out.
-// Un-ignore once enqueue_bytes wakes the task and drains pending_reads from the buffer.
+// controller) paired with a *default* reader: the read parks before the push arrives, so it can
+// only be served by an out-of-band enqueue waking the byte task. enqueue_bytes wakes the task's
+// serve gate (not just the state-level read_wakers that BYOB/AsyncRead register), and the task
+// drains its pending_reads from the buffer. See docs/explainers/byte-read-delivery.md.
 #[cfg(feature = "send")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "push-model default reader stranding: enqueue does not wake the byte task (deferred)"]
-async fn push_model_default_reader_strands() {
+async fn push_model_default_reader_is_served() {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -882,7 +879,7 @@ async fn push_model_default_reader_strands() {
     let stream = ReadableStream::builder_bytes(PushSource { go: go.clone() }).spawn(tokio::spawn);
     let (_locked, reader) = stream.get_reader().unwrap();
 
-    // Read first so it parks (buffer empty), THEN push — the ordering that strands.
+    // Read first so it parks (buffer empty), THEN push — the ordering that used to strand.
     let read = tokio::spawn(async move { reader.read().await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     go.notify_one();
@@ -893,4 +890,47 @@ async fn push_model_default_reader_strands() {
         .unwrap()
         .unwrap();
     assert_eq!(served, Some(Bytes::from_static(b"pushed")));
+}
+
+// The terminal counterpart: a default read parked on a push-model source must get EOF when the
+// stream is closed out of band (from another task), not hang. Same serve-gate wakeup as an enqueue.
+#[cfg(feature = "send")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_model_default_reader_gets_eof_on_out_of_band_close() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct CloseLater {
+        go: Arc<Notify>,
+    }
+    impl ReadableByteSource for CloseLater {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            let ctrl = controller.clone();
+            let go = self.go.clone();
+            tokio::spawn(async move {
+                go.notified().await;
+                let _ = ctrl.close();
+            });
+            Ok(())
+        }
+    }
+
+    let go = Arc::new(Notify::new());
+    let stream = ReadableStream::builder_bytes(CloseLater { go: go.clone() }).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    let read = tokio::spawn(async move { reader.read().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    go.notify_one();
+
+    let eof = tokio::time::timeout(Duration::from_secs(3), read)
+        .await
+        .expect("parked read must complete (EOF) once the stream closes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(eof, None);
 }
