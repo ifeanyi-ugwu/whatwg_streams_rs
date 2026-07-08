@@ -444,21 +444,25 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-No `#[ignore]`d tests remain. One divergence is documented as a deferred follow-up:
+No `#[ignore]`d tests remain, and no behavioural divergences are outstanding. The items below were
+divergent and are now fixed.
 
-- **byte stream pull gate: level-triggered, not spec `[[pullAgain]]`.** The spec gates both
-  controllers through `CallPullIfNeeded` with `[[pulling]]`/`[[pullAgain]]` — edge-triggered: after a
-  pull resolves it re-pulls only if an enqueue/read happened *during* the pull. The default task
-  implements this faithfully (`needs_pull` is `[[pullAgain]]`, armed on start/enqueue/read). The byte
-  task instead re-arms on pull completion whenever `buffer < hwm` (`maybe_trigger_pull` in
-  `mark_pull_completed`) — level-triggered. For a source that enqueues or `.await`s inside `pull()`
-  the buffer fills and the gate settles, so the observable behaviour matches. But a source whose
-  `pull()` returns `Ok(())` without enqueuing and without awaiting re-pulls in a tight loop with no
-  yield point, starving a current-thread runtime; the default side parks in the same case. This
-  includes the default no-op `pull()` (omitted `pull()`), so the "seed in `start()`, omit `pull()`"
-  pattern the `ReadableByteSource::pull` doc suggests can hang. A spec-faithful fix is to make the
-  byte task edge-triggered like the default side (which would also let the `tee` byte branch drop its
-  `served` handshake); deferred as its own change since the byte task is central to every byte stream.
+Previously divergent, now fixed: **byte stream pull gate re-fired a progress-less `pull()`.** The
+spec gates both controllers through `CallPullIfNeeded` with `[[pulling]]`/`[[pullAgain]]` —
+edge-triggered: after a pull resolves it re-pulls only if an enqueue/read happened *during* the pull.
+The default task implements this faithfully (`needs_pull` is `[[pullAgain]]`, armed on
+start/enqueue/read). The byte task instead re-armed on pull completion whenever `buffer < hwm`
+(`maybe_trigger_pull` in `mark_pull_completed`) — level-triggered — so a `pull()` that returned
+`Ok(())` without enqueuing and without awaiting re-pulled in a tight loop with no yield point,
+starving a current-thread runtime hard enough to strand the read's own completion. That includes the
+default no-op `pull()`, so the "seed in `start()`, omit `pull()`" pattern the `ReadableByteSource::pull`
+doc suggests could hang. In the byte task's inline `pull().await` an enqueue (buffer growth) is the
+only event that can occur during a pull, so buffer growth *is* the `[[pullAgain]]` edge:
+`mark_pull_completed` now re-arms only when the pull made progress (or a BYOB pull-into is still
+outstanding), never on `desiredSize` alone. Pinned by
+`byte_pull_gate_does_not_spin_on_progressless_pull`. The `tee` byte branch keeps its `served`
+handshake: its coordinator enqueues from a separate task (a push producer) that the byte task does
+not wake for task-queued default reads, so the handshake is still required.
 
 Previously divergent, now fixed: **readable `tee` exact pull count under backpressure.** The tee
 over-read by one because `should_pull` counted a per-branch *channel backlog* decremented when a
