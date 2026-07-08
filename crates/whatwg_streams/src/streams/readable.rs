@@ -2646,10 +2646,13 @@ async fn readable_byte_stream_task<Source>(
 
                 let size_before = byte_state.buffer_size();
 
-                match source.pull(&mut controller).await {
+                let made_progress = match source.pull(&mut controller).await {
                     Ok(()) => {
-                        // The source produces by enqueueing into the controller.
-                        if byte_state.buffer_size() > size_before {
+                        // The source produces by enqueueing into the controller; a grown buffer is
+                        // the spec's [[pullAgain]] edge (see mark_pull_completed). Capture it before
+                        // draining reads, which shrink the buffer back.
+                        let made_progress = byte_state.buffer_size() > size_before;
+                        if made_progress {
                             while let Some(completion) = pending_reads.pop_front() {
                                 match poll_fn(|cx| byte_state.poll_read_chunk(cx)).now_or_never() {
                                     Some(Ok(None)) => {
@@ -2690,16 +2693,19 @@ async fn readable_byte_stream_task<Source>(
                                 let _ = completion.send(Err(error.clone()));
                             }
                         }
+
+                        made_progress
                     }
                     Err(err) => {
                         byte_state.error(err.clone());
                         while let Some(completion) = pending_reads.pop_front() {
                             let _ = completion.send(Err(err.clone()));
                         }
+                        false
                     }
-                }
+                };
 
-                byte_state.mark_pull_completed();
+                byte_state.mark_pull_completed(made_progress);
 
                 // Return source to state if still open and no error
                 if !byte_state.closed.load(std::sync::atomic::Ordering::Acquire)
