@@ -1044,3 +1044,60 @@ async fn pull_not_called_while_queue_full() {
         "pull() must fire after the queue is drained"
     );
 }
+
+// WPT: general.any.js — pull() must NOT be called once close() has been requested, even
+// while a deferred close is still draining its queue (spec ShouldCallPull returns false
+// when closeRequested). Draining a chunk during the closing window must not re-fire pull().
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pull_not_called_after_close_while_draining() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    struct CloseWithQueueSource {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for CloseWithQueueSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            // Close with a non-empty queue → the stream stays "readable" (closing) until
+            // it drains.
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            controller.close()?;
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let stream = ReadableStream::builder(CloseWithQueueSource {
+        pulls: pulls.clone(),
+    })
+    .strategy(CountQueuingStrategy::new(4))
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Drain the queue: each read re-arms the pull gate and reopens desired_size, but the
+    // stream is closing, so pull() must never fire.
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+    assert_eq!(reader.read().await.unwrap(), Some(2));
+    assert_eq!(reader.read().await.unwrap(), None);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        0,
+        "pull() must not be called after close() is requested, even while draining"
+    );
+}

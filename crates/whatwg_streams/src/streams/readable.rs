@@ -2504,6 +2504,11 @@ async fn readable_stream_task<T: 'static, Source>(
         let current_ds = desired_size.load(std::sync::atomic::Ordering::Acquire);
         if needs_pull
             && inner.state == StreamState::Readable
+            // A closing stream stays "readable" while its queue drains, but pull() must
+            // not fire once close() has been requested (spec ShouldCallPull → false when
+            // closeRequested). Draining a chunk re-arms needs_pull and reopens
+            // desired_size, so without this guard a pull would fire during the close.
+            && !close_pending
             && !inner.pulling
             && !inner.cancel_requested
         {
