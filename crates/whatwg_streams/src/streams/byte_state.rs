@@ -464,13 +464,17 @@ where
         self.pull_in_progress.store(true, Ordering::Release);
     }
 
-    // Called when pull operation completes
-    pub fn mark_pull_completed(&self) {
+    // Called when a pull completes. `made_progress` is true when the pull enqueued (the buffer
+    // grew) — the byte analog of the spec's [[pullAgain]] edge, since an enqueue is the only thing
+    // that can happen during the task's inline `pull().await`. Re-arm the gate only on that edge
+    // (or while a BYOB pull-into is still outstanding, which is an explicit demand even at HWM 0),
+    // never merely because the buffer sits below the high-water mark: a progress-less pull re-armed
+    // on desiredSize alone re-fires forever with no yield point and busy-loops the task.
+    pub fn mark_pull_completed(&self, made_progress: bool) {
         self.pull_in_progress.store(false, Ordering::Release);
-        // Still-pending pull-intos must keep pulling even at HWM 0.
         if !self.pending_pull_intos.lock().is_empty() {
             self.force_pull();
-        } else {
+        } else if made_progress {
             self.maybe_trigger_pull();
         }
     }
