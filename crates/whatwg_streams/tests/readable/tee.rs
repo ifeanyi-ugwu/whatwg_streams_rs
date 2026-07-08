@@ -529,18 +529,12 @@ async fn tee_does_not_pull_when_source_already_errored() {
 // HWM 0 enqueues one chunk per pull; branches HWM 1. The initial pull fills both branches; reading
 // one chunk from each empties both, so the spec pulls a second time — exactly twice.
 //
-// Divergence (`#[ignore]`d, asserts the spec outcome): the tee over-pulls by one (observed 3, not
-// 2). The BackpressureMode-extension coordinator gates pulling on a per-branch *channel-backlog*
-// count (branchN_pending_count), decremented when the branch's TeeSource buffers a chunk into the
-// branch's own queue — not when the branch's reader consumes it. So there are two buffers (the
-// coordinator->branch channel plus the branch's queue) but should_pull only sees the channel: once
-// a read frees the branch queue and the buffered chunk moves in, the backlog reads 0 and the
-// coordinator reads again. A spec-precise count needs the branch's real queue depth (desiredSize)
-// to drive should_pull, unifying the double buffer — deferred. The core tee behaviour (both
-// branches receive every chunk, in order) is covered by `tee_both_branches_get_all_chunks`.
+// The coordinator gates pulling on the branches' real `desiredSize` (the branch queue is the only
+// buffer, so the count is exact) and only reads after a fresh pull signal from a branch. A branch
+// whose queue is full sends no signal, so the coordinator parks instead of reading again — no
+// over-pull.
 #[cfg(feature = "send")]
 #[tokio::test]
-#[ignore = "tee over-pulls by one: should_pull uses the channel backlog, not the branch queue depth (see comment)"]
 async fn tee_pulls_only_enough_to_fill_emptiest_queue() {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;

@@ -264,7 +264,10 @@ impl ReadableByteStreamController {
         self.byte_state.desired_size()
     }
 
-    pub fn close(&mut self) -> StreamResult<()> {
+    // enqueue/close/error take &self: they only touch the shared `byte_state`, so a
+    // captured clone (e.g. the tee coordinator's branch handle) can drive the stream
+    // without exclusive access. A source's `&mut controller` still calls them via reborrow.
+    pub fn close(&self) -> StreamResult<()> {
         if self.byte_state.is_closed() {
             return Err("Stream is already closed".into());
         }
@@ -275,7 +278,7 @@ impl ReadableByteStreamController {
         Ok(())
     }
 
-    pub fn enqueue(&mut self, chunk: impl Into<Bytes>) -> StreamResult<()> {
+    pub fn enqueue(&self, chunk: impl Into<Bytes>) -> StreamResult<()> {
         if self.byte_state.is_closed() {
             return Err("Stream is closed".into());
         }
@@ -289,7 +292,7 @@ impl ReadableByteStreamController {
         Ok(())
     }
 
-    pub fn error(&mut self, error: StreamError) -> StreamResult<()> {
+    pub fn error(&self, error: StreamError) -> StreamResult<()> {
         self.byte_state.error(error);
         Ok(())
     }
@@ -607,13 +610,13 @@ where
 }
 
 // ===== Tee implementation =====
-
-#[derive(Debug, Clone)]
-enum TeeChunk<T> {
-    Data(T),
-    End,
-    Error(StreamError),
-}
+//
+// The tee follows the spec model (whatwg ReadableStreamDefaultTee): the coordinator
+// reads one chunk from the source and enqueues it directly into both branch
+// controllers. Each branch is a real ReadableStream whose only buffer is its own
+// queue, so pulling is gated by the branches' real `desiredSize` — pull counts are
+// exact and backpressure is automatic. Each branch's `TeeSource` is a pure signal that
+// asks the coordinator for a chunk when the branch wants data.
 
 #[derive(Debug, Clone)]
 pub struct TeeConfig {
@@ -634,9 +637,16 @@ impl Default for TeeConfig {
     }
 }
 
+/// How the tee decides when to pull, when the two branches consume at different rates.
+///
+/// The spec tee backpressures to the *faster* branch, so a slower branch buffers
+/// without bound (in browsers, a pending slow branch can deadlock the faster one). This
+/// is a known, discussed limitation — see whatwg/streams #506 (does teeing assume
+/// unlimited internal buffering?), #1235 (backpressure should follow the slowest
+/// branch), and #1186 (bounded/realtime buffering). The non-spec modes below address it.
 #[derive(Debug, Clone)]
 pub enum BackpressureMode {
-    /// Matches the behavior of `ReadableStream.prototype.tee()` in the WHATWG Streams spec.  
+    /// Matches the behavior of `ReadableStream.prototype.tee()` in the WHATWG Streams spec.
     ///
     /// - Pulls if *either branch* has demand (the faster consumer drives progress).  
     /// - Every pulled chunk is cloned and enqueued into *both* branches.  
@@ -740,45 +750,78 @@ impl TeeCancelResult {
     }
 }
 
+/// One tee branch's controller, as the coordinator drives it. Both controllers are
+/// `Clone` and mutate through shared state, so the coordinator holds a clone and
+/// enqueues into the branch directly — the spec's shared pull algorithm enqueueing into
+/// both branch controllers. A concrete `B: TeeBranch<T>` (not `Box<dyn ...>`) keeps the
+/// coordinator off trait objects, which drag `+ Send` boxing across the `MaybeSend`
+/// platform abstraction.
+trait TeeBranch<T>: Clone {
+    fn enqueue(&self, chunk: T) -> StreamResult<()>;
+    fn desired_size(&self) -> Option<isize>;
+    fn close(&self) -> StreamResult<()>;
+    fn error(&self, error: StreamError) -> StreamResult<()>;
+}
+
+impl<T: MaybeSend + 'static> TeeBranch<T> for ReadableStreamDefaultController<T> {
+    fn enqueue(&self, chunk: T) -> StreamResult<()> {
+        ReadableStreamDefaultController::enqueue(self, chunk)
+    }
+    fn desired_size(&self) -> Option<isize> {
+        ReadableStreamDefaultController::desired_size(self)
+    }
+    fn close(&self) -> StreamResult<()> {
+        ReadableStreamDefaultController::close(self)
+    }
+    fn error(&self, error: StreamError) -> StreamResult<()> {
+        ReadableStreamDefaultController::error(self, error)
+    }
+}
+
+impl TeeBranch<Bytes> for ReadableByteStreamController {
+    fn enqueue(&self, chunk: Bytes) -> StreamResult<()> {
+        ReadableByteStreamController::enqueue(self, chunk)
+    }
+    fn desired_size(&self) -> Option<isize> {
+        ReadableByteStreamController::desired_size(self)
+    }
+    fn close(&self) -> StreamResult<()> {
+        ReadableByteStreamController::close(self)
+    }
+    fn error(&self, error: StreamError) -> StreamResult<()> {
+        ReadableByteStreamController::error(self, error)
+    }
+}
+
+/// The source of one tee branch. It holds no buffer: its `pull()` only signals the
+/// coordinator that this branch wants a chunk, and the coordinator enqueues into the
+/// branch's controller externally. The branch's own queue is the single buffer.
 pub struct TeeSource<T: MaybeSend + 'static> {
-    chunk_rx: UnboundedReceiver<TeeChunk<T>>,
     branch_canceled: SharedPtr<AtomicBool>,
+
+    // Branch → coordinator: "this branch wants data". Shared by both branches; the
+    // coordinator coalesces (an AtomicBool collapses concurrent signals into one wake).
+    pull_signal: AsyncSignal,
+    // Coordinator → this branch: "I have served you (enqueue/close/error)". Only the
+    // byte pull path waits on it; see the ReadableByteSource impl below.
+    served: AsyncSignal,
 
     // Cancel coordination — both TeeSource instances share these.
     first_cancel_done: SharedPtr<AtomicBool>,
     cancel_result: SharedPtr<TeeCancelResult>,
 
-    // Optional fields used only for backpressure-aware modes.
-    // None for the Unbounded fast-path.
-    pending_count: Option<SharedPtr<AtomicUsize>>,
-    backpressure_signal: Option<AsyncSignal>,
+    _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T: MaybeSend + 'static> TeeSource<T> {
-    /// Backpressure bookkeeping shared by the default and byte pull paths: when a
-    /// chunk leaves this branch's queue, decrement the pending count and wake the
-    /// coordinator so it can read the next chunk from the source.
-    fn note_chunk_dequeued(&self) {
-        if let Some(pending) = &self.pending_count {
-            let old = pending.fetch_sub(1, Ordering::AcqRel);
-            if old > 0 {
-                if let Some(sig) = &self.backpressure_signal {
-                    sig.signal();
-                }
-            }
-        }
-    }
-
     /// Cancel coordination shared by the default and byte sources. The first branch
     /// to cancel resolves immediately; the second waits for the coordinator to run
     /// the source's cancel and propagates its result.
     async fn cancel_coordinated(&mut self) -> StreamResult<()> {
         self.branch_canceled.store(true, Ordering::Release);
-
-        // Wake coordinator if we have a signal (non-fast path).
-        if let Some(sig) = &self.backpressure_signal {
-            sig.signal();
-        }
+        // Wake the coordinator so it notices this branch is gone (and, if both are,
+        // cancels the source).
+        self.pull_signal.signal();
 
         // first_cancel_done.swap(true) returns the OLD value.
         // If false → we are the FIRST branch to cancel; return Ok(()) immediately.
@@ -810,26 +853,14 @@ impl<T: MaybeSend + 'static> TeeSource<T> {
 impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
     async fn pull(
         &mut self,
-        controller: &mut ReadableStreamDefaultController<T>,
+        _controller: &mut ReadableStreamDefaultController<T>,
     ) -> StreamResult<()> {
-        if self.branch_canceled.load(Ordering::Acquire) {
-            controller.close()?;
-            return Ok(());
-        }
-
-        match self.chunk_rx.next().await {
-            Some(TeeChunk::Data(chunk)) => {
-                self.note_chunk_dequeued();
-                controller.enqueue(chunk)?;
-            }
-            Some(TeeChunk::End) | None => {
-                controller.close()?;
-            }
-            Some(TeeChunk::Error(err)) => {
-                return Err(err);
-            }
-        }
-
+        // Ask the coordinator for a chunk; it reads one from the source and enqueues
+        // directly into this branch's controller. This pull enqueues nothing. The
+        // default task's pull gate is edge-triggered (spec [[pullAgain]]), so it won't
+        // re-fire until that enqueue (or a read) re-arms it — one signal per demand, no
+        // busy loop, so nothing to wait on here.
+        self.pull_signal.signal();
         Ok(())
     }
 
@@ -838,34 +869,24 @@ impl<T: MaybeSend + 'static> ReadableSource<T> for TeeSource<T> {
     }
 }
 
-// A byte stream's tee yields byte (BYOB-capable) branches: this source feeds a byte
-// branch by enqueueing each chunk. The branches refcount-share one Bytes rather than
-// copying (the spec clones via CloneAsUint8Array because JS ArrayBuffers are mutable;
-// Bytes is immutable, so sharing is observably identical and safe — BYOB reads copy
-// into the caller's own buffer, never mutating the shared chunk).
+// A byte stream's tee yields byte (BYOB-capable) branches: the coordinator enqueues each
+// chunk into the branch's byte controller. The branches refcount-share one Bytes rather
+// than copying (the spec clones via CloneAsUint8Array because JS ArrayBuffers are
+// mutable; Bytes is immutable, so sharing is observably identical and safe — BYOB reads
+// copy into the caller's own buffer, never mutating the shared chunk).
 impl ReadableByteSource for TeeSource<Bytes> {
     async fn pull(
         &mut self,
-        controller: &mut ReadableByteStreamController,
+        _controller: &mut ReadableByteStreamController,
     ) -> StreamResult<()> {
-        if self.branch_canceled.load(Ordering::Acquire) {
-            controller.close()?;
-            return Ok(());
-        }
-
-        match self.chunk_rx.next().await {
-            Some(TeeChunk::Data(chunk)) => {
-                self.note_chunk_dequeued();
-                controller.enqueue(chunk)?;
-            }
-            Some(TeeChunk::End) | None => {
-                controller.close()?;
-            }
-            Some(TeeChunk::Error(err)) => {
-                return Err(err);
-            }
-        }
-
+        // Same request-to-coordinator handshake as the default branch, but the byte
+        // task's pull gate is level-triggered on desiredSize: it re-pulls as long as the
+        // buffer is below the high-water mark. If this returned before the coordinator
+        // enqueued, the gate would re-pull in a tight loop. Block until the coordinator
+        // has served this branch so the completed pull sees an up-to-date buffer and the
+        // gate settles.
+        self.pull_signal.signal();
+        self.served.wait().await;
         Ok(())
     }
 
@@ -874,193 +895,238 @@ impl ReadableByteSource for TeeSource<Bytes> {
     }
 }
 
-struct TeeCoordinator<T, Source, StreamType, LockState>
+struct TeeCoordinator<T, Source, StreamType, LockState, B>
 where
     T: MaybeSend + Clone + 'static,
     StreamType: StreamTypeMarker,
+    B: TeeBranch<T>,
 {
     reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
 
-    branch1_tx: UnboundedSender<TeeChunk<T>>,
-    branch2_tx: UnboundedSender<TeeChunk<T>>,
+    branch1: B,
+    branch2: B,
 
     branch1_canceled: SharedPtr<AtomicBool>,
     branch2_canceled: SharedPtr<AtomicBool>,
 
     cancel_result: SharedPtr<TeeCancelResult>,
 
-    // Backpressure configuration
     backpressure_mode: BackpressureMode,
-    branch1_pending_count: Option<SharedPtr<AtomicUsize>>,
-    branch2_pending_count: Option<SharedPtr<AtomicUsize>>,
 
-    backpressure_signal: Option<AsyncSignal>,
-    branch1_high_water_mark: usize,
-    branch2_high_water_mark: usize,
+    // A branch's pull() signals this; the coordinator waits on it for the next demand.
+    pull_signal: AsyncSignal,
+    // Fired after the coordinator serves a branch (enqueue/close/error), releasing a byte
+    // branch's pull that is parked on it.
+    branch1_served: AsyncSignal,
+    branch2_served: AsyncSignal,
 }
 
-impl<T: MaybeSend + 'static, Source, StreamType, LockState>
-    TeeCoordinator<T, Source, StreamType, LockState>
+impl<T: MaybeSend + 'static, Source, StreamType, LockState, B>
+    TeeCoordinator<T, Source, StreamType, LockState, B>
 where
     T: Clone,
     StreamType: StreamTypeMarker,
+    B: TeeBranch<T>,
 {
-    // Decide whether to pull; respects fast-path (None pending counts => Unbounded fast-path)
-    fn should_pull(&self) -> bool {
-        let branch1_active =
-            !self.branch1_canceled.load(Ordering::Acquire) && !self.branch1_tx.is_closed();
-        let branch2_active =
-            !self.branch2_canceled.load(Ordering::Acquire) && !self.branch2_tx.is_closed();
+    fn branch1_active(&self) -> bool {
+        !self.branch1_canceled.load(Ordering::Acquire)
+    }
 
-        if !branch1_active && !branch2_active {
+    fn branch2_active(&self) -> bool {
+        !self.branch2_canceled.load(Ordering::Acquire)
+    }
+
+    fn both_branches_dead(&self) -> bool {
+        !self.branch1_active() && !self.branch2_active()
+    }
+
+    /// Whether to read another chunk, given the two branches' real `desiredSize`. Because
+    /// the branch queue is the only buffer, `desiredSize` is exact — the tee pulls no more
+    /// than the branches can hold. `unwrap_or(0)`: an errored branch (None) has no demand.
+    fn should_pull(&self) -> bool {
+        let b1_active = self.branch1_active();
+        let b2_active = self.branch2_active();
+        if !b1_active && !b2_active {
             return false;
         }
 
-        // Fast-path: no pending counts allocated => treat as Unbounded behavior.
-        if self.branch1_pending_count.is_none() || self.branch2_pending_count.is_none() {
-            // fast path: pull if either active
-            return branch1_active || branch2_active;
-        }
-
-        // Safe to unwrap because we checked above
-        let branch1_pending = self
-            .branch1_pending_count
-            .as_ref()
-            .unwrap()
-            .load(Ordering::Acquire);
-        let branch2_pending = self
-            .branch2_pending_count
-            .as_ref()
-            .unwrap()
-            .load(Ordering::Acquire);
-
-        let branch1_hwm = self.branch1_high_water_mark;
-        let branch2_hwm = self.branch2_high_water_mark;
+        let ds1 = self.branch1.desired_size().unwrap_or(0);
+        let ds2 = self.branch2.desired_size().unwrap_or(0);
 
         match self.backpressure_mode {
-            BackpressureMode::Unbounded => branch1_active || branch2_active,
-            BackpressureMode::SlowestConsumer => {
-                let b1_ok = !branch1_active || branch1_pending < branch1_hwm;
-                let b2_ok = !branch2_active || branch2_pending < branch2_hwm;
-                b1_ok && b2_ok
-            }
+            BackpressureMode::Unbounded => b1_active || b2_active,
+            BackpressureMode::SpecCompliant => (b1_active && ds1 > 0) || (b2_active && ds2 > 0),
+            BackpressureMode::SlowestConsumer => (!b1_active || ds1 > 0) && (!b2_active || ds2 > 0),
             BackpressureMode::Aggregate => {
-                let total = branch1_pending + branch2_pending;
-                total < (branch1_hwm + branch2_hwm)
-            }
-            BackpressureMode::SpecCompliant => {
-                let b1_can = !branch1_active || branch1_pending < branch1_hwm;
-                let b2_can = !branch2_active || branch2_pending < branch2_hwm;
-                b1_can || b2_can
+                let mut total = 0isize;
+                if b1_active {
+                    total += ds1;
+                }
+                if b2_active {
+                    total += ds2;
+                }
+                total > 0
             }
         }
     }
 
-    async fn distribute_chunk(&self, chunk: T) {
-        let branch1_active =
-            !self.branch1_canceled.load(Ordering::Acquire) && !self.branch1_tx.is_closed();
-        let branch2_active =
-            !self.branch2_canceled.load(Ordering::Acquire) && !self.branch2_tx.is_closed();
-
-        // Try send to branch1
-        if branch1_active {
-            if self
-                .branch1_tx
-                .unbounded_send(TeeChunk::Data(chunk.clone()))
-                .is_ok()
-            {
-                if let Some(p) = &self.branch1_pending_count {
-                    p.fetch_add(1, Ordering::AcqRel);
-                }
-            } else {
-                self.branch1_canceled.store(true, Ordering::Release);
-            }
+    fn distribute_chunk(&self, chunk: T) {
+        // Enqueue fails only if a branch is already closed/errored (e.g. its stream was
+        // dropped); treat that as the branch being gone.
+        if self.branch1_active() && self.branch1.enqueue(chunk.clone()).is_err() {
+            self.branch1_canceled.store(true, Ordering::Release);
         }
-
-        // Branch2
-        if branch2_active {
-            if self
-                .branch2_tx
-                .unbounded_send(TeeChunk::Data(chunk))
-                .is_ok()
-            {
-                if let Some(p) = &self.branch2_pending_count {
-                    p.fetch_add(1, Ordering::AcqRel);
-                }
-            } else {
-                self.branch2_canceled.store(true, Ordering::Release);
-            }
+        if self.branch2_active() && self.branch2.enqueue(chunk).is_err() {
+            self.branch2_canceled.store(true, Ordering::Release);
         }
+        self.serve_signals();
+    }
+
+    fn close_branches(&self) {
+        let _ = self.branch1.close();
+        let _ = self.branch2.close();
+        self.serve_signals();
+    }
+
+    fn error_branches(&self, err: StreamError) {
+        let _ = self.branch1.error(err.clone());
+        let _ = self.branch2.error(err);
+        self.serve_signals();
+    }
+
+    fn serve_signals(&self) {
+        self.branch1_served.signal();
+        self.branch2_served.signal();
+    }
+
+    async fn finish_both_canceled(&self) {
+        // Both branches are gone: cancel the source and broadcast its result to any
+        // branch cancel() still waiting. Release any byte pull parked on `served` first.
+        self.serve_signals();
+        let result = self
+            .reader
+            .cancel(Some("Both tee branches terminated".to_string()))
+            .await;
+        self.cancel_result.complete(result);
     }
 
     async fn run(self) {
         self.run_inner().await;
-        // Ensure the cancel_result is always completed so any branch cancel()
-        // waiting on it doesn't hang (e.g. when coordinator exits via EOF or error).
+        // Complete cancel_result so a branch cancel() waiting on it never hangs when the
+        // coordinator exited via EOF/error rather than a both-canceled finish. Idempotent
+        // — a real cancel result set by finish_both_canceled() wins.
         self.cancel_result.complete(Ok(()));
     }
 
     async fn run_inner(&self) {
         loop {
-            // termination check
-            let branch1_dead =
-                self.branch1_canceled.load(Ordering::Acquire) || self.branch1_tx.is_closed();
-            let branch2_dead =
-                self.branch2_canceled.load(Ordering::Acquire) || self.branch2_tx.is_closed();
-
-            if branch1_dead && branch2_dead {
-                let result = self
-                    .reader
-                    .cancel(Some("Both tee branches terminated".to_string()))
-                    .await;
-                // Broadcast the source cancel result to whichever branch is waiting.
-                self.cancel_result.complete(result);
-                break;
+            if self.both_branches_dead() {
+                self.finish_both_canceled().await;
+                return;
             }
 
-            // Wait for backpressure to clear if needed
-            // If non-fast-path, wait while should_pull() is false using a real signal.
-            while !self.should_pull() {
-                if let Some(sig) = &self.backpressure_signal {
-                    sig.wait().await;
-                } else {
-                    // No signal available (fast-path) — shouldn't be here, but break to avoid deadlock.
-                    break;
-                }
+            // Wait for a branch to ask for data (its pull() signals). Reading only after a
+            // fresh signal — never looping straight back into another read — is what keeps
+            // the pull count exact: a served branch whose queue is now full sends no new
+            // signal, so the coordinator parks here instead of over-pulling.
+            self.pull_signal.wait().await;
 
-                // Recheck termination after waiting
-                let branch1_dead =
-                    self.branch1_canceled.load(Ordering::Acquire) || self.branch1_tx.is_closed();
-                let branch2_dead =
-                    self.branch2_canceled.load(Ordering::Acquire) || self.branch2_tx.is_closed();
-                if branch1_dead && branch2_dead {
-                    let result = self
-                        .reader
-                        .cancel(Some("Both tee branches terminated".to_string()))
-                        .await;
-                    self.cancel_result.complete(result);
+            // A cancel (which also signals) may have woken us.
+            if self.both_branches_dead() {
+                self.finish_both_canceled().await;
+                return;
+            }
+
+            // A branch asked, but the backpressure mode may still say "not yet" (e.g.
+            // SlowestConsumer with the other branch full). Wait for the next signal.
+            if !self.should_pull() {
+                continue;
+            }
+
+            match self.reader.read().await {
+                Ok(Some(chunk)) => self.distribute_chunk(chunk),
+                Ok(None) => {
+                    self.close_branches();
+                    return;
+                }
+                Err(err) => {
+                    self.error_branches(err);
                     return;
                 }
             }
+        }
+    }
+}
 
-            // Pull from original stream
-            match self.reader.read().await {
-                Ok(Some(chunk)) => {
-                    self.distribute_chunk(chunk).await;
-                }
-                Ok(None) => {
-                    // EOF - notify both branches
-                    let _ = self.branch1_tx.unbounded_send(TeeChunk::End);
-                    let _ = self.branch2_tx.unbounded_send(TeeChunk::End);
-                    break;
-                }
-                Err(err) => {
-                    // Error - notify both branches
-                    let _ = self.branch1_tx.unbounded_send(TeeChunk::Error(err.clone()));
-                    let _ = self.branch2_tx.unbounded_send(TeeChunk::Error(err));
-                    break;
-                }
-            }
+/// The shared state wiring a tee pair together, built once and split between the two
+/// branch sources and the coordinator. Bundled so the default and byte tee builders
+/// don't each duplicate the (identical) wiring.
+struct TeeSetup {
+    branch1_canceled: SharedPtr<AtomicBool>,
+    branch2_canceled: SharedPtr<AtomicBool>,
+    pull_signal: AsyncSignal,
+    branch1_served: AsyncSignal,
+    branch2_served: AsyncSignal,
+    first_cancel_done: SharedPtr<AtomicBool>,
+    cancel_result: SharedPtr<TeeCancelResult>,
+}
+
+impl TeeSetup {
+    fn new() -> Self {
+        Self {
+            branch1_canceled: SharedPtr::new(AtomicBool::new(false)),
+            branch2_canceled: SharedPtr::new(AtomicBool::new(false)),
+            pull_signal: AsyncSignal::new(),
+            branch1_served: AsyncSignal::new(),
+            branch2_served: AsyncSignal::new(),
+            first_cancel_done: SharedPtr::new(AtomicBool::new(false)),
+            cancel_result: SharedPtr::new(TeeCancelResult::new()),
+        }
+    }
+
+    fn sources<T: MaybeSend + 'static>(&self) -> (TeeSource<T>, TeeSource<T>) {
+        let source1 = TeeSource {
+            branch_canceled: self.branch1_canceled.clone(),
+            pull_signal: self.pull_signal.clone(),
+            served: self.branch1_served.clone(),
+            first_cancel_done: self.first_cancel_done.clone(),
+            cancel_result: self.cancel_result.clone(),
+            _phantom: PhantomData,
+        };
+        let source2 = TeeSource {
+            branch_canceled: self.branch2_canceled.clone(),
+            pull_signal: self.pull_signal.clone(),
+            served: self.branch2_served.clone(),
+            first_cancel_done: self.first_cancel_done.clone(),
+            cancel_result: self.cancel_result.clone(),
+            _phantom: PhantomData,
+        };
+        (source1, source2)
+    }
+
+    fn coordinator<T, Source, StreamType, LockState, B>(
+        self,
+        reader: ReadableStreamDefaultReader<T, Source, StreamType, LockState>,
+        branch1: B,
+        branch2: B,
+        mode: BackpressureMode,
+    ) -> TeeCoordinator<T, Source, StreamType, LockState, B>
+    where
+        T: MaybeSend + Clone + 'static,
+        StreamType: StreamTypeMarker,
+        B: TeeBranch<T>,
+    {
+        TeeCoordinator {
+            reader,
+            branch1,
+            branch2,
+            branch1_canceled: self.branch1_canceled,
+            branch2_canceled: self.branch2_canceled,
+            cancel_result: self.cancel_result,
+            backpressure_mode: mode,
+            pull_signal: self.pull_signal,
+            branch1_served: self.branch1_served,
+            branch2_served: self.branch2_served,
         }
     }
 }
@@ -1386,64 +1452,20 @@ where
     > {
         let (_, reader) = self.get_reader()?;
 
-        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<T>>();
-        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<T>>();
+        let setup = TeeSetup::new();
+        let (source1, source2) = setup.sources();
 
-        let branch1_canceled = SharedPtr::new(AtomicBool::new(false));
-        let branch2_canceled = SharedPtr::new(AtomicBool::new(false));
-
-        let (branch1_pending, branch2_pending, backpressure_signal) =
-            if matches!(mode, BackpressureMode::Unbounded) {
-                (None, None, None)
-            } else {
-                (
-                    Some(SharedPtr::new(AtomicUsize::new(0))),
-                    Some(SharedPtr::new(AtomicUsize::new(0))),
-                    Some(AsyncSignal::new()),
-                )
-            };
-
-        let branch1_hwm = branch1_strategy.high_water_mark();
-        let branch2_hwm = branch2_strategy.high_water_mark();
-
-        let first_cancel_done = SharedPtr::new(AtomicBool::new(false));
-        let cancel_result = SharedPtr::new(TeeCancelResult::new());
-
-        let coordinator = TeeCoordinator {
-            reader,
-            branch1_tx: branch1_tx.clone(),
-            branch2_tx: branch2_tx.clone(),
-            branch1_canceled: branch1_canceled.clone(),
-            branch2_canceled: branch2_canceled.clone(),
-            cancel_result: cancel_result.clone(),
-            backpressure_mode: mode,
-            branch1_pending_count: branch1_pending.clone(),
-            branch2_pending_count: branch2_pending.clone(),
-            backpressure_signal: backpressure_signal.clone(),
-            branch1_high_water_mark: branch1_hwm,
-            branch2_high_water_mark: branch2_hwm,
-        };
-
-        let source1 = TeeSource {
-            chunk_rx: branch1_rx,
-            branch_canceled: branch1_canceled,
-            first_cancel_done: first_cancel_done.clone(),
-            cancel_result: cancel_result.clone(),
-            pending_count: branch1_pending,
-            backpressure_signal: backpressure_signal.clone(),
-        };
-
-        let source2 = TeeSource {
-            chunk_rx: branch2_rx,
-            branch_canceled: branch2_canceled,
-            first_cancel_done,
-            cancel_result,
-            pending_count: branch2_pending,
-            backpressure_signal,
-        };
-
+        // Build the branch streams first, then clone their controllers for the
+        // coordinator to enqueue into.
         let (stream1, rfut1) = ReadableStream::new_inner(source1, branch1_strategy);
         let (stream2, rfut2) = ReadableStream::new_inner(source2, branch2_strategy);
+
+        let coordinator = setup.coordinator(
+            reader,
+            (*stream1.controller).clone(),
+            (*stream2.controller).clone(),
+            mode,
+        );
 
         let coordinator_fut = coordinator.run();
 
@@ -1455,10 +1477,9 @@ where
     }
 }
 
-// Byte tee path: the coordinator and channels are identical to the default tee — it
-// reads Bytes chunks from the source and fans them out by refcount — but the branches
-// are built as byte streams (BYOB-capable), so a consumer can `get_byob_reader()` on a
-// branch.
+// Byte tee path: the coordinator reads Bytes chunks from the source and enqueues them
+// into both branches by refcount, identical to the default tee. The branches are built
+// as byte streams (BYOB-capable), so a consumer can `get_byob_reader()` on a branch.
 impl<Source> ReadableStream<Bytes, Source, ByteStream, Unlocked>
 where
     Source: ReadableByteSource,
@@ -1480,64 +1501,18 @@ where
     > {
         let (_, reader) = self.get_reader()?;
 
-        let (branch1_tx, branch1_rx) = unbounded::<TeeChunk<Bytes>>();
-        let (branch2_tx, branch2_rx) = unbounded::<TeeChunk<Bytes>>();
-
-        let branch1_canceled = SharedPtr::new(AtomicBool::new(false));
-        let branch2_canceled = SharedPtr::new(AtomicBool::new(false));
-
-        let (branch1_pending, branch2_pending, backpressure_signal) =
-            if matches!(mode, BackpressureMode::Unbounded) {
-                (None, None, None)
-            } else {
-                (
-                    Some(SharedPtr::new(AtomicUsize::new(0))),
-                    Some(SharedPtr::new(AtomicUsize::new(0))),
-                    Some(AsyncSignal::new()),
-                )
-            };
-
-        let branch1_hwm = branch1_strategy.high_water_mark();
-        let branch2_hwm = branch2_strategy.high_water_mark();
-
-        let first_cancel_done = SharedPtr::new(AtomicBool::new(false));
-        let cancel_result = SharedPtr::new(TeeCancelResult::new());
-
-        let coordinator = TeeCoordinator {
-            reader,
-            branch1_tx: branch1_tx.clone(),
-            branch2_tx: branch2_tx.clone(),
-            branch1_canceled: branch1_canceled.clone(),
-            branch2_canceled: branch2_canceled.clone(),
-            cancel_result: cancel_result.clone(),
-            backpressure_mode: mode,
-            branch1_pending_count: branch1_pending.clone(),
-            branch2_pending_count: branch2_pending.clone(),
-            backpressure_signal: backpressure_signal.clone(),
-            branch1_high_water_mark: branch1_hwm,
-            branch2_high_water_mark: branch2_hwm,
-        };
-
-        let source1 = TeeSource {
-            chunk_rx: branch1_rx,
-            branch_canceled: branch1_canceled,
-            first_cancel_done: first_cancel_done.clone(),
-            cancel_result: cancel_result.clone(),
-            pending_count: branch1_pending,
-            backpressure_signal: backpressure_signal.clone(),
-        };
-
-        let source2 = TeeSource {
-            chunk_rx: branch2_rx,
-            branch_canceled: branch2_canceled,
-            first_cancel_done,
-            cancel_result,
-            pending_count: branch2_pending,
-            backpressure_signal,
-        };
+        let setup = TeeSetup::new();
+        let (source1, source2) = setup.sources::<Bytes>();
 
         let (stream1, rfut1) = ReadableStream::new_bytes_inner(source1, branch1_strategy);
         let (stream2, rfut2) = ReadableStream::new_bytes_inner(source2, branch2_strategy);
+
+        let coordinator = setup.coordinator(
+            reader,
+            (*stream1.controller).clone(),
+            (*stream2.controller).clone(),
+            mode,
+        );
 
         let coordinator_fut = coordinator.run();
 
@@ -4304,11 +4279,21 @@ mod tee_tests {
         assert_eq!(reader1.read().await.unwrap(), Some(0));
         assert_eq!(reader2.read().await.unwrap(), Some(0));
 
+        // Reading chunk 1 from branch1 empties it and triggers the source's erroring pull.
+        // Erroring a branch discards its queue (spec ResetQueue), so branch2's still-buffered
+        // chunk 1 races the error propagation: it may be delivered first or dropped. Both are
+        // spec-valid (cf. tee_source_error_propagates_to_both_branches).
         assert_eq!(reader1.read().await.unwrap(), Some(1));
-        assert_eq!(reader2.read().await.unwrap(), Some(1));
+        let err2 = match reader2.read().await {
+            Ok(Some(v)) => {
+                assert_eq!(v, 1);
+                reader2.read().await.unwrap_err()
+            }
+            Err(e) => e,
+            Ok(None) => panic!("expected the source error on branch2, got EOF"),
+        };
 
         let err1 = reader1.read().await.unwrap_err();
-        let err2 = reader2.read().await.unwrap_err();
 
         assert_eq!(err1.to_string(), "Test error");
         assert_eq!(err2.to_string(), "Test error");
