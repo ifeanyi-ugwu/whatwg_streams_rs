@@ -843,3 +843,54 @@ async fn byte_pull_gate_does_not_spin_on_progressless_pull() {
         "progress-less pull must fire at most once then park, not busy-loop (got {count})"
     );
 }
+
+// KNOWN GAP — see docs/explainers/byte-push-default-reader-stranding.md.
+// A push-model byte source (no-op pull(), enqueues later from another task via a captured
+// controller) paired with a *default* reader strands when the read parks before the push:
+// enqueue_bytes wakes read_wakers (which BYOB/AsyncRead register) but never wakes the byte
+// task, so a read parked in the task's pending_reads is never served. This asserts the
+// correct outcome (the read completes); it is #[ignore]d because it currently times out.
+// Un-ignore once enqueue_bytes wakes the task and drains pending_reads from the buffer.
+#[cfg(feature = "send")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "push-model default reader stranding: enqueue does not wake the byte task (deferred)"]
+async fn push_model_default_reader_strands() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct PushSource {
+        go: Arc<Notify>,
+    }
+    impl ReadableByteSource for PushSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            let ctrl = controller.clone();
+            let go = self.go.clone();
+            tokio::spawn(async move {
+                go.notified().await;
+                let _ = ctrl.enqueue(b"pushed".to_vec());
+            });
+            Ok(())
+        }
+        // pull() omitted: no-op. Production happens out of band from the spawned task.
+    }
+
+    let go = Arc::new(Notify::new());
+    let stream = ReadableStream::builder_bytes(PushSource { go: go.clone() }).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Read first so it parks (buffer empty), THEN push — the ordering that strands.
+    let read = tokio::spawn(async move { reader.read().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    go.notify_one();
+
+    let served = tokio::time::timeout(Duration::from_secs(3), read)
+        .await
+        .expect("push-model default read must complete once the push lands")
+        .unwrap()
+        .unwrap();
+    assert_eq!(served, Some(Bytes::from_static(b"pushed")));
+}
