@@ -789,3 +789,57 @@ async fn byte_parked_read_then_error_rejects() {
     let err = result.expect_err("parked read() must reject once the controller errors");
     assert!(err.to_string().contains("error1"), "got: {err}");
 }
+
+// Mirrors the default stream's `pull_called_once_on_idle_started_stream`: a byte source
+// whose pull() makes no progress (enqueues nothing, awaits nothing) — the same shape as
+// omitting pull() to push everything from start() — must not spin the byte pull gate. After
+// a read drains the seeded chunk the buffer sits below the high-water mark; a level-triggered
+// gate would re-fire the progress-less pull forever, starving the runtime hard enough to
+// strand the read's own completion. The gate must pull once, see no progress, and park.
+#[cfg(feature = "send")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_pull_gate_does_not_spin_on_progressless_pull() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct SeedThenIdle {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableByteSource for SeedThenIdle {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            controller.enqueue(b"hi".to_vec())?;
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableByteStreamController,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let stream = ReadableStream::builder_bytes(SeedThenIdle {
+        pulls: pulls.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Drains the seed; the buffer is now empty (below HWM) but the source produces nothing
+    // more. This is the read whose completion a busy loop would strand.
+    assert_eq!(reader.read().await.unwrap(), Some(Bytes::from_static(b"hi")));
+
+    // Give the task ample real time to (wrongly) spin the progress-less pull.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let count = pulls.load(Ordering::Acquire);
+    assert!(
+        count <= 1,
+        "progress-less pull must fire at most once then park, not busy-loop (got {count})"
+    );
+}
