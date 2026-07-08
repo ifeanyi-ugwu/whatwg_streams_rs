@@ -128,10 +128,8 @@ gate. Regression tests: `push_model_default_reader_is_served` (data) and
 ## A note on the tee
 
 A byte `tee` branch is fed by the coordinator, which enqueues from a separate task
-— itself a push producer. The branch source's `pull()` blocks on a `served`
-handshake until the coordinator has enqueued, which lands the enqueue inside the
-branch's pull window (delivery path 1). With the serve gate now present, path 2
-would deliver the branch's parked reads even without that handshake, so `served`
-is no longer required for *correctness*; it is retained because the tee's exact
-pull-count behaviour is verified against it, and reworking that is out of scope
-here.
+— itself a push producer. The branch source's `pull()` is a pure signal that asks
+the coordinator for a chunk; the coordinator's out-of-band enqueue then reaches the
+branch's parked read through the serve gate (delivery path 2), exactly like any
+other push source. So a byte tee branch needs no special handling — its `pull()` is
+the same plain signal as a default-stream tee branch.

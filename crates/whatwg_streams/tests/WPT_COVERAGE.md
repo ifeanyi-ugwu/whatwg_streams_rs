@@ -410,7 +410,7 @@ Both branches drain the full content independently (each owns its `Vec<u8>`), ca
 keeps the other live, and canceling both fires the source's `cancel()` exactly once —
 covered by the byte-tee tests plus the generic tee suite in `readable/tee.rs` (the
 coordinator is shared between default and byte tee; it enqueues directly into each
-branch's controller, with the byte branch's pull blocking on a `served` signal until served).
+branch's controller, and a branch's parked read is served by the byte task's serve gate).
 
 This was previously a divergence (byte tee yielded *default* branches). It is now
 implemented: `tee()` stays universal, and the `TeeBuilder` terminal methods are split by
@@ -458,9 +458,9 @@ a third `select!` branch — data, EOF, or error reaches a parked read whether t
 inside or outside a pull. BYOB/`AsyncRead` readers and pull-model sources were always fine; the bad
 ordering (read-before-push) is the common one for a push source. Pinned by
 `push_model_default_reader_is_served` and `push_model_default_reader_gets_eof_on_out_of_band_close`;
-full walk-through in `docs/explainers/byte-read-delivery.md`. (The serve gate makes the `tee` byte
-branch's `served` handshake redundant for correctness, but it is kept — the tee's exact pull count is
-verified against it.)
+full walk-through in `docs/explainers/byte-read-delivery.md`. (The serve gate also serves the `tee`
+byte branches, so a byte branch's `pull()` is a plain coordinator signal — the same as a
+default-stream tee branch — with no special handshake.)
 
 Previously divergent, now fixed: **byte stream pull gate re-fired a progress-less `pull()`.** The
 spec gates both controllers through `CallPullIfNeeded` with `[[pulling]]`/`[[pullAgain]]` —
