@@ -604,22 +604,23 @@ called). Not re-litigated here.
 
 ### Identified portable gaps not yet ported
 
-The bulk of the audit's portable behaviours are covered or documented as skips/divergences, and
-no `#[ignore]`d tests remain. A critical re-audit left these low-signal items unpinned (behaviour
-believed correct-by-construction, but not directly tested):
+None outstanding. Every portable behaviour the audit surfaced is covered or documented as a
+skip/divergence, and no `#[ignore]`d tests remain. The low-signal edges a critical re-audit had
+left unpinned are now pinned directly (all found correct-by-construction — none was a bug):
 
-- Default-stream push model: a source that `enqueue`s/`close`s out of band from a spawned task (via
-  a captured controller clone) while a `read()` is already parked. Correct by construction — the
-  default task is channel-based, so an out-of-band `ControllerMsg::Enqueue` wakes it — unlike the
-  byte side, which needed a serve gate (`push_model_default_reader_*`). Not pinned for default streams.
-- `tee`: enqueue() + close() while both branches are mid-read (the atomic enqueue-then-close case);
-  and "stops pulling once the source errors while both branches are reading" as a distinct
-  no-further-pull assertion. Adjacent behaviours are covered; these exact interactions are not.
-- Readable cancel arriving during a deferred-close drain window (`close_pending`): handled by the
-  code (state is still `Readable`, so Cancel proceeds and clears `close_pending`) but not tested.
-- piping `multiple-propagation` "closed readable → closed writable" must fulfill: rides on
-  `futures::select!` poll ordering (the read-`None` arm is listed first and wins), believed correct
-  but not pinned.
+- Default-stream push model — `default_stream_push_model_serves_parked_read`: an out-of-band
+  `enqueue()` via a captured controller clone serves a read that parked first (the default task is
+  channel-based; no serve gate needed, unlike the byte side).
+- `tee` enqueue()+close() to both branches mid-read — `tee_enqueue_then_close_reaches_both_branches`;
+  and stops pulling once the source errors while both branches read —
+  `tee_source_error_while_reading_errors_both_and_stops_pulling`.
+- Cancel during a deferred-close drain window — `cancel_during_deferred_close_drain_succeeds`: cancel
+  clears the queue and closes the closing stream, resolving rather than hanging.
+- piping `multiple-propagation` "closed readable → closed writable" —
+  `pipe_to_empty_source_into_closed_dest_rejects`: this pins that the outcome is **deterministic**
+  (not `select!`-ordering luck, the re-audit's worry). It is a minor divergence from WPT (which
+  fulfils this row): piping into an already-closed destination *rejects* here — uniformly, whatever
+  the source — consistent with `pipe_to_closed_dest_cancels_source_and_rejects`.
 
 The transform `controller.error()` no-op-after-terminal family (errors.any.js second-call / after
 cancel / after abort / after a hook threw) is covered by the first-wins error handler plus
