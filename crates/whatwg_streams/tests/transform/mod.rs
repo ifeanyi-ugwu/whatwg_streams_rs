@@ -1781,11 +1781,55 @@ async fn transform_throw_after_terminate_errors_readable() {
         "write() must reject with the thrown error, got: {write_result:?}"
     );
 
-    // The readable must surface the transform error, not close cleanly. reader.closed()
-    // rejects on an errored stream and resolves Ok on a cleanly-closed one.
-    let closed = reader.closed().await;
+    // The readable must surface the transform error (by identity), not close cleanly:
+    // reader.closed() rejects with the thrown error on an errored stream, and resolves Ok
+    // on a cleanly-closed one.
+    let closed_err = reader
+        .closed()
+        .await
+        .expect_err("readable must error, not close cleanly");
     assert!(
-        closed.is_err(),
-        "readable must error with the thrown error, not close cleanly, got: {closed:?}"
+        closed_err.to_string().contains("transform boom"),
+        "readable must error with the thrown error's identity, got: {closed_err}"
+    );
+}
+
+// WPT: errors.any.js — "controller.error() should do nothing the second time it is called"
+// (transform side). The first error wins on the transform's readable controller too — a
+// surplus controller.error() does not overwrite the stored error.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn transform_surplus_controller_error_is_noop_first_wins() {
+    struct DoubleErrorT;
+
+    impl Transformer<u32, u32> for DoubleErrorT {
+        async fn transform(
+            &mut self,
+            _chunk: u32,
+            controller: &mut TransformStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.error("first".into())?;
+            let _ = controller.error("second".into());
+            Ok(())
+        }
+    }
+
+    // Explicit readable HWM 1: the spec-default readable HWM of 0 would block the write in
+    // wait_for_readable_space() before transform() runs (this test never reads), deadlocking.
+    let ts = TransformStream::builder(DoubleErrorT)
+        .readable_strategy(CountQueuingStrategy::new(1))
+        .spawn(tokio::spawn);
+    let (readable, writable) = ts.split();
+    let (_lw, writer) = writable.get_writer().unwrap();
+    let (_lr, reader) = readable.get_reader().unwrap();
+
+    let _ = writer.write(1u32).await; // triggers transform() → two controller.error() calls
+    let closed_err = reader
+        .closed()
+        .await
+        .expect_err("readable must error after controller.error()");
+    assert!(
+        closed_err.to_string().contains("first"),
+        "the first controller.error() wins; the surplus call is a no-op, got: {closed_err}"
     );
 }

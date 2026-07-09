@@ -429,11 +429,22 @@ async fn tee_failing_source_cancel_propagates_to_branch_cancel() {
     let r1_cancel = r1.cancel(None).await;
     let r2_cancel = r2.cancel(None).await;
 
-    // Source cancel() throws — the error must propagate to at least one branch
+    // ACCEPTED DIVERGENCE from spec ReadableStreamDefaultTee, which gives both branches
+    // one shared composite cancel promise that rejects for BOTH when source.cancel()
+    // throws. Here the branches do not share a promise: the first branch to cancel
+    // resolves immediately (Ok), and only the second — which triggers the coordinator's
+    // source.cancel() — reflects its result. Strict spec would instead make the first
+    // branch's cancel() pend until both branches cancel (a hang if the other never does),
+    // which the ergonomic choice trades away. Pinned exactly rather than with a loose
+    // `is_err() || is_err()`. Documented in WPT_COVERAGE.md.
     assert!(
-        r1_cancel.is_err() || r2_cancel.is_err(),
-        "source cancel() error must reach at least one branch cancel: \
-         r1={r1_cancel:?} r2={r2_cancel:?}"
+        r1_cancel.is_ok(),
+        "the first branch to cancel resolves immediately, got {r1_cancel:?}"
+    );
+    let err = r2_cancel.expect_err("the second branch must reject with the source cancel error");
+    assert!(
+        err.to_string().contains("cancel threw"),
+        "the second branch's cancel must carry the source cancel error, got: {err}"
     );
 }
 
