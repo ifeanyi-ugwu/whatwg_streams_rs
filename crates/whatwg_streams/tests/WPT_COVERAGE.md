@@ -444,8 +444,29 @@ listed here with their disposition so nothing is silently missing.
 
 ### Known behavioural divergences
 
-No `#[ignore]`d tests remain, and no behavioural divergences are outstanding. The items below were
-divergent and are now fixed.
+No `#[ignore]`d tests remain. Two accepted divergences stand (below, "Accepted divergences"); the
+rest of this section lists items that were divergent and are now fixed.
+
+#### Accepted divergences (deliberate, documented)
+
+- **`tee` cancel does not share one composite cancel promise.** Spec `ReadableStreamDefaultTee`
+  gives `branch1.cancel()` and `branch2.cancel()` the *same* promise, which settles only once both
+  branches cancel and `source.cancel(compositeReason)` runs — so a throwing `source.cancel()` rejects
+  *both*, and cancelling only one branch leaves its `cancel()` pending until the other cancels. Here
+  the first branch to cancel resolves `Ok` immediately and only the second reflects the source
+  result (`c1 = Ok`, `c2 = Err` when the source cancel throws). This trades the spec's composite
+  promise for ergonomics: cancelling one branch returns rather than hanging until the other does.
+  Pinned exactly (not with a loose `is_err() || is_err()`) by
+  `tee_failing_source_cancel_propagates_to_branch_cancel`.
+- **`piping` error precedence when a pre-*erroring* writable meets an errored source.** WPT
+  `multiple-propagation.any.js` row "errored readable → *erroring* writable" (both set via a
+  synchronous `start()` that calls `controller.error()`): the spec rejects `pipeTo` with the
+  *writable's* error, because aborting a writable still in the `erroring` state (its controller not
+  yet `started`) discards the passed reason and finalizes with the writable's own stored error. The
+  Rust writable does not model the `erroring`-vs-`errored` distinction, so the pipe cancels the
+  errored readable and rejects with the *source's* error instead. The sibling "errored → *errored*"
+  row (writable fully errored via a microtask) wants the source error and Rust matches it. Subtle,
+  state-machine/timing-dependent; left as a known divergence rather than modelled.
 
 Previously divergent, now fixed: **a push-model byte source stranded a default reader.** A source
 whose `pull()` produces nothing and that `enqueue`s later, out of band, from another task (a captured
@@ -560,8 +581,27 @@ called). Not re-litigated here.
 
 ### Identified portable gaps not yet ported
 
-None. Every portable spec behaviour the audit surfaced is now either covered or a documented
-skip/divergence, and no `#[ignore]`d tests remain.
+The bulk of the audit's portable behaviours are covered or documented as skips/divergences, and
+no `#[ignore]`d tests remain. A critical re-audit left these low-signal items unpinned (behaviour
+believed correct-by-construction, but not directly tested):
+
+- Default-stream push model: a source that `enqueue`s/`close`s out of band from a spawned task (via
+  a captured controller clone) while a `read()` is already parked. Correct by construction — the
+  default task is channel-based, so an out-of-band `ControllerMsg::Enqueue` wakes it — unlike the
+  byte side, which needed a serve gate (`push_model_default_reader_*`). Not pinned for default streams.
+- `tee`: enqueue() + close() while both branches are mid-read (the atomic enqueue-then-close case);
+  and "stops pulling once the source errors while both branches are reading" as a distinct
+  no-further-pull assertion. Adjacent behaviours are covered; these exact interactions are not.
+- Readable cancel arriving during a deferred-close drain window (`close_pending`): handled by the
+  code (state is still `Readable`, so Cancel proceeds and clears `close_pending`) but not tested.
+- piping `multiple-propagation` "closed readable → closed writable" must fulfill: rides on
+  `futures::select!` poll ordering (the read-`None` arm is listed first and wins), believed correct
+  but not pinned.
+
+The transform `controller.error()` no-op-after-terminal family (errors.any.js second-call / after
+cancel / after abort / after a hook threw) is covered by the first-wins error handler plus
+`transform_surplus_controller_error_is_noop_first_wins` and the cancel-6/7 tests; the standalone
+captured-controller variants are not each individually pinned but exercise the same guarded path.
 
 ### Stale test-comment labels (no coverage impact)
 
