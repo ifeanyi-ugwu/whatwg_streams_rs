@@ -449,47 +449,23 @@ rest of this section lists items that were divergent and are now fixed.
 
 #### Accepted divergences (deliberate, documented)
 
-- **`tee` cancel does not share one composite cancel promise — deliberately, because the spec model
-  is user-hostile here.** Spec `ReadableStreamDefaultTee` gives both branches' `cancel()` the *same*
-  promise, which settles only once *both* branches cancel and `source.cancel(compositeReason)` runs.
-  Two consequences follow: cancelling only one branch leaves its `cancel()` **pending forever** until
-  the other also cancels — so `reader.cancel().await` on one branch hangs while the other is still in
-  use, the single most common tee usage — and a throwing `source.cancel()` rejects *both* branches.
+Each carries only the fact and the test here; the reasoning and illustrations live in
+`docs/explainers/spec-divergences.md`.
 
-  The spec can tie `cancel()` to the source result because it conflates two separate events:
-  *detaching a branch* (immediate, always succeeds — the branch just stops being fed) and *cancelling
-  the shared source* (later, only once both branches give up — one branch cancelling never reaches the
-  source). This implementation keeps them separate. The first branch to cancel resolves `Ok`
-  immediately — an honest statement that *its branch* is detached, which claims nothing about the
-  source (one-branch cancel does not touch it) — and only the second, which actually triggers
-  `source.cancel()`, reflects its result: `c1 = Ok`, `c2 = Err` when the source cancel throws. So
-  cancelling one branch returns instead of hanging. The one rough edge: on a both-branches cancel with
-  a throwing `source.cancel()`, the failure surfaces on whichever branch cancels *last*, not
-  symmetrically (a deterministic error path would be pure polish). Adopting strict spec fidelity would
-  reintroduce the cancel-one-branch hang, so it is not adopted. Pinned exactly (not with a loose
-  `is_err() || is_err()`) by `tee_failing_source_cancel_propagates_to_branch_cancel`.
-- **`piping` error precedence when a pre-*erroring* writable meets an errored source.** When both
-  sides are already broken — source errored with `error1`, dest broken with `error2` —
-  `source.pipeTo(dest)` must choose which error to reject with, and the spec's answer hinges on a
-  writable-state distinction this implementation does not model (`errored` = fully done erroring;
-  `erroring` = still transitioning, e.g. `controller.error()` called inside `start()` before the
-  controller has "started"):
-
-  |                        | dest is `erroring` (errored inside `start()`) | dest is `errored` (fully done) |
-  |------------------------|-----------------------------------------------|--------------------------------|
-  | Spec rejects with      | `error2` (the dest's own)                     | `error1` (the source's)        |
-  | This impl rejects with | `error1` — wrong                              | `error1` — correct             |
-
-  The spec flips because aborting a writable that is still `erroring` discards the reason passed to the
-  abort and finalizes with the writable's *own* pending error (`error2`), whereas aborting a fully
-  `errored` one is a no-op and the pipe falls back to the source error (`error1`). This writable has
-  only `Writable`/`Closed`/`Errored` — no transitional `erroring` — so `writer.ready()` returns
-  `Err(error2)`, the pipe then cancels the errored source (`reader.cancel()` → `Err(error1)`), and
-  `error1` surfaces in *both* columns. Reaching the wrong cell requires a writable that errors
-  *synchronously in `start()`* and an already-errored source piped in the same tick — piping one broken
-  stream into another and disputing whose error label wins. The fix would be modelling transitional
-  `erroring` (and `closing`) writable states; not worth it for a cell no real program reaches, so left
-  as a documented divergence.
+- **`tee` cancel does not share one composite cancel promise** (deliberate). The first branch to
+  cancel resolves `Ok` immediately; only the second — which triggers `source.cancel()` — reflects its
+  result (`c1 = Ok`, `c2 = Err` when the source cancel throws). Strict fidelity (one shared composite
+  promise) would hang `reader.cancel().await` on one branch until the other cancels — the common tee
+  usage — so it is not adopted. Pinned by `tee_failing_source_cancel_propagates_to_branch_cancel`.
+- **`piping` error precedence when a pre-*erroring* writable meets an errored source.** With both sides
+  broken, WPT `multiple-propagation.any.js`'s "errored readable → *erroring* writable" row rejects with
+  the writable's error; this impl rejects with the source's, because the writable has no transitional
+  `erroring` state (it matches WPT on the "→ *errored*" sibling row). Contrived: needs a writable that
+  errors synchronously in `start()` plus an already-errored source piped in the same tick.
+- **`piping` an empty source into a closed destination rejects** (WPT fulfils that row). Piping into an
+  already-closed destination is an invalid target uniformly, whatever the source — consistent with
+  `pipe_to_closed_dest_cancels_source_and_rejects`, and *deterministic* (not `select!`-ordering luck).
+  Pinned by `pipe_to_empty_source_into_closed_dest_rejects`.
 
 Previously divergent, now fixed: **a push-model byte source stranded a default reader.** A source
 whose `pull()` produces nothing and that `enqueue`s later, out of band, from another task (a captured
@@ -617,10 +593,9 @@ left unpinned are now pinned directly (all found correct-by-construction — non
 - Cancel during a deferred-close drain window — `cancel_during_deferred_close_drain_succeeds`: cancel
   clears the queue and closes the closing stream, resolving rather than hanging.
 - piping `multiple-propagation` "closed readable → closed writable" —
-  `pipe_to_empty_source_into_closed_dest_rejects`: this pins that the outcome is **deterministic**
-  (not `select!`-ordering luck, the re-audit's worry). It is a minor divergence from WPT (which
-  fulfils this row): piping into an already-closed destination *rejects* here — uniformly, whatever
-  the source — consistent with `pipe_to_closed_dest_cancels_source_and_rejects`.
+  `pipe_to_empty_source_into_closed_dest_rejects`: pins that the outcome is deterministic (not
+  `select!`-ordering luck, the re-audit's worry). A minor divergence from WPT — see the "Accepted
+  divergences" section above and `docs/explainers/spec-divergences.md`.
 
 The transform `controller.error()` no-op-after-terminal family (errors.any.js second-call / after
 cancel / after abort / after a hook threw) is covered by the first-wins error handler plus
