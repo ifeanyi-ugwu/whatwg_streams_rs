@@ -449,24 +449,47 @@ rest of this section lists items that were divergent and are now fixed.
 
 #### Accepted divergences (deliberate, documented)
 
-- **`tee` cancel does not share one composite cancel promise.** Spec `ReadableStreamDefaultTee`
-  gives `branch1.cancel()` and `branch2.cancel()` the *same* promise, which settles only once both
-  branches cancel and `source.cancel(compositeReason)` runs — so a throwing `source.cancel()` rejects
-  *both*, and cancelling only one branch leaves its `cancel()` pending until the other cancels. Here
-  the first branch to cancel resolves `Ok` immediately and only the second reflects the source
-  result (`c1 = Ok`, `c2 = Err` when the source cancel throws). This trades the spec's composite
-  promise for ergonomics: cancelling one branch returns rather than hanging until the other does.
-  Pinned exactly (not with a loose `is_err() || is_err()`) by
-  `tee_failing_source_cancel_propagates_to_branch_cancel`.
-- **`piping` error precedence when a pre-*erroring* writable meets an errored source.** WPT
-  `multiple-propagation.any.js` row "errored readable → *erroring* writable" (both set via a
-  synchronous `start()` that calls `controller.error()`): the spec rejects `pipeTo` with the
-  *writable's* error, because aborting a writable still in the `erroring` state (its controller not
-  yet `started`) discards the passed reason and finalizes with the writable's own stored error. The
-  Rust writable does not model the `erroring`-vs-`errored` distinction, so the pipe cancels the
-  errored readable and rejects with the *source's* error instead. The sibling "errored → *errored*"
-  row (writable fully errored via a microtask) wants the source error and Rust matches it. Subtle,
-  state-machine/timing-dependent; left as a known divergence rather than modelled.
+- **`tee` cancel does not share one composite cancel promise — deliberately, because the spec model
+  is user-hostile here.** Spec `ReadableStreamDefaultTee` gives both branches' `cancel()` the *same*
+  promise, which settles only once *both* branches cancel and `source.cancel(compositeReason)` runs.
+  Two consequences follow: cancelling only one branch leaves its `cancel()` **pending forever** until
+  the other also cancels — so `reader.cancel().await` on one branch hangs while the other is still in
+  use, the single most common tee usage — and a throwing `source.cancel()` rejects *both* branches.
+
+  The spec can tie `cancel()` to the source result because it conflates two separate events:
+  *detaching a branch* (immediate, always succeeds — the branch just stops being fed) and *cancelling
+  the shared source* (later, only once both branches give up — one branch cancelling never reaches the
+  source). This implementation keeps them separate. The first branch to cancel resolves `Ok`
+  immediately — an honest statement that *its branch* is detached, which claims nothing about the
+  source (one-branch cancel does not touch it) — and only the second, which actually triggers
+  `source.cancel()`, reflects its result: `c1 = Ok`, `c2 = Err` when the source cancel throws. So
+  cancelling one branch returns instead of hanging. The one rough edge: on a both-branches cancel with
+  a throwing `source.cancel()`, the failure surfaces on whichever branch cancels *last*, not
+  symmetrically (a deterministic error path would be pure polish). Adopting strict spec fidelity would
+  reintroduce the cancel-one-branch hang, so it is not adopted. Pinned exactly (not with a loose
+  `is_err() || is_err()`) by `tee_failing_source_cancel_propagates_to_branch_cancel`.
+- **`piping` error precedence when a pre-*erroring* writable meets an errored source.** When both
+  sides are already broken — source errored with `error1`, dest broken with `error2` —
+  `source.pipeTo(dest)` must choose which error to reject with, and the spec's answer hinges on a
+  writable-state distinction this implementation does not model (`errored` = fully done erroring;
+  `erroring` = still transitioning, e.g. `controller.error()` called inside `start()` before the
+  controller has "started"):
+
+  |                        | dest is `erroring` (errored inside `start()`) | dest is `errored` (fully done) |
+  |------------------------|-----------------------------------------------|--------------------------------|
+  | Spec rejects with      | `error2` (the dest's own)                     | `error1` (the source's)        |
+  | This impl rejects with | `error1` — wrong                              | `error1` — correct             |
+
+  The spec flips because aborting a writable that is still `erroring` discards the reason passed to the
+  abort and finalizes with the writable's *own* pending error (`error2`), whereas aborting a fully
+  `errored` one is a no-op and the pipe falls back to the source error (`error1`). This writable has
+  only `Writable`/`Closed`/`Errored` — no transitional `erroring` — so `writer.ready()` returns
+  `Err(error2)`, the pipe then cancels the errored source (`reader.cancel()` → `Err(error1)`), and
+  `error1` surfaces in *both* columns. Reaching the wrong cell requires a writable that errors
+  *synchronously in `start()`* and an already-errored source piped in the same tick — piping one broken
+  stream into another and disputing whose error label wins. The fix would be modelling transitional
+  `erroring` (and `closing`) writable states; not worth it for a cell no real program reaches, so left
+  as a documented divergence.
 
 Previously divergent, now fixed: **a push-model byte source stranded a default reader.** A source
 whose `pull()` produces nothing and that `enqueue`s later, out of band, from another task (a captured
