@@ -1101,3 +1101,89 @@ async fn pull_not_called_after_close_while_draining() {
         "pull() must not be called after close() is requested, even while draining"
     );
 }
+
+// Cancel arriving during a deferred-close drain window (queue non-empty, stream still
+// "readable"/closing): cancel must take effect — clear the queue, close the stream, and
+// resolve — not hang or be ignored.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn cancel_during_deferred_close_drain_succeeds() {
+    struct CloseWithQueueSource;
+    impl ReadableSource<u32> for CloseWithQueueSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(1)?;
+            controller.enqueue(2)?;
+            controller.close()?; // close with a non-empty queue → deferred (close_pending)
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let stream = ReadableStream::builder(CloseWithQueueSource)
+        .strategy(CountQueuingStrategy::new(4))
+        .spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Read one chunk: queue still holds 2, stream is closing (close_pending), not yet closed.
+    assert_eq!(reader.read().await.unwrap(), Some(1));
+
+    // Cancel during the drain window must resolve (clears the queue and closes the stream).
+    reader.cancel(None).await.unwrap();
+    assert_eq!(reader.read().await.unwrap(), None, "read after cancel is EOF");
+    reader.closed().await.unwrap();
+}
+
+// Default-stream push model: a source that produces nothing from pull() but enqueues out of
+// band from another task (via a captured controller clone) must serve a read that parked
+// before the push arrived. Correct by construction (the default task is channel-based), pinned.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn default_stream_push_model_serves_parked_read() {
+    use std::sync::{Arc, Mutex};
+
+    struct PushSource {
+        ctrl: Arc<Mutex<Option<ReadableStreamDefaultController<u32>>>>,
+    }
+    impl ReadableSource<u32> for PushSource {
+        async fn start(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            *self.ctrl.lock().unwrap() = Some(controller.clone());
+            Ok(())
+        }
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            futures::future::pending::<()>().await; // never produces from pull
+            Ok(())
+        }
+    }
+
+    let ctrl = Arc::new(Mutex::new(None));
+    let stream = ReadableStream::builder(PushSource { ctrl: ctrl.clone() }).spawn(tokio::spawn);
+    let (_locked, reader) = stream.get_reader().unwrap();
+
+    // Park a read: pull() blocks and produces nothing, so the read has no data yet.
+    let read_fut = tokio::spawn(async move { reader.read().await });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Push a chunk out of band, from this task, via the captured controller clone.
+    ctrl.lock().unwrap().as_ref().unwrap().enqueue(99).unwrap();
+
+    assert_eq!(
+        read_fut.await.unwrap().unwrap(),
+        Some(99),
+        "an out-of-band enqueue must serve a read that parked before it"
+    );
+}

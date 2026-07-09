@@ -588,3 +588,85 @@ async fn tee_pulls_only_enough_to_fill_emptiest_queue() {
         "tee must pull exactly twice: once to fill both branches, once after both are drained"
     );
 }
+
+// WPT: tee.any.js — "enqueue() and close() while both branches are pulling". A single pull that
+// enqueues a chunk and then closes must deliver the chunk to BOTH branches and then close BOTH,
+// with both branches mid-read.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_enqueue_then_close_reaches_both_branches() {
+    struct EnqueueThenCloseSource;
+    impl ReadableSource<u32> for EnqueueThenCloseSource {
+        async fn pull(
+            &mut self,
+            controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            controller.enqueue(42)?;
+            controller.close()?;
+            Ok(())
+        }
+    }
+
+    let source = ReadableStream::builder(EnqueueThenCloseSource).spawn(tokio::spawn);
+    let (b1, b2) = source.tee().spawn(tokio::spawn).unwrap();
+    let (_l1, r1) = b1.get_reader().unwrap();
+    let (_l2, r2) = b2.get_reader().unwrap();
+
+    // Both branches read concurrently (mid-read when the enqueue+close lands).
+    let (a1, a2) = tokio::join!(r1.read(), r2.read());
+    assert_eq!(a1.unwrap(), Some(42), "branch1 must receive the enqueued chunk");
+    assert_eq!(a2.unwrap(), Some(42), "branch2 must receive the enqueued chunk");
+    let (e1, e2) = tokio::join!(r1.read(), r2.read());
+    assert_eq!(e1.unwrap(), None, "branch1 must see EOF from the close");
+    assert_eq!(e2.unwrap(), None, "branch2 must see EOF from the close");
+}
+
+// WPT: tee.any.js — "stops pulling once the original errors while both branches are reading". A
+// source that errors during a pull (with both branches mid-read) must reject both reads and not
+// keep pulling afterwards.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn tee_source_error_while_reading_errors_both_and_stops_pulling() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    struct ErrorOnPullSource {
+        pulls: Arc<AtomicU32>,
+    }
+    impl ReadableSource<u32> for ErrorOnPullSource {
+        async fn pull(
+            &mut self,
+            _controller: &mut ReadableStreamDefaultController<u32>,
+        ) -> StreamResult<()> {
+            self.pulls.fetch_add(1, Ordering::Release);
+            Err(StreamError::from("source boom"))
+        }
+    }
+
+    let pulls = Arc::new(AtomicU32::new(0));
+    let source = ReadableStream::builder(ErrorOnPullSource {
+        pulls: pulls.clone(),
+    })
+    .spawn(tokio::spawn);
+    let (b1, b2) = source.tee().spawn(tokio::spawn).unwrap();
+    let (_l1, r1) = b1.get_reader().unwrap();
+    let (_l2, r2) = b2.get_reader().unwrap();
+
+    // Both read → the source pulls and errors → both reads reject.
+    let (a1, a2) = tokio::join!(r1.read(), r2.read());
+    assert!(a1.is_err(), "branch1 read must reject with the source error");
+    assert!(a2.is_err(), "branch2 read must reject with the source error");
+    // Further reads on the now-errored branches also reject...
+    let (f1, f2) = tokio::join!(r1.read(), r2.read());
+    assert!(f1.is_err() && f2.is_err(), "further reads on an errored tee must reject");
+    // ...and no runaway pulling continues after the error.
+    let after = pulls.load(Ordering::Acquire);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        pulls.load(Ordering::Acquire),
+        after,
+        "the tee must stop pulling once the source has errored (was {after})"
+    );
+}

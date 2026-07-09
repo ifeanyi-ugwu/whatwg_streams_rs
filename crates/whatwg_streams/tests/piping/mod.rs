@@ -1879,3 +1879,37 @@ async fn pipe_to_late_abort_no_effect_after_readable_errored_with_pending_write(
         "pipe must reject with the readable error, not the abort; got: {err}"
     );
 }
+
+// WPT: multiple-propagation.any.js — "closed readable → closed writable". Piping an
+// already-closed (empty) source into an already-closed destination. Pins the actual,
+// deterministic outcome (documented in WPT_COVERAGE.md if it diverges from the WPT
+// fulfil expectation): piping into a closed destination targets a closed writable, which
+// this implementation rejects rather than treating as a no-op success.
+#[cfg(feature = "send")]
+#[tokio::test]
+async fn pipe_to_empty_source_into_closed_dest_rejects() {
+    struct PlainSink;
+    impl WritableSink<u32> for PlainSink {
+        async fn write(
+            &mut self,
+            _c: u32,
+            _: &mut WritableStreamDefaultController,
+        ) -> StreamResult<()> {
+            Ok(())
+        }
+    }
+
+    let source = ReadableStream::from_vec(Vec::<u32>::new()).spawn(tokio::spawn);
+    let dest = WritableStream::builder(PlainSink).spawn(tokio::spawn);
+    let (_locked, writer) = dest.get_writer().unwrap();
+    writer.close().await.unwrap();
+    drop(writer);
+
+    // Deterministic: piping into an already-closed destination rejects (consistent with
+    // pipe_to_closed_dest_cancels_source_and_rejects), regardless of the source being empty.
+    let result = source.pipe_to(&dest, None).await;
+    assert!(
+        result.is_err(),
+        "piping into a closed destination rejects even when the source is empty, got: {result:?}"
+    );
+}
